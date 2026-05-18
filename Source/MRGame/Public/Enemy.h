@@ -26,6 +26,10 @@ public:
 	// Called to bind functionality to input
 	virtual void SetupPlayerInputComponent(class UInputComponent* PlayerInputComponent) override;
 	
+	UFUNCTION()
+	void OnHitCapsuleBeginOverlap(UPrimitiveComponent* OverlappedComp,AActor* OtherActor,
+		UPrimitiveComponent* OtherComp,int32 OtherBodyIndex,bool bFromSweep, const FHitResult& SweepResult);
+	
 	UPROPERTY(EditAnywhere, Category = "Enemy")
 	float MoveSpeed = 150.f;
 	

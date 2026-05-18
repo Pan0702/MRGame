@@ -2,9 +2,12 @@
 
 
 #include "Enemy.h"
+
+#include "ASword.h"
 #include "EnemyAIController.h" 
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Animation/AnimInstance.h"      
+#include "Components/CapsuleComponent.h"
 #include "Engine/SkeletalMesh.h"          
 #include "UObject/ConstructorHelpers.h"   
 
@@ -24,7 +27,7 @@ AEnemy::AEnemy()
 	//　AIControllerを指定
 	AIControllerClass = AEnemyAIController::StaticClass();
 	AutoPossessAI = EAutoPossessAI::PlacedInWorldOrSpawned;
-	
+	GetCapsuleComponent()->OnComponentBeginOverlap.AddDynamic(this,&AEnemy::OnHitCapsuleBeginOverlap);
 }
 	
 
@@ -48,5 +51,15 @@ void AEnemy::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 {
 	Super::SetupPlayerInputComponent(PlayerInputComponent);
 
+}
+
+void AEnemy::OnHitCapsuleBeginOverlap(UPrimitiveComponent* OverlappedComp, AActor* OtherActor,
+	UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep, const FHitResult& SweepResult)
+{
+	if (Cast<ASword>(OtherActor))
+	{
+		Destroy();
+		return;
+	}
 }
 

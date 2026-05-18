@@ -1,0 +1,990 @@
+# SKILL: ue-game-features
+
+---
+name: ue-game-features
+description: "Use this skill when working with Game Feature plugins, modular gameplay, GameFeatureAction, GameFeatureData, GameFrameworkComponentManager, init state system, experience system, modular components, UPawnComponent, UControllerComponent, UGameStateComponent, UPlayerStateComponent, or Lyra-style modular architecture. See references/ for code templates and experience system patterns."
+metadata:
+  version: 1.0.0
+---
+
+# UE Game Features and Modular Gameplay
+
+You are an expert in Unreal Engine's Game Features plugin system and modular gameplay architecture.
+
+## Context Check
+
+Read `.agents/ue-project-context.md` before proceeding. Determine:
+- Whether the `GameFeatures` and `ModularGameplay` plugins are enabled
+- Which actors register as component receivers (`AddReceiver`)
+- Whether the project uses an init state system or experience-based loading
+- Existing `UGameFeatureAction` subclasses or modular component base classes
+
+## Information Gathering
+
+Ask the developer:
+1. Are you creating a new Game Feature plugin or extending an existing one?
+2. What components or abilities should the feature inject into gameplay actors?
+3. Does the feature need async loading or runtime activation/deactivation?
+4. Is there an experience/game mode composition system (Lyra-style)?
+5. Do components need ordered initialization across features?
+
+---
+
+## Game Feature Plugin Structure
+
+A Game Feature plugin is a standard UE plugin with `Type` set to `"GameFeature"` in its `.uplugin` descriptor. This tells the engine to manage its lifecycle through the Game Features subsystem rather than loading it as a regular plugin.
+
+### .uplugin Descriptor
+
+```cpp
+{
+    "Type": "GameFeature",
+    "BuiltInInitialFeatureState": "Active",  // or "Registered", "Installed"
+    "Plugins": [
+        { "Name": "GameFeatures", "Enabled": true },
+        { "Name": "ModularGameplay", "Enabled": true }
+    ]
+}
+```
+
+`BuiltInInitialFeatureState` controls how far the plugin advances on startup. Use `"Active"` for always-on features, `"Registered"` for features activated by gameplay code, or `"Installed"` for downloadable content loaded on demand.
+
+### UGameFeatureData
+
+Each Game Feature plugin contains a `UGameFeatureData` primary data asset (extends `UPrimaryDataAsset`) that defines what the feature does:
+
+```cpp
+// From GameFeatureData.h
+UPROPERTY(EditDefaultsOnly, Instanced, Category = "Game Feature | Actions")
+TArray<TObjectPtr<UGameFeatureAction>> Actions;
+
+UPROPERTY(EditAnywhere, Category = "Game Feature | Asset Manager")
+TArray<FPrimaryAssetTypeInfo> PrimaryAssetTypesToScan;
+```
+
+`Actions` is the core — an instanced array of `UGameFeatureAction` subclasses that execute when the feature activates.
+
+### Directory Convention
+
+```
+Plugins/GameFeatures/
+├── ShooterCore/
+│   ├── ShooterCore.uplugin          (Type: GameFeature)
+│   ├── Content/
+│   │   └── ShooterCore.uasset       (UGameFeatureData)
+│   └── Source/ShooterCoreRuntime/
+└── DeathmatchRules/
+    ├── DeathmatchRules.uplugin
+    └── Content/DeathmatchRules.uasset
+```
+
+---
+
+## Plugin State Machine
+
+Game Feature plugins transition through a well-defined state machine. Actions fire at specific transitions and runtime activation must target valid destination states.
+
+### EGameFeaturePluginState Lifecycle
+
+```
+Uninitialized → Terminal → UnknownStatus → StatusKnown
+    → Installed → Registered → Loaded → Active
+```
+
+Each major state has transition states between them (e.g., `Registering`, `Loading`, `Activating`). You target a destination state and the subsystem walks the chain.
+
+### Destination States
+
+| State | Description |
+|-------|-------------|
+| `Terminal` | Plugin removed from tracking entirely |
+| `StatusKnown` | Availability confirmed (exists on disk or bundle) |
+| `Installed` | Files on local storage, not yet registered |
+| `Registered` | Assets registered with Asset Manager, actions notified |
+| `Loaded` | Assets loaded into memory |
+| `Active` | Actions fully activated, components injected |
+
+URL protocols: `file:` for built-in disk plugins, `installbundle:` for downloadable features. Convert descriptor path to URL with `UGameFeaturesSubsystem::GetPluginURL_FileProtocol(Path)`.
+
+---
+
+## UGameFeatureAction
+
+`UGameFeatureAction` (`UCLASS(MinimalAPI, DefaultToInstanced, EditInlineNew, Abstract)`) is the base class for all actions. `DefaultToInstanced` + `EditInlineNew` allow instances to be created inline within `UGameFeatureData`'s `Actions` array.
+
+### Lifecycle Methods
+
+```cpp
+// Registration phase
+virtual void OnGameFeatureRegistering();
+virtual void OnGameFeatureUnregistering();
+
+// Loading phase
+virtual void OnGameFeatureLoading();
+virtual void OnGameFeatureUnloading();
+
+// Activation — primary override point
+virtual void OnGameFeatureActivating(FGameFeatureActivatingContext& Context);
+virtual void OnGameFeatureActivating();  // legacy no-arg fallback
+
+// Post-activation confirmation
+virtual void OnGameFeatureActivated();
+
+// Deactivation — supports async via context
+virtual void OnGameFeatureDeactivating(FGameFeatureDeactivatingContext& Context);
+```
+
+`OnGameFeatureActivating(Context)` is the primary override. The base calls the legacy no-arg version for backward compatibility.
+
+### Async Deactivation
+
+When deactivation requires async work, pause it via the context:
+
+```cpp
+void UMyAction::OnGameFeatureDeactivating(FGameFeatureDeactivatingContext& Context)
+{
+    FSimpleDelegate ResumeDelegate = Context.PauseDeactivationUntilComplete(
+        TEXT("MyAction_AsyncCleanup"));
+    // Start async work — MUST invoke ResumeDelegate when done or deactivation hangs
+    AsyncTask(ENamedThreads::GameThread, [ResumeDelegate]()
+    {
+        // ... cleanup ...
+        ResumeDelegate.ExecuteIfBound();
+    });
+}
+```
+
+See `references/game-feature-patterns.md` for complete custom action subclass templates.
+
+---
+
+## Built-in Actions
+
+### UGameFeatureAction_AddComponents
+
+`UCLASS(MinimalAPI, meta=(DisplayName="Add Components"), final)`. The most commonly used action — injects components into actors via `UGameFrameworkComponentManager`.
+
+Configuration uses `FGameFeatureComponentEntry`:
+
+```cpp
+UPROPERTY(EditAnywhere) TSoftClassPtr<AActor> ActorClass;
+UPROPERTY(EditAnywhere) TSoftClassPtr<UActorComponent> ComponentClass;
+UPROPERTY(EditAnywhere) uint8 bClientComponent : 1;
+UPROPERTY(EditAnywhere) uint8 bServerComponent : 1;
+```
+
+Internally stores `TSharedPtr<FComponentRequestHandle>` — RAII removes components when the handle drops (feature deactivates). Set both `bClientComponent` and `bServerComponent` for components needed everywhere, server-only for gameplay logic, client-only for cosmetic.
+
+### Other Built-in Actions
+
+| Action | Purpose |
+|--------|---------|
+| `UGameFeatureAction_AddCheats` | Register cheat manager extensions |
+| `UGameFeatureAction_DataRegistry` | Register data registry sources |
+
+---
+
+## UGameFeaturesSubsystem
+
+`UGameFeaturesSubsystem` (`UEngineSubsystem`) manages all Game Feature plugin lifecycles:
+
+```cpp
+UGameFeaturesSubsystem& GFS = UGameFeaturesSubsystem::Get();
+```
+
+### Runtime Activation and Deactivation
+
+```cpp
+FString PluginURL = UGameFeaturesSubsystem::GetPluginURL_FileProtocol(
+    TEXT("/MyProject/Plugins/GameFeatures/MyFeature/MyFeature.uplugin"));
+
+// Activate — callback receives const UE::GameFeatures::FResult&
+GFS.LoadAndActivateGameFeaturePlugin(PluginURL,
+    FGameFeaturePluginLoadComplete::CreateUObject(this, &UMyMgr::OnLoaded));
+
+// Deactivate and unload
+GFS.DeactivateGameFeaturePlugin(PluginURL);
+GFS.UnloadGameFeaturePlugin(PluginURL, /*bKeepRegistered=*/ false);
+
+// Or target a specific state:
+GFS.ChangeGameFeatureTargetState(PluginURL, EGameFeatureTargetState::Registered,
+    FGameFeaturePluginChangeStateComplete());
+```
+
+### Query and Observe
+
+```cpp
+bool bActive = GFS.IsGameFeaturePluginActive(PluginURL, /*bCheckForActivating=*/ false);
+EGameFeaturePluginState State = GFS.GetPluginState(PluginURL);
+
+// Global observer — implement IGameFeatureStateChangeObserver
+GFS.AddObserver(MyObserver, UGameFeaturesSubsystem::EObserverPluginStateUpdateMode::CurrentAndFuture);
+GFS.RemoveObserver(MyObserver);
+```
+
+`IGameFeatureStateChangeObserver` provides: `OnGameFeatureRegistering(Data, PluginName, URL)`, `OnGameFeatureActivating(Data, URL)`, `OnGameFeatureDeactivating(Data, Context, URL)`.
+
+---
+
+## Component Injection System
+
+`UGameFrameworkComponentManager` (`UGameInstanceSubsystem`) is the runtime engine that injects components into actors. It is a **Game Instance subsystem** — not an engine subsystem:
+
+```cpp
+UGameFrameworkComponentManager* CompMgr =
+    GetGameInstance()->GetSubsystem<UGameFrameworkComponentManager>();
+```
+
+### Actor Registration (Receivers)
+
+Actors must register as receivers to accept injected components:
+
+```cpp
+void AMyCharacter::BeginPlay()
+{
+    Super::BeginPlay();
+    UGameFrameworkComponentManager::AddGameFrameworkComponentReceiver(this);
+}
+void AMyCharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    UGameFrameworkComponentManager::RemoveGameFrameworkComponentReceiver(this);
+    Super::EndPlay(EndPlayReason);
+}
+```
+
+### Component Requests (RAII)
+
+```cpp
+TSharedPtr<FComponentRequestHandle> Handle = CompMgr->AddComponentRequest(
+    TSoftClassPtr<AActor>(AMyCharacter::StaticClass()),
+    UMyHealthComponent::StaticClass(),
+    EGameFrameworkAddComponentFlags::AddUnique);
+// Handle is RAII — destroying it removes the request and cleans up injected components
+```
+
+| Flag | Value | Behavior |
+|------|-------|----------|
+| `None` | 0 | Default, allows duplicates |
+| `AddUnique` | 1 | Skip if same class already exists |
+| `AddIfNotChild` | 2 | Skip if a child class already exists |
+| `UseAutoGeneratedName` | 4 | Auto-generated name instead of class name |
+
+### Extension Handlers and Events
+
+```cpp
+TSharedPtr<FComponentRequestHandle> ExtHandle = CompMgr->AddExtensionHandler(
+    TSoftClassPtr<AActor>(AMyCharacter::StaticClass()),
+    FExtensionHandlerDelegate::CreateUObject(this, &UMyAction::OnExtension));
+
+void UMyAction::OnExtension(AActor* Actor, FName EventName)
+{
+    if (EventName == UGameFrameworkComponentManager::NAME_GameActorReady)
+    { /* Actor fully initialized */ }
+}
+```
+
+Standard event names: `NAME_ReceiverAdded`, `NAME_ReceiverRemoved`, `NAME_ExtensionAdded`, `NAME_ExtensionRemoved`, `NAME_GameActorReady`. Send custom events with `CompMgr->SendExtensionEvent(Actor, FName("MyEvent"))`.
+
+---
+
+## Init State System
+
+The init state system solves ordered initialization across independently-loaded features. Without it, Component A might read from Component B before B exists — a common problem in modular architectures.
+
+### Registering Init States
+
+Define project-wide init states as `FGameplayTag` values in a fixed order:
+
+```cpp
+CompMgr->RegisterInitState(TAG_InitState_Spawning, false, FGameplayTag());
+CompMgr->RegisterInitState(TAG_InitState_DataAvailable, false, TAG_InitState_Spawning);
+CompMgr->RegisterInitState(TAG_InitState_DataInitialized, false, TAG_InitState_DataAvailable);
+CompMgr->RegisterInitState(TAG_InitState_GameplayReady, false, TAG_InitState_DataInitialized);
+```
+
+### Changing and Observing Init State
+
+```cpp
+// Advance a feature's state
+bool bChanged = CompMgr->ChangeFeatureInitState(
+    MyActor, FName("MyComponent"), this, TAG_InitState_DataAvailable);
+
+// Wait for another feature to reach a state
+FDelegateHandle DH = CompMgr->RegisterAndCallForActorInitState(
+    MyActor, FName("OtherComp"), TAG_InitState_DataInitialized,
+    FActorInitStateChangedDelegate::CreateUObject(this, &UMyComp::OnOtherReady),
+    /*bCallImmediately=*/ true);
+
+// Check if all features reached a state
+bool bAllReady = CompMgr->HaveAllFeaturesReachedInitState(
+    MyActor, TAG_InitState_GameplayReady, /*ExcludingFeature=*/ NAME_None);
+```
+
+### IGameFrameworkInitStateInterface
+
+Implement on components for structured init state progression:
+
+```cpp
+UCLASS()
+class UMyModularComponent : public UPawnComponent,
+    public IGameFrameworkInitStateInterface
+{
+    GENERATED_BODY()
+public:
+    virtual FName GetFeatureName() const override { return TEXT("MyFeature"); }
+    virtual bool CanChangeInitState(UGameFrameworkComponentManager* Manager,
+        FGameplayTag CurrentState, FGameplayTag DesiredState) const override;
+    virtual void HandleChangeInitState(UGameFrameworkComponentManager* Manager,
+        FGameplayTag CurrentState, FGameplayTag DesiredState) override;
+    virtual void CheckDefaultInitialization() override;
+
+    virtual void BeginPlay() override
+    {
+        Super::BeginPlay();
+        RegisterInitStateFeature();
+    }
+    virtual void EndPlay(const EEndPlayReason::Type Reason) override
+    {
+        UnregisterInitStateFeature();
+        Super::EndPlay(Reason);
+    }
+};
+```
+
+`ContinueInitStateChain(TArray<FGameplayTag>{State1, State2, State3})` attempts to advance through a sequence of states. Use this in `CheckDefaultInitialization` to auto-advance as far as possible.
+
+---
+
+## Modular Component Hierarchy
+
+The `ModularGameplay` plugin provides typed base components for gameplay framework actors:
+
+| Base Class | Parent | Typed Accessor |
+|------------|--------|----------------|
+| `UGameFrameworkComponent` | `UActorComponent` | None (generic base) |
+| `UPawnComponent` | `UGameFrameworkComponent` | `GetPawn<T>()`, `GetPawnChecked<T>()` |
+| `UControllerComponent` | `UGameFrameworkComponent` | `GetController<T>()`, `GetControllerChecked<T>()` |
+| `UGameStateComponent` | `UGameFrameworkComponent` | `GetGameState<T>()`, `GetGameStateChecked<T>()` |
+| `UPlayerStateComponent` | `UGameFrameworkComponent` | `GetPlayerState<T>()`, `GetPlayerStateChecked<T>()` |
+
+Use these instead of raw `UActorComponent` for type-safe owner access and init state integration.
+
+---
+
+## Experience System Pattern
+
+The experience system (pioneered by Lyra) composes game modes from Game Feature plugins at runtime. Instead of a monolithic GameMode, lightweight experience data assets list which features to activate.
+
+### Core Flow
+
+```
+GameMode::InitGame()
+  → Load UExperienceDefinition (from map or URL options)
+    → For each feature: LoadAndActivateGameFeaturePlugin()
+    → All loaded → OnExperienceLoaded broadcast
+      → Components initialize, gameplay begins
+```
+
+A `UExperienceManagerComponent` on `AGameStateBase` orchestrates loading. Systems bind to its `OnExperienceLoaded` delegate rather than assuming features are available at `BeginPlay`.
+
+See `references/experience-system.md` for the full pattern with code templates.
+
+---
+
+## Project Policies
+
+`UGameFeaturesProjectPolicies` controls feature loading behavior. Override `IsPluginAllowed(PluginURL, OutReason)` to filter plugins, `GetGameFeatureLoadingMode(bLoadClientData, bLoadServerData)` for network filtering, and `InitGameFeatureManager()`/`ShutdownGameFeatureManager()` for custom lifecycle. Register via `DefaultGame.ini` under `GameFeaturesSubsystemSettings`.
+
+See `references/game-feature-patterns.md` for the full policies subclass template.
+
+---
+
+## Common Mistakes
+
+**Missing receiver registration:**
+```cpp
+// WRONG — components never injected, no error logged
+void AMyCharacter::BeginPlay() { Super::BeginPlay(); }
+// RIGHT
+void AMyCharacter::BeginPlay()
+{
+    Super::BeginPlay();
+    UGameFrameworkComponentManager::AddGameFrameworkComponentReceiver(this);
+}
+```
+
+**Leaking FComponentRequestHandle:**
+```cpp
+// WRONG — handle destroyed immediately, component removed next frame
+CompMgr->AddComponentRequest(ActorClass, CompClass, Flags);
+// RIGHT — store for lifetime of injection
+RequestHandle = CompMgr->AddComponentRequest(ActorClass, CompClass, Flags);
+```
+
+**Using BeginPlay for cross-component init:**
+```cpp
+// WRONG — modular components may not exist yet
+void UMyComp::BeginPlay() { GetOwner()->FindComponentByClass<UOther>()->Configure(); }
+// RIGHT — use init state system to wait for dependencies
+void UMyComp::HandleChangeInitState(/*...*/, FGameplayTag DesiredState)
+{
+    if (DesiredState == TAG_InitState_DataInitialized)
+        GetOwner()->FindComponentByClass<UOther>()->Configure();
+}
+```
+
+**Forgetting PauseDeactivationUntilComplete delegate:** If you call `PauseDeactivationUntilComplete` but never invoke the returned delegate, plugin deactivation hangs indefinitely. Always invoke it, even on error paths.
+
+**Wrong subsystem type for ComponentManager:**
+```cpp
+// WRONG — NOT an engine subsystem
+GEngine->GetEngineSubsystem<UGameFrameworkComponentManager>();
+// RIGHT — UGameInstanceSubsystem
+GetGameInstance()->GetSubsystem<UGameFrameworkComponentManager>();
+```
+
+---
+
+## Related Skills
+
+- `ue-gameplay-framework` — GameMode, GameState, PlayerController, PlayerState lifecycle
+- `ue-actor-component-architecture` — Component creation, attachment, tick management
+- `ue-gameplay-abilities` — GAS integration with modular components
+- `ue-data-assets-tables` — Primary data assets, Asset Manager scanning
+- `ue-module-build-system` — Plugin structure, Build.cs dependencies
+- `ue-world-level-streaming` — Level streaming, seamless travel interactions
+
+--- REFERENCE: experience-system.md ---
+# Experience System Reference
+
+The experience system pattern (pioneered by Lyra) composes game modes from multiple Game Feature
+plugins at runtime. Instead of a monolithic `AGameMode` subclass per game type, you define
+lightweight data assets that list which features to activate.
+
+---
+
+## Experience Definition Asset
+
+```cpp
+// UExperienceDefinition — a primary data asset listing features to compose
+#pragma once
+#include "Engine/DataAsset.h"
+#include "ExperienceDefinition.generated.h"
+
+UCLASS()
+class UExperienceDefinition : public UPrimaryDataAsset
+{
+    GENERATED_BODY()
+public:
+    // Game Feature plugins to activate for this experience
+    UPROPERTY(EditDefaultsOnly, Category = "Experience")
+    TArray<FString> GameFeaturesToEnable;
+
+    // Actions to execute directly (without a full Game Feature plugin)
+    UPROPERTY(EditDefaultsOnly, Instanced, Category = "Experience")
+    TArray<TObjectPtr<UGameFeatureAction>> Actions;
+
+    // Default pawn data for this experience
+    UPROPERTY(EditDefaultsOnly, Category = "Experience")
+    TObjectPtr<UPawnData> DefaultPawnData;
+
+    virtual FPrimaryAssetId GetPrimaryAssetId() const override
+    {
+        return FPrimaryAssetId(FPrimaryAssetType("Experience"),
+            GetFName());
+    }
+};
+```
+
+Example experience assets:
+- **B_Deathmatch**: Enables `ShooterCore` + `DeathmatchRules`
+- **B_ControlPoint**: Enables `ShooterCore` + `ControlPointRules`
+- **B_FrontEnd**: Enables `FrontEndUI` only (no gameplay features)
+
+Each experience shares common features (e.g., `ShooterCore` for weapons, health, HUD) and
+adds mode-specific rules as separate Game Feature plugins.
+
+---
+
+## Experience Manager Component
+
+A `UGameStateComponent` on `AGameStateBase` orchestrates experience loading:
+
+```cpp
+#pragma once
+#include "Components/GameStateComponent.h"
+#include "ExperienceManagerComponent.generated.h"
+
+DECLARE_MULTICAST_DELEGATE_OneParam(FOnExperienceLoaded, const UExperienceDefinition*);
+
+UCLASS()
+class UExperienceManagerComponent : public UGameStateComponent
+{
+    GENERATED_BODY()
+public:
+    // Call from GameMode::InitGame to start loading
+    void SetCurrentExperience(FPrimaryAssetId ExperienceId);
+
+    // Check if experience is fully loaded and active
+    bool IsExperienceLoaded() const { return bExperienceLoaded; }
+
+    // Bind to get notified when experience is ready — fires immediately if already loaded
+    void CallOrRegister_OnExperienceLoaded(FOnExperienceLoaded::FDelegate&& Delegate);
+
+    const UExperienceDefinition* GetCurrentExperience() const { return CurrentExperience; }
+
+    FOnExperienceLoaded OnExperienceLoaded;
+
+private:
+    void OnExperienceLoadComplete();
+    void OnGameFeaturePluginLoadComplete(const UE::GameFeatures::FResult& Result);
+
+    UPROPERTY()
+    TObjectPtr<const UExperienceDefinition> CurrentExperience;
+
+    int32 NumGameFeaturePluginsLoading = 0;
+    bool bExperienceLoaded = false;
+};
+```
+
+---
+
+## Experience Loading Flow
+
+```cpp
+// 1. GameMode selects and starts loading the experience
+void AMyGameMode::InitGame(const FString& MapName, const FString& Options,
+    FString& ErrorMessage)
+{
+    Super::InitGame(MapName, Options, ErrorMessage);
+
+    // Determine experience from map, URL options, or default
+    FPrimaryAssetId ExperienceId = FPrimaryAssetId(
+        FPrimaryAssetType("Experience"), FName("B_Deathmatch"));
+
+    // Get the experience manager on GameState
+    UExperienceManagerComponent* ExpMgr =
+        GameState->FindComponentByClass<UExperienceManagerComponent>();
+    ExpMgr->SetCurrentExperience(ExperienceId);
+}
+
+// 2. ExperienceManagerComponent loads the definition, then activates features
+void UExperienceManagerComponent::SetCurrentExperience(FPrimaryAssetId ExperienceId)
+{
+    // Async load the experience data asset
+    UAssetManager::Get().LoadPrimaryAsset(ExperienceId,
+        TArray<FName>(),
+        FStreamableDelegate::CreateUObject(this,
+            &UExperienceManagerComponent::OnExperienceLoadComplete));
+}
+
+void UExperienceManagerComponent::OnExperienceLoadComplete()
+{
+    // Asset loaded — now activate each Game Feature plugin
+    CurrentExperience = Cast<UExperienceDefinition>(
+        UAssetManager::Get().GetPrimaryAssetObject(ExperienceId));
+
+    UGameFeaturesSubsystem& GFS = UGameFeaturesSubsystem::Get();
+    NumGameFeaturePluginsLoading = CurrentExperience->GameFeaturesToEnable.Num();
+
+    for (const FString& PluginURL : CurrentExperience->GameFeaturesToEnable)
+    {
+        GFS.LoadAndActivateGameFeaturePlugin(PluginURL,
+            FGameFeaturePluginLoadComplete::CreateUObject(
+                this, &UExperienceManagerComponent::OnGameFeaturePluginLoadComplete));
+    }
+
+    // If no plugins to load, mark ready immediately
+    if (NumGameFeaturePluginsLoading == 0)
+    {
+        bExperienceLoaded = true;
+        OnExperienceLoaded.Broadcast(CurrentExperience);
+    }
+}
+
+void UExperienceManagerComponent::OnGameFeaturePluginLoadComplete(
+    const UE::GameFeatures::FResult& Result)
+{
+    NumGameFeaturePluginsLoading--;
+    if (NumGameFeaturePluginsLoading == 0)
+    {
+        bExperienceLoaded = true;
+        OnExperienceLoaded.Broadcast(CurrentExperience);
+    }
+}
+
+// 3. CallOrRegister pattern — fires immediately if already loaded
+void UExperienceManagerComponent::CallOrRegister_OnExperienceLoaded(
+    FOnExperienceLoaded::FDelegate&& Delegate)
+{
+    if (bExperienceLoaded)
+    {
+        Delegate.Execute(CurrentExperience);
+    }
+    else
+    {
+        OnExperienceLoaded.Add(MoveTemp(Delegate));
+    }
+}
+```
+
+---
+
+## Consuming the Experience
+
+Systems that depend on the experience being ready use `CallOrRegister_OnExperienceLoaded`
+instead of assuming features are available at `BeginPlay`:
+
+```cpp
+void UMyPawnComponent::BeginPlay()
+{
+    Super::BeginPlay();
+
+    AGameStateBase* GS = GetWorld()->GetGameState<AGameStateBase>();
+    if (UExperienceManagerComponent* ExpMgr =
+        GS->FindComponentByClass<UExperienceManagerComponent>())
+    {
+        ExpMgr->CallOrRegister_OnExperienceLoaded(
+            FOnExperienceLoaded::FDelegate::CreateUObject(
+                this, &UMyPawnComponent::OnExperienceReady));
+    }
+}
+
+void UMyPawnComponent::OnExperienceReady(const UExperienceDefinition* Experience)
+{
+    // All features active — safe to look up injected components, configure abilities, etc.
+    // Experience->DefaultPawnData contains pawn configuration for this mode
+}
+```
+
+---
+
+## Feature Composition Example
+
+A Deathmatch experience composed from modular features:
+
+```
+B_Deathmatch (UExperienceDefinition)
+├── GameFeaturesToEnable:
+│   ├── "ShooterCore"        → Health, weapons, HUD, hit detection
+│   ├── "DeathmatchRules"    → Score tracking, kill feed, respawn timer
+│   └── "TeamSystem"         → Team assignment, team colors, team HUD
+├── Actions:
+│   └── AddComponents: DeathmatchScoreComponent → AGameState
+└── DefaultPawnData: BP_ShooterCharacter
+```
+
+Switching to Control Point mode replaces `DeathmatchRules` with `ControlPointRules` while
+keeping `ShooterCore` and `TeamSystem`. This avoids duplicating shared gameplay code and
+allows features to be developed and tested independently.
+
+--- REFERENCE: game-feature-patterns.md ---
+# Game Feature Patterns Reference
+
+Complete code templates for Game Feature plugin setup, custom actions, and component injection.
+
+---
+
+## GameFeature .uplugin Template
+
+```json
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0",
+    "FriendlyName": "My Feature",
+    "Description": "Adds my gameplay feature",
+    "Category": "Game Features",
+    "CreatedBy": "",
+    "CreatedByURL": "",
+    "DocsURL": "",
+    "MarketplaceURL": "",
+    "CanContainContent": true,
+    "Installed": false,
+    "ExplicitlyLoaded": true,
+    "Type": "GameFeature",
+    "BuiltInInitialFeatureState": "Active",
+    "Plugins": [
+        { "Name": "GameFeatures", "Enabled": true },
+        { "Name": "ModularGameplay", "Enabled": true }
+    ]
+}
+```
+
+`BuiltInInitialFeatureState` options: `"Installed"` (on disk, not registered), `"Registered"` (registered with Asset Manager, activated by code), `"Active"` (fully active on startup).
+
+---
+
+## Custom UGameFeatureAction Subclass
+
+```cpp
+// MyGameFeatureAction_SpawnManagers.h
+#pragma once
+#include "GameFeatureAction.h"
+#include "GameFeaturesSubsystem.h"
+#include "MyGameFeatureAction_SpawnManagers.generated.h"
+
+UCLASS(MinimalAPI, meta = (DisplayName = "Spawn Managers"))
+class UMyGameFeatureAction_SpawnManagers : public UGameFeatureAction
+{
+    GENERATED_BODY()
+
+public:
+    virtual void OnGameFeatureActivating(FGameFeatureActivatingContext& Context) override;
+    virtual void OnGameFeatureDeactivating(FGameFeatureDeactivatingContext& Context) override;
+
+private:
+    void AddToWorld(const FWorldContext& WorldContext);
+    void HandleGameInstanceStart(UGameInstance* GameInstance);
+
+    // Per-world tracking for PIE support
+    TMap<FObjectKey, TArray<TWeakObjectPtr<AActor>>> SpawnedActorsPerWorld;
+
+    UPROPERTY(EditAnywhere, Category = "Spawn")
+    TSubclassOf<AActor> ManagerClass;
+};
+```
+
+```cpp
+// MyGameFeatureAction_SpawnManagers.cpp
+#include "MyGameFeatureAction_SpawnManagers.h"
+#include "Engine/GameInstance.h"
+#include "Engine/World.h"
+
+void UMyGameFeatureAction_SpawnManagers::OnGameFeatureActivating(
+    FGameFeatureActivatingContext& Context)
+{
+    // Handle worlds already running (hot-activation)
+    for (const FWorldContext& WorldContext : GEngine->GetWorldContexts())
+    {
+        if (Context.ShouldApplyToWorldContext(WorldContext))
+        {
+            AddToWorld(WorldContext);
+        }
+    }
+    // Handle worlds created after activation (new PIE sessions, travel)
+    FWorldDelegates::OnStartGameInstance.AddUObject(
+        this, &UMyGameFeatureAction_SpawnManagers::HandleGameInstanceStart);
+}
+
+void UMyGameFeatureAction_SpawnManagers::OnGameFeatureDeactivating(
+    FGameFeatureDeactivatingContext& Context)
+{
+    FWorldDelegates::OnStartGameInstance.RemoveAll(this);
+
+    for (auto& [WorldKey, ActorArray] : SpawnedActorsPerWorld)
+    {
+        for (TWeakObjectPtr<AActor>& ActorPtr : ActorArray)
+        {
+            if (AActor* Actor = ActorPtr.Get())
+            {
+                Actor->Destroy();
+            }
+        }
+    }
+    SpawnedActorsPerWorld.Empty();
+}
+
+void UMyGameFeatureAction_SpawnManagers::AddToWorld(const FWorldContext& WorldContext)
+{
+    UWorld* World = WorldContext.World();
+    if (!World || !World->IsGameWorld() || !ManagerClass)
+    {
+        return;
+    }
+
+    FActorSpawnParameters SpawnParams;
+    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+    AActor* Spawned = World->SpawnActor<AActor>(ManagerClass, FTransform::Identity, SpawnParams);
+    if (Spawned)
+    {
+        SpawnedActorsPerWorld.FindOrAdd(FObjectKey(World)).Add(Spawned);
+    }
+}
+
+void UMyGameFeatureAction_SpawnManagers::HandleGameInstanceStart(UGameInstance* GameInstance)
+{
+    if (UWorld* World = GameInstance->GetWorld())
+    {
+        for (const FWorldContext& WC : GEngine->GetWorldContexts())
+        {
+            if (WC.World() == World) { AddToWorld(WC); break; }
+        }
+    }
+}
+```
+
+**Key pattern:** Iterate `GEngine->GetWorldContexts()` and check `Context.ShouldApplyToWorldContext()` to support PIE with multiple worlds. Store per-world state with `FObjectKey` as map key.
+
+---
+
+## Actor Receiver Setup
+
+```cpp
+// MyModularCharacter.h — registers for component injection
+#include "GameFrameworkComponentManager.h"
+
+void AMyModularCharacter::BeginPlay()
+{
+    Super::BeginPlay();
+    UGameFrameworkComponentManager::AddGameFrameworkComponentReceiver(this);
+}
+
+void AMyModularCharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    UGameFrameworkComponentManager::RemoveGameFrameworkComponentReceiver(this);
+    Super::EndPlay(EndPlayReason);
+}
+```
+
+Call `RemoveGameFrameworkComponentReceiver` before `Super::EndPlay` to ensure cleanup occurs while the actor is still valid.
+
+---
+
+## Extension Handler Registration
+
+```cpp
+// In a custom UGameFeatureAction or subsystem
+void UMyAction::OnGameFeatureActivating(FGameFeatureActivatingContext& Context)
+{
+    UGameFrameworkComponentManager* CompMgr =
+        UGameInstance::GetSubsystem<UGameFrameworkComponentManager>(
+            /* get game instance from world context */);
+
+    ExtensionHandle = CompMgr->AddExtensionHandler(
+        TSoftClassPtr<AActor>(AMyCharacter::StaticClass()),
+        FExtensionHandlerDelegate::CreateUObject(
+            this, &UMyAction::OnActorExtension));
+}
+
+void UMyAction::OnActorExtension(AActor* Actor, FName EventName)
+{
+    if (EventName == UGameFrameworkComponentManager::NAME_ReceiverAdded)
+    {
+        // Actor just registered — configure initial state
+    }
+    else if (EventName == UGameFrameworkComponentManager::NAME_GameActorReady)
+    {
+        // All init states complete — safe to use all components
+    }
+    else if (EventName == UGameFrameworkComponentManager::NAME_ReceiverRemoved)
+    {
+        // Actor unregistering — clean up references
+    }
+}
+
+void UMyAction::OnGameFeatureDeactivating(FGameFeatureDeactivatingContext& Context)
+{
+    // RAII: dropping the handle removes the extension
+    ExtensionHandle.Reset();
+}
+
+// Member variable — RAII handle
+TSharedPtr<FComponentRequestHandle> ExtensionHandle;
+```
+
+---
+
+## FComponentRequestHandle RAII Lifecycle
+
+```cpp
+// Store handles as member variables for lifetime management
+// Note: TSharedPtr is not supported by UE reflection — no UPROPERTY() here
+TArray<TSharedPtr<FComponentRequestHandle>> ComponentRequests;
+
+void UMyAction::OnGameFeatureActivating(FGameFeatureActivatingContext& Context)
+{
+    UGameFrameworkComponentManager* CompMgr = /* ... */;
+
+    // Each request returns a shared handle — RAII removes on destruction
+    ComponentRequests.Add(CompMgr->AddComponentRequest(
+        TSoftClassPtr<AActor>(AMyCharacter::StaticClass()),
+        UMyHealthComponent::StaticClass(),
+        EGameFrameworkAddComponentFlags::AddUnique));
+
+    ComponentRequests.Add(CompMgr->AddComponentRequest(
+        TSoftClassPtr<AActor>(AMyCharacter::StaticClass()),
+        UMyInventoryComponent::StaticClass(),
+        EGameFrameworkAddComponentFlags::AddUnique));
+}
+
+void UMyAction::OnGameFeatureDeactivating(FGameFeatureDeactivatingContext& Context)
+{
+    // Empty the array — shared pointers destruct — components removed automatically
+    ComponentRequests.Empty();
+}
+```
+
+---
+
+## Custom Action with Async Deactivation
+
+```cpp
+UCLASS(MinimalAPI, meta = (DisplayName = "Save Progress On Deactivate"))
+class UMyAction_SaveProgress : public UGameFeatureAction
+{
+    GENERATED_BODY()
+public:
+    virtual void OnGameFeatureDeactivating(
+        FGameFeatureDeactivatingContext& Context) override
+    {
+        // Pause deactivation — returns FSimpleDelegate that MUST be invoked
+        FSimpleDelegate Resume = Context.PauseDeactivationUntilComplete(
+            TEXT("SaveProgress"));
+
+        // Start async save
+        UGameplayStatics::AsyncSaveGameToSlot(
+            SaveGameObject, TEXT("AutoSave"), 0,
+            FAsyncSaveGameToSlotDelegate::CreateLambda(
+                [Resume](const FString&, const int32, bool bSuccess)
+                {
+                    UE_LOG(LogTemp, Log, TEXT("Save %s"),
+                        bSuccess ? TEXT("succeeded") : TEXT("failed"));
+                    Resume.ExecuteIfBound();  // Resume deactivation
+                }));
+    }
+
+private:
+    UPROPERTY()
+    TObjectPtr<USaveGame> SaveGameObject;
+};
+```
+
+**Critical:** Always invoke the resume delegate, even on error paths. If the async operation can fail silently (timeout, crash), wrap with a safety timer.
+
+---
+
+## Project Policies Subclass
+
+```cpp
+UCLASS()
+class UMyProjectPolicies : public UGameFeaturesProjectPolicies
+{
+    GENERATED_BODY()
+public:
+    virtual bool IsPluginAllowed(const FString& PluginURL, FString* OutReason) const override
+    {
+        // Block specific features in shipping builds
+        if (PluginURL.Contains(TEXT("DebugTools")))
+        {
+            if (OutReason) { *OutReason = TEXT("Debug tools disabled in shipping"); }
+            return false;
+        }
+        return true;
+    }
+
+    virtual void GetGameFeatureLoadingMode(
+        bool& bLoadClientData, bool& bLoadServerData) const override
+    {
+        bLoadClientData = !IsRunningDedicatedServer();
+        bLoadServerData = true;
+    }
+};
+```
+
+Register in `DefaultGame.ini`:
+```ini
+[/Script/GameFeatures.GameFeaturesSubsystemSettings]
+GameFeaturesManagerClassName=/Script/MyProject.UMyProjectPolicies
+```
+

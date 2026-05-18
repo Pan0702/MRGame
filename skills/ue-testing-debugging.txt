@@ -1,0 +1,1246 @@
+# SKILL: ue-testing-debugging
+
+---
+name: ue-testing-debugging
+description: Use when writing automation tests, functional tests, or any test in Unreal Engine. Also use when the user asks about "UE_LOG", logging, log categories, assertion, check, ensure, verify, DrawDebug, debug draw, console command, profiling, Unreal Insights, stat commands, or debugging techniques. See ue-module-build-system for test module setup, and ue-cpp-foundations for general C++ logging patterns.
+metadata:
+  version: 1.0.0
+---
+
+# UE Testing & Debugging
+
+You are an expert in testing, debugging, and profiling Unreal Engine C++ projects.
+
+## Context
+
+Read `.agents/ue-project-context.md` for engine version, existing log categories, test infrastructure (automation modules, test maps), and project-specific conventions before providing guidance.
+
+## Before You Start
+
+Ask which area the user needs help with if unclear:
+- **Automation tests** — unit/integration tests using IMPLEMENT_SIMPLE_AUTOMATION_TEST
+- **Functional tests** — actor-based AFunctionalTest in maps
+- **Logging** — UE_LOG, custom categories, verbosity filtering
+- **Assertions** — check, ensure, verify and when to use each
+- **Debug drawing** — DrawDebug helpers for runtime visualization
+- **Console commands** — UFUNCTION(Exec), FAutoConsoleCommand, CVars
+- **Profiling** — Unreal Insights, stat commands, SCOPE_CYCLE_COUNTER
+
+---
+## Automation Framework
+
+Automation tests live in a dedicated module (e.g., `MyGameTests`) that depends on `"AutomationController"`. Include the module in the editor target via `ExtraModuleNames` and conditionally in the game target via `if (bWithAutomationTests)`.
+
+### Simple Tests
+
+```cpp
+// Source/MyGameTests/Private/MyFeature.spec.cpp
+#include "Misc/AutomationTest.h"
+// Must specify one application context flag AND exactly one filter flag
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMyInventoryTest, "MyGame.Inventory.AddItem",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FMyInventoryTest::RunTest(const FString& Parameters)
+{
+    UInventoryComponent* Inv = NewObject<UInventoryComponent>();
+    Inv->AddItem(FName("Sword"), 1);
+    TestEqual(TEXT("Item count after add"), Inv->GetItemCount(FName("Sword")), 1);
+    TestTrue(TEXT("Has sword"), Inv->HasItem(FName("Sword")));
+    TestFalse(TEXT("No axe"),   Inv->HasItem(FName("Axe")));
+    TestNotNull(TEXT("Inv valid"), Inv);
+    return true;
+}
+```
+
+### Complex / Parameterized Tests
+
+`IMPLEMENT_COMPLEX_AUTOMATION_TEST` requires overriding `GetTests()` to populate the parameter list, and `RunTest(Parameters)` receives each entry in turn.
+
+```cpp
+IMPLEMENT_COMPLEX_AUTOMATION_TEST(FMyAssetLoadTest, "MyGame.Assets.LoadByPath",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+void FMyAssetLoadTest::GetTests(TArray<FString>& OutBeautifiedNames,
+                                 TArray<FString>& OutTestCommands) const
+{
+    OutBeautifiedNames.Add(TEXT("Sword"));  OutTestCommands.Add(TEXT("/Game/Items/BP_Sword"));
+    OutBeautifiedNames.Add(TEXT("Shield")); OutTestCommands.Add(TEXT("/Game/Items/BP_Shield"));
+}
+
+bool FMyAssetLoadTest::RunTest(const FString& Parameters)
+{
+    UObject* Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *Parameters);
+    if (!TestNotNull(TEXT("Asset loaded"), Asset)) { return false; }
+    TestTrue(TEXT("Is DataAsset"), Asset->IsA<UPrimaryDataAsset>());
+    return true;
+}
+```
+
+### Test Assertion Methods
+
+```cpp
+// Equality — overloaded for int32, int64, float, double, FVector, FRotator,
+//            FTransform, FColor, FLinearColor, FString, FStringView, FText, FName
+TestEqual(TEXT("Label"), Actual, Expected);
+TestEqual(TEXT("Float approx"), ActualF, ExpectedF, 0.001f);   // tolerance overload
+
+// Boolean
+TestTrue(TEXT("Label"), bCondition);
+TestFalse(TEXT("Label"), bCondition);
+
+// Pointer / validity
+TestNotNull(TEXT("Label"), Ptr);          // fails if Ptr == nullptr
+TestNull(TEXT("Label"), Ptr);             // fails if Ptr != nullptr
+TestValid(TEXT("Label"), WeakPtr);        // IsValid() check on TWeakObjectPtr etc.
+
+// Custom failure messages
+AddError(FString::Printf(TEXT("Unexpected damage %d"), Damage));
+AddWarning(TEXT("Deprecated path hit"));
+
+// Add error and bail — returns false from RunTest if condition fails
+UE_RETURN_ON_ERROR(Ptr != nullptr, TEXT("Ptr must not be null"));
+```
+
+### Test Flags Reference
+
+| Flag | Meaning |
+|---|---|
+| `EditorContext` | Runs in the editor process |
+| `ClientContext` | Runs in game client |
+| `ServerContext` | Runs on dedicated server |
+| `SmokeFilter` | Fast; runs on every CI check-in |
+| `ProductFilter` | Project/game-level tests |
+
+---
+## Latent Commands (Async Testing)
+
+Use latent commands when the test must wait for an async operation. `Update()` returns `true` when done, `false` to retry next frame.
+
+```cpp
+DEFINE_LATENT_AUTOMATION_COMMAND_ONE_PARAMETER(FWaitSecondsCommand, float, Duration);
+bool FWaitSecondsCommand::Update() { return GetCurrentRunTime() >= Duration; }
+
+// Enqueue inside RunTest; commands drain sequentially after RunTest returns
+ADD_LATENT_AUTOMATION_COMMAND(FWaitSecondsCommand(2.0f));
+```
+
+See `references/automation-test-patterns.md` for delegate-wait, timeout, and post-async assertion patterns.
+
+---
+## Functional Tests
+
+`AFunctionalTest` is a `UCLASS` actor placed in a test map. Override `StartTest()` and call `FinishTest()` when done.
+
+```cpp
+// MyFunctionalTest.h
+UCLASS()
+class MYGAMETESTS_API AMyFunctionalTest : public AFunctionalTest
+{
+    GENERATED_BODY()
+public:
+    virtual void StartTest() override;
+private:
+    UFUNCTION() void OnTimerExpired();
+    FTimerHandle TimerHandle;
+};
+
+// MyFunctionalTest.cpp
+void AMyFunctionalTest::StartTest()
+{
+    Super::StartTest();
+    GetWorldTimerManager().SetTimer(TimerHandle, this,
+        &AMyFunctionalTest::OnTimerExpired, 1.0f, false);
+}
+
+void AMyFunctionalTest::OnTimerExpired()
+{
+    bool bPassed = /* verify world state */ true;
+    FinishTest(bPassed ? EFunctionalTestResult::Succeeded
+                       : EFunctionalTestResult::Failed,
+               TEXT("Timer-based check"));
+}
+```
+
+Place actors in `Maps/Test_MyFeature.umap`. Run via `RunAutomationTest "MyGame.Functional.MyFeature"` or the Session Frontend.
+
+### TimeLimit
+
+```cpp
+// Timeout — auto-fail if test exceeds time limit
+void AMyFunctionalTest::PrepareTest()
+{
+    Super::PrepareTest();
+    TimeLimit = 10.0f;  // seconds; 0 = no timeout (default)
+}
+```
+
+---
+## Logging
+
+### Declaring and Defining a Category
+
+```cpp
+// MyModule.h  — visible across the module
+DECLARE_LOG_CATEGORY_EXTERN(LogMyModule, Log, All);
+//                           ^Name       ^Default  ^CompileTime max
+
+// MyModule.cpp
+DEFINE_LOG_CATEGORY(LogMyModule);
+
+// Single-file static category (no extern needed)
+DEFINE_LOG_CATEGORY_STATIC(LogMyHelper, Warning, All);
+```
+
+### UE_LOG Usage
+
+```cpp
+// UE_LOG(CategoryName, Verbosity, Format, ...)
+UE_LOG(LogMyModule, Log,        TEXT("Player spawned: %s"), *PlayerName);
+UE_LOG(LogMyModule, Warning,    TEXT("Inventory full, dropping item %s"), *ItemName);
+UE_LOG(LogMyModule, Error,      TEXT("Failed to load asset at %s"), *AssetPath);
+UE_LOG(LogMyModule, Verbose,    TEXT("Tick called, dt=%.4f"), DeltaTime);
+UE_LOG(LogMyModule, Fatal,      TEXT("Unrecoverable save corruption")); // crashes
+
+// Conditional log — condition evaluated only if category/verbosity is active
+UE_CLOG(Health <= 0.f, LogMyModule, Warning, TEXT("Actor %s has zero health"), *GetName());
+```
+
+### Verbosity Levels (highest to lowest severity)
+
+| Level | When to use |
+|---|---|
+| `Fatal` | Crash-worthy unrecoverable errors |
+| `Error` | Operation failed, needs developer attention |
+| `Warning` | Unexpected but recoverable condition |
+| `Display` | User-visible output (always shown) |
+| `Log` | Standard development info |
+| `Verbose` | Detailed per-frame or per-call info |
+| `VeryVerbose` | Trace-level; very high frequency |
+
+### Structured Logging (UE 5.2+)
+
+```cpp
+#include "Logging/StructuredLog.h"
+// Named fields — order does not matter; extra fields beyond the format string are allowed
+UE_LOGFMT(LogMyModule, Warning,
+    "Loading '{Name}' failed with error {Error}",
+    ("Name", AssetName), ("Error", ErrorCode), ("Flags", LoadFlags));
+```
+
+### Runtime Log Filtering
+
+```
+# Command line: set a category to Verbose at startup
+-LogCmds="LogMyModule Verbose, LogAI Warning"
+
+# Console at runtime
+Log LogMyModule Verbose
+Log LogAI Warning
+Log reset          # restore defaults
+```
+
+---
+## Assertions
+
+Assertions are defined in `Misc/AssertionMacros.h`. Understand the build-configuration behaviour before choosing one.
+
+### check / checkf
+
+```cpp
+// Active in Debug, Development, Test. REMOVED in Shipping (expression not evaluated).
+check(Ptr != nullptr);
+checkf(Index >= 0 && Index < Array.Num(),
+       TEXT("Index %d out of range [0,%d)"), Index, Array.Num());
+
+// Debug-only (DO_GUARD_SLOW — only Debug builds)
+checkSlow(ExpensiveValidationFn());
+
+// Marks unreachable code paths
+checkNoEntry();
+
+// Marks code that must only execute once
+checkNoReentry();
+```
+
+### ensure / ensureMsgf
+
+```cpp
+// Non-fatal. Logs callstack and submits crash report. Execution continues.
+// Fires only ONCE per call site per session (subsequent failures are silent).
+if (ensure(Component != nullptr))
+{
+    Component->DoWork();  // safe to call here
+}
+
+// With a message
+ensureMsgf(Health > 0.f, TEXT("Actor %s has non-positive health %.1f"),
+           *GetName(), Health);
+
+// Always fires (not just once per session)
+ensureAlways(bInitialized);
+ensureAlwaysMsgf(bInitialized, TEXT("System not initialized before use"));
+```
+
+### verify / verifyf
+
+```cpp
+// Expression ALWAYS evaluated (even in Shipping), but only halts in non-Shipping.
+// Use when expression has side effects you always need.
+verify(Manager->Init());
+verifyf(Count++ < MaxCount, TEXT("Exceeded max count %d"), MaxCount);
+```
+
+### Decision Guide
+
+| Situation | Macro |
+|---|---|
+| Class invariant, programmer error | `check` / `checkf` |
+| Recoverable condition, want to continue | `ensure` / `ensureMsgf` |
+| Expression has side effects always needed | `verify` / `verifyf` |
+| Debug-build heavy validation | `checkSlow` |
+| User-facing input validation | **none** — use explicit if/return |
+
+---
+## Debug Drawing
+
+Debug draw functions from `DrawDebugHelpers.h` render geometry directly in the world viewport during PIE or standalone builds. They are stripped by `#if ENABLE_DRAW_DEBUG` in Shipping.
+
+```cpp
+#include "DrawDebugHelpers.h"
+
+// Duration > 0 = seconds visible; bPersistentLines = true for permanent.
+// Duration 0 or -1 both show for one frame.
+UWorld* World = GetWorld();
+DrawDebugLine(World, StartLoc, EndLoc, FColor::Red, false, 2.0f, 0, 2.0f);
+DrawDebugSphere(World, Center, Radius, 12, FColor::Green, false, 2.0f);
+DrawDebugBox(World, Center, Extent, FColor::Blue, false, 2.0f);
+DrawDebugCapsule(World, Center, HalfHeight, Radius,
+                 FQuat::Identity, FColor::Yellow, false, 2.0f);
+DrawDebugPoint(World, Location, 8.0f, FColor::White, false, 2.0f);
+DrawDebugDirectionalArrow(World, Start, End, 40.0f, FColor::Cyan, false, 2.0f);
+DrawDebugString(World, Location, TEXT("Label"), nullptr,
+                FColor::White, 2.0f, true);
+
+// Clear all persistent debug geometry
+FlushPersistentDebugLines(World);
+
+// Guard persistent draws for shipping: #if ENABLE_DRAW_DEBUG ... #endif
+// UKismetSystemLibrary::DrawDebugSphere (and siblings) auto-gate behind ENABLE_DRAW_DEBUG
+```
+
+---
+## Console Commands
+
+### Exec Functions
+
+```cpp
+// AMyPlayerController.h
+UFUNCTION(Exec)
+void ToggleGodMode();
+
+// AMyPlayerController.cpp
+void AMyPlayerController::ToggleGodMode()
+{
+    bGodMode = !bGodMode;
+    UE_LOG(LogMyModule, Display, TEXT("GodMode: %s"), bGodMode ? TEXT("ON") : TEXT("OFF"));
+}
+```
+
+Exec functions work when typed in the console (~) if on a `PlayerController`, `Pawn`, `HUD`, `GameMode`, `GameState`, `CheatManager`, or `GameInstance`.
+
+### FAutoConsoleCommand and CVars
+
+```cpp
+// Registers at static init; no world context needed
+static FAutoConsoleCommand GDumpStatsCmd(
+    TEXT("MyGame.DumpStats"), TEXT("Dump gameplay stats"),
+    FConsoleCommandDelegate::CreateLambda([]()
+    {
+        UE_LOG(LogMyModule, Display, TEXT("=== GameStats ==="));
+    }));
+
+// With world + args (PIE-safe; prefer this for gameplay commands)
+static FAutoConsoleCommandWithWorldAndArgs GSpawnItemCmd(
+    TEXT("MyGame.SpawnItem"), TEXT("Usage: MyGame.SpawnItem <Name>"),
+    FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+        [](const TArray<FString>& Args, UWorld* World) { /* spawn */ }));
+
+// CVar — declare in .cpp to avoid ODR issues
+static TAutoConsoleVariable<float> CVarDamageScale(
+    TEXT("MyGame.DamageScale"), 1.0f,
+    TEXT("Scales all outgoing damage."), ECVF_Cheat);
+float Scale = CVarDamageScale.GetValueOnGameThread();
+
+// Attach CVar to an existing variable
+float GDrawDistance = 5000.0f;
+static FAutoConsoleVariableRef CVarDrawDistance(
+    TEXT("MyGame.DrawDistance"), GDrawDistance,
+    TEXT("Draw distance for gameplay objects"), ECVF_Default);
+```
+
+### Runtime Command Registration
+
+```cpp
+// Runtime registration — call from StartupModule, Initialize, or BeginPlay
+IConsoleCommand* Cmd = IConsoleManager::Get().RegisterConsoleCommand(
+    TEXT("MyGame.ReloadConfig"),
+    TEXT("Reloads runtime config"),
+    FConsoleCommandDelegate::CreateUObject(this, &UMySubsystem::ReloadConfig));
+// Unregister when the owning object is destroyed:
+IConsoleManager::Get().UnregisterConsoleObject(Cmd);
+```
+
+Unlike `FAutoConsoleCommand` (static init registration), `RegisterConsoleCommand` registers at runtime and returns a handle for explicit cleanup.
+
+---
+## Custom Stat Groups & Profiling Markers
+
+```cpp
+// Declare in a .cpp — feeds stat commands and Unreal Insights
+DECLARE_STATS_GROUP(TEXT("MyGame"), STATGROUP_MyGame, STATCAT_Advanced);
+DECLARE_CYCLE_STAT(TEXT("MySystem Tick"), STAT_MySystemTick, STATGROUP_MyGame);
+DECLARE_CYCLE_STAT(TEXT("PathFind"),      STAT_PathFind,     STATGROUP_MyGame);
+
+void UMySystem::Tick(float DeltaTime) { SCOPE_CYCLE_COUNTER(STAT_MySystemTick); }
+FPath UMySystem::FindPath(...)        { SCOPE_CYCLE_COUNTER(STAT_PathFind); }
+
+// Named events — colored blocks in Insights, no stat overhead
+#include "HAL/PlatformMisc.h"
+void UMySystem::HeavyOperation() { SCOPED_NAMED_EVENT(MyHeavyOp, FColor::Orange); }
+
+// CSV profiling — lightweight always-on telemetry written to Saved/Profiling/CSVStats/
+#include "ProfilingDebugging/CsvProfiler.h"
+CSV_DEFINE_CATEGORY(MyGame, true);
+void UMySystem::Tick(float DeltaTime) { CSV_SCOPED_TIMING_STAT(MyGame, SystemTick); }
+```
+
+---
+## Debugging Techniques
+
+### Visual Logger
+
+```cpp
+#include "VisualLogger/VisualLogger.h"
+// Window > Visual Logger shows a timeline of shapes and log events per actor
+UE_VLOG_SPHERE(this, LogMyModule, Verbose, GetActorLocation(), 50.0f, FColor::Green, TEXT("Patrol point"));
+UE_VLOG_SEGMENT(this, LogMyModule, Log, From, To, FColor::Red, TEXT("Path"));
+UE_VLOG(this, LogMyModule, Log, TEXT("State: %s"), *StateName);
+```
+
+### Gameplay Debugger
+
+Press `'` (apostrophe) in PIE to open the Gameplay Debugger. It shows AI, EQS, Ability System, and custom categories. Register a custom category in module startup:
+
+```cpp
+IGameplayDebugger::Get().RegisterCategory("MySystem",
+    IGameplayDebugger::FOnGetCategory::CreateStatic(&FMyDebugCategory::MakeInstance),
+    EGameplayDebuggerCategoryState::EnabledInGame);
+```
+
+### IDE Breakpoint Debugging
+
+Attach Visual Studio or Rider to the running `UnrealEditor` process (Debug > Attach to Process). Use `DebugGame` or `Debug` configuration for full symbol resolution -- `Development` strips many symbols.
+
+```cpp
+// Break on assertion failures -- set breakpoints on these functions:
+// FDebug::AssertFailed       (check/checkf)
+// FDebug::EnsureFailed       (ensure/ensureMsgf)
+// FDebug::OptionallyLogFormattedEnsureMessageReturningFalse
+
+// Conditional breakpoint example (VS/Rider):
+// Condition: Actor->GetName().Contains(TEXT("Enemy"))
+// Hit count: break on 5th hit
+```
+
+For `check()` and `ensure()` failures, set breakpoints on the handler functions above -- they fire before crash/log, letting you inspect the call stack.
+
+### Crash Analysis
+
+- Minidumps land in `Saved/Crashes/`. Open with `UnrealEditor-Win64-DebugGame` PDB in WinDbg or Rider.
+- `FDebug::DumpStackTraceToLog(ELogVerbosity::Error)` prints the current callstack to the log.
+- `ensure` submits a callstack to the Crash Reporter without crashing the process.
+
+**Network**: `-NetTrace` for replication capture, `stat net` for live bandwidth, `net.ListActorChannels` for actor channels.
+
+**Key profiling commands**: `stat startfile`/`stat stopfile` (.uestats capture for Insights), `stat gpu`/`ProfileGPU` (GPU timing), `stat memoryplatform`/`memreport -full` (memory), `-trace=cpu,gpu,frame,memory` (Insights launch args). See `references/profiling-commands.md`.
+
+---
+
+## Common Mistakes
+
+**check() in shipping** — `check()` expressions are compiled out of Shipping builds. Never put required logic inside a check expression; use `verify()` if the expression must always evaluate.
+
+**ensure fires only once** — After the first ensure failure at a call site, subsequent calls at that site are silent. Use `ensureAlways` if you need every failure reported.
+
+**DrawDebug in shipping** — DrawDebug calls do not exist in Shipping without `ENABLE_DRAW_DEBUG`. Wrap persistent draws with `#if ENABLE_DRAW_DEBUG`.
+
+**Missing log category** — Defining `UE_LOG` with a category not visible in the current translation unit causes a linker error. Include the header that declares the category.
+
+**Automation test without a filter flag** — Every `IMPLEMENT_SIMPLE_AUTOMATION_TEST` must have exactly one filter flag (Smoke, Engine, Product, Perf, Stress, or Negative). Missing it is a compile-time `static_assert` failure.
+
+**Latent command after `return true`** — Latent commands are enqueued before the function returns. Do not enqueue them after the `return true;` statement.
+
+**Log spam in multiplayer** — Identical log calls fire from both server and each client. Prefix messages with `GetWorld()->GetNetMode()` or use `UE_CLOG(HasAuthority(), ...)` to reduce noise.
+
+---
+
+## Related Skills
+
+- `ue-cpp-foundations` — UE macro system, delegates, FString, UE_LOG basics
+- `ue-module-build-system` — setting up a dedicated test module and target inclusion
+- `ue-actor-component-architecture` — AFunctionalTest placement and world interaction
+
+---
+## References
+
+- `references/automation-test-patterns.md` — test setup patterns, latent commands, common scenarios
+- `references/profiling-commands.md` — stat commands, Insights capture, analysis workflow
+
+--- REFERENCE: automation-test-patterns.md ---
+# Automation Test Patterns
+
+Reference for common Unreal Engine automation test setups, latent command patterns, and scenario recipes. All patterns use the real API from `Misc/AutomationTest.h`.
+
+---
+
+## Test Module Setup
+
+### Build Rules
+
+```csharp
+// MyGameTests.Build.cs
+public class MyGameTests : ModuleRules
+{
+    public MyGameTests(ReadOnlyTargetRules Target) : base(Target)
+    {
+        PrivateDependencyModuleNames.AddRange(new string[]
+        {
+            "Core",
+            "CoreUObject",
+            "Engine",
+            "AutomationController",
+            "MyGame",           // the module being tested
+        });
+
+        // Include editor-only dependencies when running in Editor context
+        if (Target.bBuildEditor)
+        {
+            PrivateDependencyModuleNames.Add("UnrealEd");
+        }
+    }
+}
+```
+
+### Target File Inclusion
+
+```csharp
+// MyGameEditor.Target.cs  (editor target — tests run here)
+ExtraModuleNames.Add("MyGameTests");
+
+// MyGame.Target.cs  (game target — tests excluded unless bWithAutomationTests)
+if (bWithAutomationTests)
+{
+    ExtraModuleNames.Add("MyGameTests");
+}
+```
+
+### Naming Convention
+
+```
+MyGame.Category.SubCategory.TestName
+
+Examples:
+  MyGame.Inventory.AddItem
+  MyGame.Inventory.RemoveItem
+  MyGame.Inventory.Overflow
+  MyGame.Pathfinding.SimpleGrid
+  MyGame.Pathfinding.ObstacleDense
+  MyGame.Assets.PrimaryWeaponLoad
+```
+
+The dot-separated path creates a tree in the Session Frontend Automation tab.
+
+---
+
+## Pattern: Pure Logic Test (No World)
+
+For testing stateless utility functions and pure C++ classes.
+
+```cpp
+#include "Misc/AutomationTest.h"
+#include "MyMath.h"   // the unit under test
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FMyMathLerpTest,
+    "MyGame.Math.LerpClamped",
+    EAutomationTestFlags::EditorContext |
+    EAutomationTestFlags::SmokeFilter)   // SmokeFilter = fast, runs every check-in
+
+bool FMyMathLerpTest::RunTest(const FString& Parameters)
+{
+    TestEqual(TEXT("Lerp at 0"),   MyMath::LerpClamped(0.f, 10.f, 0.f), 0.f,  0.001f);
+    TestEqual(TEXT("Lerp at 1"),   MyMath::LerpClamped(0.f, 10.f, 1.f), 10.f, 0.001f);
+    TestEqual(TEXT("Lerp at 0.5"), MyMath::LerpClamped(0.f, 10.f, 0.5f), 5.f, 0.001f);
+    // Clamped: alpha outside [0,1] saturates
+    TestEqual(TEXT("Lerp above 1"), MyMath::LerpClamped(0.f, 10.f, 2.f), 10.f, 0.001f);
+    TestEqual(TEXT("Lerp below 0"), MyMath::LerpClamped(0.f, 10.f, -1.f), 0.f, 0.001f);
+    return true;
+}
+```
+
+---
+
+## Pattern: UObject Test (Requires GC)
+
+For testing `UObject`-derived classes. `NewObject<>` requires a valid outer.
+
+```cpp
+#include "Misc/AutomationTest.h"
+#include "Engine/Engine.h"
+#include "Inventory/InventoryComponent.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FInventoryComponentTest,
+    "MyGame.Inventory.AddRemove",
+    EAutomationTestFlags::EditorContext |
+    EAutomationTestFlags::ProductFilter)
+
+bool FInventoryComponentTest::RunTest(const FString& Parameters)
+{
+    // Use GetTransientPackage() as outer for test UObjects
+    UInventoryComponent* Inv = NewObject<UInventoryComponent>(GetTransientPackage());
+    if (!TestNotNull(TEXT("Inventory created"), Inv)) { return false; }
+
+    Inv->AddItem(FName("Sword"), 3);
+    TestEqual(TEXT("Count after add"), Inv->GetCount(FName("Sword")), 3);
+
+    Inv->RemoveItem(FName("Sword"), 1);
+    TestEqual(TEXT("Count after remove"), Inv->GetCount(FName("Sword")), 2);
+
+    Inv->RemoveItem(FName("Sword"), 99);  // over-remove
+    TestEqual(TEXT("Count clamped at 0"), Inv->GetCount(FName("Sword")), 0);
+
+    // TestValid works on TWeakObjectPtr and IsValid()-capable types
+    TWeakObjectPtr<UInventoryComponent> WeakInv(Inv);
+    TestValid(TEXT("Weak ref valid"), WeakInv);
+
+    return true;
+}
+```
+
+---
+
+## Pattern: Parameterized Test Over Asset Paths
+
+```cpp
+IMPLEMENT_COMPLEX_AUTOMATION_TEST(
+    FDataAssetValidation,
+    "MyGame.Assets.DataAssetValidation",
+    EAutomationTestFlags::EditorContext |
+    EAutomationTestFlags::ProductFilter)
+
+void FDataAssetValidation::GetTests(TArray<FString>& OutBeautifiedNames,
+                                     TArray<FString>& OutTestCommands) const
+{
+    // Enumerate assets at editor time
+    FAssetRegistryModule& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+    TArray<FAssetData> Assets;
+    AR.Get().GetAssetsByClass(UMyItemData::StaticClass()->GetClassPathName(), Assets);
+
+    for (const FAssetData& Asset : Assets)
+    {
+        OutBeautifiedNames.Add(Asset.AssetName.ToString());
+        OutTestCommands.Add(Asset.GetObjectPathString());
+    }
+}
+
+bool FDataAssetValidation::RunTest(const FString& Parameters)
+{
+    // Parameters = the object path string from OutTestCommands
+    UMyItemData* ItemData = LoadObject<UMyItemData>(nullptr, *Parameters);
+    UE_RETURN_ON_ERROR(ItemData != nullptr,
+        FString::Printf(TEXT("Failed to load %s"), *Parameters));
+
+    TestFalse(TEXT("DisplayName not empty"),
+              ItemData->DisplayName.IsEmpty());
+    TestTrue(TEXT("MaxStack > 0"),
+             ItemData->MaxStack > 0);
+    TestNotNull(TEXT("Icon set"), ItemData->Icon.LoadSynchronous());
+
+    return true;
+}
+```
+
+---
+
+## Pattern: Expected Error / Negative Test
+
+Use `AddExpectedMessage` to suppress and verify expected error log output.
+
+```cpp
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FInventoryOverflowNegativeTest,
+    "MyGame.Inventory.OverflowRejectsItem",
+    EAutomationTestFlags::EditorContext |
+    EAutomationTestFlags::ProductFilter |
+    EAutomationTestFlags::NegativeFilter)
+
+bool FInventoryOverflowNegativeTest::RunTest(const FString& Parameters)
+{
+    // Tell the framework to expect (and suppress) this warning
+    AddExpectedMessage(TEXT("Inventory is full"),
+                       ELogVerbosity::Warning,
+                       EAutomationExpectedMessageFlags::Contains);
+
+    UInventoryComponent* Inv = NewObject<UInventoryComponent>(GetTransientPackage());
+    Inv->SetMaxSlots(1);
+    Inv->AddItem(FName("Sword"), 1);   // fills the slot
+
+    // This should log "Inventory is full" and return false
+    bool bAdded = Inv->AddItem(FName("Shield"), 1);
+    TestFalse(TEXT("Second item rejected"), bAdded);
+
+    return true;
+}
+```
+
+---
+
+## Pattern: Latent Command — Wait for Delegate
+
+```cpp
+#include "Misc/AutomationTest.h"
+
+// Command that waits until a shared bool flag is set
+DEFINE_LATENT_AUTOMATION_COMMAND_ONE_PARAMETER(
+    FWaitForBoolCommand, TSharedPtr<bool>, bDone);
+
+bool FWaitForBoolCommand::Update()
+{
+    return bDone.IsValid() && *bDone;
+}
+
+// Command with timeout
+DEFINE_LATENT_AUTOMATION_COMMAND_TWO_PARAMETER(
+    FWaitForBoolOrTimeoutCommand, TSharedPtr<bool>, bDone, float, Timeout);
+
+bool FWaitForBoolOrTimeoutCommand::Update()
+{
+    if (bDone.IsValid() && *bDone) { return true; }
+    if (GetCurrentRunTime() > Timeout)
+    {
+        // Logging in a latent command does NOT add a test error automatically
+        // Store the test ref if you need to call AddError
+        return true;  // done (timed out)
+    }
+    return false;
+}
+
+// Usage inside a test
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+    FAsyncOperationTest,
+    "MyGame.Async.SubsystemReady",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::ProductFilter)
+
+bool FAsyncOperationTest::RunTest(const FString& Parameters)
+{
+    TSharedPtr<bool> bReady = MakeShared<bool>(false);
+
+    // Kick off async work, flip bReady when done
+    UMySubsystem* Sub = GEngine->GetEngineSubsystem<UMySubsystem>();
+    if (!TestNotNull(TEXT("Subsystem"), Sub)) { return false; }
+
+    Sub->InitAsync([bReady]() { *bReady = true; });
+
+    // Wait up to 5 seconds
+    ADD_LATENT_AUTOMATION_COMMAND(FWaitForBoolOrTimeoutCommand(bReady, 5.0f));
+
+    // Latent commands run after RunTest returns; assertions here run immediately
+    // For post-async assertions, use a custom latent command that captures the test ptr
+    return true;
+}
+```
+
+---
+
+## Pattern: Latent Command — Validate After Async
+
+To make assertions after async work, capture the test reference in the latent command.
+
+```cpp
+class FValidateAfterAsyncCommand : public IAutomationLatentCommand
+{
+public:
+    FValidateAfterAsyncCommand(FAutomationTestBase* InTest,
+                                TSharedPtr<bool> InbDone,
+                                TSharedPtr<int32> InResult)
+        : Test(InTest), bDone(InbDone), Result(InResult) {}
+
+    virtual bool Update() override
+    {
+        if (!bDone.IsValid() || !*bDone) { return false; }
+        Test->TestEqual(TEXT("Async result"), *Result, 42);
+        return true;
+    }
+
+private:
+    FAutomationTestBase* Test;
+    TSharedPtr<bool> bDone;
+    TSharedPtr<int32> Result;
+};
+
+// In RunTest:
+bool FMyAsyncCalcTest::RunTest(const FString& Parameters)
+{
+    auto bDone   = MakeShared<bool>(false);
+    auto Result  = MakeShared<int32>(0);
+
+    UMyCalc::RunAsync([bDone, Result](int32 Val)
+    {
+        *Result = Val;
+        *bDone  = true;
+    });
+
+    ADD_LATENT_AUTOMATION_COMMAND(FValidateAfterAsyncCommand(this, bDone, Result));
+    return true;
+}
+```
+
+---
+
+## Running Tests
+
+### Session Frontend (Editor)
+
+1. Open **Window > Session Frontend > Automation**.
+2. Connect to the local session.
+3. Filter by name or flags; check boxes and click **Start Tests**.
+
+### Command Line (Unattended)
+
+```bash
+# Run all tests matching a name filter, exit when done
+UnrealEditor-Cmd MyGame -ExecCmds="Automation RunTests MyGame.Inventory" \
+    -unattended -nopause -testexit="Automation Test Queue Empty" \
+    -log -abslog=TestOutput.log
+
+# Run smoke tests only
+UnrealEditor-Cmd MyGame \
+    -ExecCmds="Automation RunFilter Smoke" \
+    -unattended -nopause -testexit="Automation Test Queue Empty"
+```
+
+### Programmatic (C++ / Python)
+
+```python
+# Inside Editor Python (via Editor Python Plugin)
+import unreal
+subsystem = unreal.get_editor_subsystem(unreal.AutomationControllerManager)
+# Use Automation Controller API to queue and run tests
+```
+
+---
+
+## Context Stack for Test Grouping
+
+Use `PushContext` / `PopContext` to annotate which sub-step caused a failure.
+
+```cpp
+bool FMyComplexTest::RunTest(const FString& Parameters)
+{
+    ExecutionInfo.PushContext(TEXT("Phase 1: Setup"));
+    // ... setup assertions
+    ExecutionInfo.PopContext();
+
+    ExecutionInfo.PushContext(TEXT("Phase 2: Execute"));
+    // ... execute assertions
+    ExecutionInfo.PopContext();
+
+    return true;
+}
+```
+
+Errors recorded while a context is active will include the context string in the failure report.
+
+---
+
+## Test Telemetry
+
+Report numeric measurements alongside test results (captured by automation infrastructure):
+
+```cpp
+bool FMyPerfTest::RunTest(const FString& Parameters)
+{
+    double StartTime = FPlatformTime::Seconds();
+    // ... operation
+    double Duration = FPlatformTime::Seconds() - StartTime;
+
+    // Reports DataPoint="SpawnTime", Measurement=Duration to telemetry
+    // ExecutionInfo.TelemetryStorage = TEXT("MyGamePerf");
+    // ExecutionInfo.TelemetryItems.Emplace(TEXT("SpawnTime"), Duration, TEXT("ms"));
+    FAutomationTestFramework::Get().AddAnalyticsItemToCurrentTest(
+        FString::Printf(TEXT("SpawnTime=%.2fms"), Duration * 1000.0));
+
+    return true;
+}
+```
+
+--- REFERENCE: profiling-commands.md ---
+# Profiling Commands & Unreal Insights
+
+Reference for stat commands, Unreal Insights capture, custom profiling markers, CSV telemetry, and performance analysis workflow.
+
+---
+
+## Built-in Stat Commands
+
+All `stat` commands are typed into the in-game console (`~`) or passed via `-ExecCmds` on the command line.
+
+### Frame & CPU
+
+| Command | Description |
+|---|---|
+| `stat fps` | Frame rate and frame time overlay |
+| `stat unit` | Game, Draw, GPU, Frame times in ms |
+| `stat unitgraph` | Rolling graph of unit timings |
+| `stat game` | Game thread breakdown: Tick, Actors, Components |
+| `stat engine` | Engine-level counters |
+| `stat tasks` | Async task system occupancy |
+| `stat threads` | Per-thread CPU times |
+| `stat slate` | Slate UI widget tick cost |
+| `stat scenerendering` | Scene rendering draw calls and primitives |
+| `stat initviews` | Visibility / frustum culling cost |
+
+### Memory
+
+| Command | Description |
+|---|---|
+| `stat memory` | High-level memory categories |
+| `stat memoryplatform` | OS-level virtual / physical memory |
+| `stat streaming` | Texture and mesh streaming stats |
+| `stat streamingdetails` | Per-resource streaming detail |
+| `memreport` | Full memory dump to `Saved/Profiling/MemReports/` |
+| `memreport -full` | Extended dump including asset registry |
+| `obj list class=Texture2D` | Count and size of all loaded Texture2D objects |
+| `obj list class=StaticMesh sortby=size` | Mesh objects sorted by memory |
+
+### GPU
+
+| Command | Description |
+|---|---|
+| `stat gpu` | Per-pass GPU time overlay (requires GPU timing support) |
+| `ProfileGPU` | Single-frame GPU capture, opens in RenderDoc-style viewer |
+| `r.ProfileGPU.Pattern *` | Set capture pattern (default `*` = everything) |
+| `r.GPUBusyWait 1` | Force busy-wait timing for more accurate GPU stats |
+
+### Networking
+
+| Command | Description |
+|---|---|
+| `stat net` | Network channel counts, saturation, packet loss |
+| `stat netdetailed` | Per-actor replication bandwidth |
+| `net.Stats 1` | Enable network stats overlay |
+
+---
+
+## Capturing Stats to File
+
+### .uestats Capture (Legacy)
+
+```
+# In-game console
+stat startfile          # starts recording to Saved/Profiling/
+stat stopfile           # stops and writes the .uestats file
+
+# Open in: UnrealEditor > Window > Session Frontend > Profiler tab
+# Or use deprecated StatsViewer commandlet
+```
+
+### Command-Line Automated Capture
+
+```bash
+# Capture for 10 seconds then exit
+UnrealEditor-Cmd MyGame -game \
+    -ExecCmds="stat startfile, delay 10, stat stopfile, quit" \
+    -log
+```
+
+---
+
+## Unreal Insights
+
+Unreal Insights replaces the legacy profiler for CPU, GPU, memory, and network trace analysis.
+
+### Starting a Trace
+
+```bash
+# Attach Insights at launch (preferred for full coverage)
+UnrealEditor MyGame \
+    -trace=cpu,gpu,frame,memory,loadtime,log,bookmark \
+    -tracehost=127.0.0.1         # send to local Insights recorder
+    # or -tracefile=MyCapture.utrace   to write directly to disk
+
+# Insight trace channels
+#   cpu        — CPU thread events and named events
+#   gpu        — GPU pass timings (requires RHI support)
+#   frame      — per-frame markers
+#   memory     — LLM allocation tracking
+#   loadtime   — asset and package load timings
+#   log        — UE_LOG lines embedded in timeline
+#   bookmark   — UE_TRACE_BOOKMARK calls
+#   task       — Task Graph tasks
+#   rhicommands — RHI command list
+```
+
+### Runtime Console Commands
+
+```
+# Start trace mid-session
+Trace.Start cpu,frame,gpu
+
+# Stop trace
+Trace.Stop
+
+# Bookmark (appears as vertical line in Insights timeline)
+Trace.Bookmark "LevelLoaded"
+```
+
+### Opening Insights
+
+```bash
+# Launch the standalone Insights app
+Engine/Binaries/Win64/UnrealInsights.exe
+
+# Open a .utrace file directly
+UnrealInsights.exe MyCapture.utrace
+```
+
+Key Insights views:
+
+- **Timing Insights** — CPU/GPU flame chart, thread rows
+- **Memory Insights** — allocation timeline, LLM categories
+- **Asset Loading** — package load waterfall
+- **Networking** — connection bandwidth and packet timeline
+
+---
+
+## Custom Profiling Markers
+
+### SCOPE_CYCLE_COUNTER
+
+Links to the stat system (visible in `stat MyGame` overlay and Insights).
+
+```cpp
+// In a .cpp file — one DECLARE per stat, referenced anywhere in the module
+DECLARE_STATS_GROUP(TEXT("MyGame"), STATGROUP_MyGame, STATCAT_Advanced);
+DECLARE_CYCLE_STAT(TEXT("InventoryTick"),  STAT_InventoryTick,  STATGROUP_MyGame);
+DECLARE_CYCLE_STAT(TEXT("PathFinder"),     STAT_PathFinder,     STATGROUP_MyGame);
+DECLARE_CYCLE_STAT(TEXT("AbilityResolve"), STAT_AbilityResolve, STATGROUP_MyGame);
+
+// Usage
+void UInventoryComponent::TickComponent(float DeltaTime, ...)
+{
+    SCOPE_CYCLE_COUNTER(STAT_InventoryTick);
+    // ...
+}
+```
+
+### SCOPED_NAMED_EVENT
+
+Shows as a colored block in Insights without stat overhead.
+
+```cpp
+#include "HAL/PlatformMisc.h"
+
+void UMySystem::ProcessBatch()
+{
+    SCOPED_NAMED_EVENT(MySystem_ProcessBatch, FColor::Orange);
+    for (auto& Item : Batch)
+    {
+        SCOPED_NAMED_EVENT_TEXT("ItemProcess", FColor::Yellow);
+        Process(Item);
+    }
+}
+```
+
+### UE_TRACE_BOOKMARK
+
+Places a labelled vertical marker in the Insights timeline.
+
+```cpp
+#include "ProfilingDebugging/TraceAuxiliary.h"  // or use Trace.Bookmark in console
+
+UE_TRACE_BOOKMARK(TEXT("WaveStarted_%d"), WaveNumber);
+```
+
+---
+
+## CSV Profiling
+
+CSV profiling writes lightweight, always-on telemetry to `Saved/Profiling/CSVStats/`. Enable with `-csvstatfile` or the auto-started profiler.
+
+```cpp
+#include "ProfilingDebugging/CsvProfiler.h"
+
+// Declare category once per module
+CSV_DEFINE_CATEGORY(MyGame, true);   // true = enabled by default
+
+// Timing stat in a function (duration captured each frame)
+void UMySystem::Tick(float DeltaTime)
+{
+    CSV_SCOPED_TIMING_STAT(MyGame, SystemTick);
+    // ...
+}
+
+// Custom scalar value
+void UMySystem::PostSpawn()
+{
+    CSV_CUSTOM_STAT(MyGame, ActiveEnemies, ActiveEnemyCount, ECsvCustomStatOp::Set);
+    CSV_CUSTOM_STAT(MyGame, DamageDealt,   FrameDamage,      ECsvCustomStatOp::Accumulate);
+}
+
+// Named event (segment in CSV timeline)
+CSV_EVENT(MyGame, TEXT("LevelLoaded"));
+```
+
+### Launching with CSV Capture
+
+```bash
+UnrealEditor-Cmd MyGame -game \
+    -csvstatfile=MySession.csv \
+    -csvCaptureFrames=1000 \     # capture 1000 frames then stop
+    -log
+```
+
+Open `.csv` output with Python / Excel or the **PerfReportTool** (`Engine/Extras/PerfReportTool/`).
+
+---
+
+## LLM (Low-Level Memory Tracker)
+
+LLM categorises allocations for memory profiling in Insights.
+
+```cpp
+#include "HAL/LowLevelMemTracker.h"
+
+// Push/pop a custom LLM scope
+LLM_SCOPE(ELLMTag::EngineMisc);                    // built-in tag
+LLM_SCOPE_BYTAG(MyGame_Inventory);                 // custom tag (declared separately)
+
+// Declare a custom LLM tag (in a cpp, once)
+LLM_DEFINE_TAG(MyGame_Inventory, TEXT("MyGame/Inventory"), TEXT("MyGame"));
+
+// Use in allocations
+{
+    LLM_SCOPE_BYTAG(MyGame_Inventory);
+    InventoryData = new FInventoryData();
+}
+```
+
+Activate LLM at launch:
+
+```bash
+UnrealEditor MyGame -LLM -trace=memory -tracehost=127.0.0.1
+```
+
+---
+
+## Performance Analysis Workflow
+
+### 1. Identify the Bottleneck
+
+```
+stat unit          # Is Frame time dominated by Game, Draw, or GPU?
+stat fps           # Confirm frame rate
+```
+
+- **Game > 33ms** → CPU game thread (tick, AI, physics logic)
+- **Draw > 33ms** → Render thread (draw calls, visibility)
+- **GPU > 33ms** → GPU fill rate, overdraw, shader complexity
+
+### 2. Drill Down on CPU
+
+```
+stat game          # Which game-thread category?
+stat engine        # Is it engine overhead?
+stat tasks         # Async task contention?
+```
+
+Then capture with Insights (`-trace=cpu,frame`) and look at the flame chart.
+
+### 3. Drill Down on GPU
+
+```
+stat gpu           # Per-pass timings
+ProfileGPU         # Single-frame breakdown
+r.ProfileGPU.Pattern BasePass    # isolate specific pass
+```
+
+### 4. Memory Pressure
+
+```
+stat memory
+memreport -full
+obj list class=Texture2D sortby=size
+```
+
+Insights memory view shows allocation spikes over time.
+
+### 5. Reproduce and Baseline
+
+Always capture a baseline before any optimization. Use CSV profiling for production telemetry:
+
+```bash
+# Baseline run
+UnrealEditor-Cmd MyGame -game -csvstatfile=Baseline.csv -csvCaptureFrames=600
+
+# After optimization
+UnrealEditor-Cmd MyGame -game -csvstatfile=Optimized.csv -csvCaptureFrames=600
+
+# Diff with PerfReportTool or a Python script
+```
+
+---
+
+## GPU Profiling with RenderDoc
+
+```bash
+# Launch with RenderDoc capture support
+UnrealEditor MyGame -AttachRenderDoc
+
+# In-game console
+renderdoc.CaptureFrame    # capture next frame
+```
+
+Or attach RenderDoc externally and use **F12** to capture. Open `.rdc` in the RenderDoc UI for draw-call-level inspection.
+
+---
+
+## Profiling on Device (Mobile / Console)
+
+```bash
+# iOS / Android — tunnel Insights over USB
+UnrealInsights.exe -RecorderAddress=127.0.0.1:1980
+
+# On device launch with
+-trace=cpu,frame -tracehost=<HOST_IP>
+
+# Console-specific profiling tools (e.g. PlayStation Razor / Xbox PIX)
+# integrate via platform-specific plugin; SCOPE_CYCLE_COUNTER feeds into them automatically
+```
+
+---
+
+## Quick Reference: Command-Line Profiling Flags
+
+| Flag | Effect |
+|---|---|
+| `-trace=cpu,gpu,frame,memory,log` | Enable trace channels for Insights |
+| `-tracehost=127.0.0.1` | Send trace to local Insights recorder |
+| `-tracefile=Output.utrace` | Write trace directly to file |
+| `-LLM` | Enable Low-Level Memory Tracker |
+| `-csvstatfile=Out.csv` | Start CSV profiling |
+| `-csvCaptureFrames=N` | Stop CSV after N frames |
+| `-statnamedevents` | Include stat names in profiler named events |
+| `-ExecCmds="stat startfile"` | Begin stats file capture on startup |
+

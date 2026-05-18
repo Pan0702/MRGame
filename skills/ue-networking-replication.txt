@@ -1,0 +1,1353 @@
+# SKILL: ue-networking-replication
+
+---
+name: ue-networking-replication
+description: "Use this skill when working on multiplayer networking, replication, RPC calls, net role logic, server/client authority, prediction, or synchronizing game state. Also use when the user mentions 'DOREPLIFETIME', 'dedicated server', 'replicated', or 'net role'. See references/replication-patterns.md for common patterns and references/rpc-decision-guide.md for RPC type selection. For GAS networking, see ue-gameplay-abilities."
+metadata:
+  version: 1.0.0
+---
+
+# UE Networking & Replication
+
+You are an expert in Unreal Engine's networking and replication systems.
+
+## Context Check
+
+Read `.agents/ue-project-context.md` for this project's multiplayer configuration.
+Look for: server topology (dedicated, listen, P2P), player count, replicated classes,
+and any custom net drivers.
+
+If the context file is absent, ask:
+1. Server topology? (dedicated, listen, P2P)
+2. Maximum player count per session?
+3. Which actors or components need to replicate data?
+4. Are you using Gameplay Ability System (GAS)?
+
+---
+
+## Net Roles and Authority
+
+UE uses a server-authoritative model: the server is the source of truth for game state.
+Clients predict locally and reconcile with server corrections.
+
+Every actor on every machine has a local role and a remote role (`ENetRole`).
+
+```
+ROLE_Authority       — owns and can modify this actor (server for replicated actors)
+ROLE_AutonomousProxy — client copy of the locally controlled pawn
+ROLE_SimulatedProxy  — client copy of another player's actor; engine interpolates state
+ROLE_None            — not replicated
+```
+
+From `Actor.h`:
+```cpp
+ENetRole GetLocalRole() const { return Role; }   // role on current machine
+ENetRole GetRemoteRole() const;                   // role the other end sees
+bool HasAuthority() const { return (GetLocalRole() == ROLE_Authority); }
+```
+
+Net modes: `NM_Standalone`, `NM_DedicatedServer`, `NM_ListenServer`, `NM_Client`.
+
+**Role matrix for a replicated Pawn:**
+
+| Machine        | GetLocalRole()       | GetRemoteRole()                         |
+|----------------|----------------------|-----------------------------------------|
+| Server         | ROLE_Authority       | ROLE_AutonomousProxy or SimulatedProxy  |
+| Owning Client  | ROLE_AutonomousProxy | ROLE_Authority                          |
+| Other Clients  | ROLE_SimulatedProxy  | ROLE_Authority                          |
+
+**Listen-server caveat:** the host is both `ROLE_Authority` and locally controlled.
+Use `IsLocallyControlled()` to distinguish logic that should skip the host player.
+
+---
+
+## UNetDriver
+
+`UNetDriver` is the core transport class responsible for managing all network connections and
+packet delivery for a world. It owns the list of `UNetConnection` objects and drives the
+replication tick. Access it via `UWorld::GetNetDriver()`.
+
+```cpp
+UNetDriver* Driver = GetWorld()->GetNetDriver();
+// Driver->ClientConnections  — all connected clients (server-side)
+// Driver->ServerConnection   — connection to server (client-side)
+```
+
+For most gameplay code you never interact with `UNetDriver` directly; it is relevant when
+writing custom net drivers, profiling connection state, or debugging packet loss.
+
+---
+
+## Property Replication
+
+### Actor Setup
+
+```cpp
+AMyActor::AMyActor()
+{
+    bReplicates = true;             // AActor::SetReplicates() also available at runtime
+    SetReplicateMovement(true);     // replicates FRepMovement (location/rotation/velocity)
+    SetNetUpdateFrequency(10.f);    // checks per second
+    SetMinNetUpdateFrequency(2.f);  // floor when nothing changes
+    NetPriority = 1.0f;            // higher = preferred when bandwidth is saturated
+}
+```
+
+From `Actor.h`: `SetReplicates`, `SetReplicateMovement`, `SetNetUpdateFrequency`,
+`SetMinNetUpdateFrequency`, and `SetNetCullDistanceSquared` are all `ENGINE_API`.
+
+**FRepMovement:** when `bReplicateMovement = true`, the engine serializes position,
+velocity, and rotation into an `FRepMovement` struct (declared in `Actor.h`) and
+sends it to simulated proxies. `UCharacterMovementComponent` bypasses this with its
+own prediction-based replication; it writes compressed moves via `FSavedMove_Character`
+and reconciles them server-side, so `SetReplicateMovement(false)` is the correct
+default for characters using CMC.
+
+### Declaring Properties
+
+```cpp
+UPROPERTY(Replicated)
+int32 Health;
+
+UPROPERTY(ReplicatedUsing = OnRep_State)
+EMyState State;
+
+UFUNCTION()
+void OnRep_State(EMyState PreviousState); // old value passed as optional parameter
+```
+
+### GetLifetimeReplicatedProps
+
+```cpp
+// MyActor.cpp
+#include "Net/UnrealNetwork.h"
+
+void AMyActor::GetLifetimeReplicatedProps(
+    TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps); // NEVER omit this
+    DOREPLIFETIME(AMyActor, Health);
+    DOREPLIFETIME_CONDITION(AMyActor, State,        COND_OwnerOnly);
+    DOREPLIFETIME_CONDITION(AMyActor, SimData,      COND_SimulatedOnly);
+    DOREPLIFETIME_CONDITION(AMyActor, InitData,     COND_InitialOnly);
+    DOREPLIFETIME_CONDITION(AMyActor, PublicData,   COND_SkipOwner);
+}
+```
+
+**Conditions:** `COND_None` (all), `COND_OwnerOnly`, `COND_SkipOwner`,
+`COND_SimulatedOnly`, `COND_AutonomousOnly`, `COND_InitialOnly`, `COND_Custom`.
+
+Use `COND_OwnerOnly` for private player data (inventory, currency).
+Use `COND_InitialOnly` for immutable spawn data (team, character class).
+
+**Initial replication burst**: When a client first joins or an actor first becomes relevant, ALL replicated properties send at once regardless of conditions (`COND_InitialOnly` fires exactly once here). This burst can saturate the actor channel — keep initial state compact and use `COND_InitialOnly` for spawn-time-only data to reduce ongoing bandwidth.
+
+### FRepLayout (Internal)
+
+`FRepLayout` is an internal engine struct that describes which properties of a class are
+replicated and how. It handles delta compression (only changed properties are sent) and
+evaluates `DOREPLIFETIME_CONDITION` filters per-connection. Developers rarely interact
+with `FRepLayout` directly, but knowing it exists helps when debugging why a property is
+or is not replicating: the layout is built once per class and cached, so dynamic changes
+to conditions require `DOREPLIFETIME_WITH_PARAMS_FAST` or `bIsPushBased` patterns rather
+than modifying the struct at runtime.
+
+### Large Arrays: FFastArraySerializer
+
+Plain `TArray` sends the full array on any change. Use `FFastArraySerializer` for
+delta-only replication. See `references/replication-patterns.md` Pattern 3 for
+a complete inventory implementation.
+
+### Custom Struct Serialization
+
+Implement `NetSerialize` on a `USTRUCT` and add `TStructOpsTypeTraits` with
+`WithNetSerializer = true` to control binary layout manually. Use
+`FVector_NetQuantize10` (0.1 cm precision) instead of raw `FVector` to halve
+position bandwidth.
+
+---
+
+## Remote Procedure Calls (RPCs)
+
+See `references/rpc-decision-guide.md` for the full decision flowchart.
+
+```cpp
+// Client calls → server executes. WithValidation is required for state changes.
+UFUNCTION(Server, Reliable, WithValidation)
+void ServerFireWeapon(FVector_NetQuantize Origin, FVector_NetQuantizeNormal Dir);
+
+// Server calls → owning client executes. No WithValidation needed.
+UFUNCTION(Client, Reliable)
+void ClientShowKillConfirm();
+
+// Server calls → server + all clients execute.
+UFUNCTION(NetMulticast, Unreliable)
+void MulticastPlayHitEffect(FVector ImpactPoint);
+```
+
+Implementations always end in `_Implementation`. Server RPCs with validation also
+need `_Validate` (return `false` to kick the client).
+
+**Reliable** — guaranteed delivery; use for state-changing actions (purchase, spawn,
+possession). **Unreliable** — fire-and-forget; use for high-frequency cosmetics.
+
+Real examples from `PlayerController.h`:
+```cpp
+UFUNCTION(unreliable, server, WithValidation) void ServerSetSpectatorLocation(...);
+UFUNCTION(reliable,   server, WithValidation) void ServerAcknowledgePossession(APawn* P);
+UFUNCTION(Reliable,   Client)                 void ClientReceiveLocalizedMessage(...);
+UFUNCTION(Client,     Unreliable)             void ClientAckTimeDilation(float, int32);
+```
+
+**RPC ownership:** Server RPCs must be called on an actor whose ownership chain
+leads to the calling client's `APlayerController`. Client RPCs must be called on
+an actor owned by a player with a `NetConnection`. Calls on unowned actors are
+silently dropped.
+
+**RPC Parameter Rules**: Only net-addressable types are valid — basic types (`int32`,
+`float`, `FString`, `FVector`), replicated `UObject*` pointers (arrive as `nullptr`
+if not replicated), and `USTRUCT(BlueprintType)` structs. Non-replicated `UObject*`
+pointers arrive as `nullptr`; pass an ID and look the object up on the remote side.
+Large payloads (>1 KB) should use replicated properties instead of RPC parameters.
+`TArray` and `TMap` parameters are supported but watch for bandwidth impact.
+
+---
+
+## Ownership and Relevancy
+
+```cpp
+// Server sets owner to control connection routing for RPCs and COND_OwnerOnly
+Weapon->SetOwner(PlayerController);
+
+// Relevancy flags (from Actor.h)
+bAlwaysRelevant      = true;  // replicate to every connection
+bOnlyRelevantToOwner = true;  // replicate only to the owning connection
+
+// Override for custom logic (e.g., team-based relevancy)
+virtual bool IsNetRelevantFor(const AActor* RealViewer, const AActor* ViewTarget,
+                               const FVector& SrcLocation) const override;
+```
+
+Default relevancy culls actors beyond `NetCullDistanceSquared` from the client
+viewpoint. `NetPriority` determines which actors win when bandwidth is saturated.
+
+**Dormancy:** actors that rarely change can pause replication entirely.
+
+```cpp
+SetNetDormancy(DORM_DormantAll); // stop replication
+FlushNetDormancy();              // send one update then return to dormant
+```
+
+**Re-relevancy**: When an actor moves outside `NetCullDistanceSquared` it stops replicating. When it returns to range, the engine treats it as a fresh relevancy event — sending another initial burst and firing all `OnRep_` callbacks with current server state. Design `OnRep_` functions to be idempotent (tolerate being called multiple times with the same value). Dormant actors (`DORM_DormantAll`) behave similarly when woken — they flush all dirty properties at once.
+
+---
+
+## Subobject Replication
+
+### Modern API (UE 5.1+)
+
+From `Actor.h`:
+```cpp
+ENGINE_API void AddReplicatedSubObject(UObject* SubObject,
+                                       ELifetimeCondition NetCondition = COND_None);
+ENGINE_API void RemoveReplicatedSubObject(UObject* SubObject);
+ENGINE_API void AddActorComponentReplicatedSubObject(UActorComponent* OwnerComponent,
+                                                     UObject* SubObject,
+                                                     ELifetimeCondition NetCondition = COND_None);
+```
+
+Enable with `bReplicateUsingRegisteredSubObjectList = true` (now the default).
+Call `AddReplicatedSubObject` on the server during `BeginPlay`; call
+`RemoveReplicatedSubObject` in `EndPlay`.
+
+### Legacy API
+
+Override `ReplicateSubobjects` when `bReplicateUsingRegisteredSubObjectList = false`:
+
+```cpp
+bool AMyActor::ReplicateSubobjects(UActorChannel* Channel,
+                                    FOutBunch* Bunch, FReplicationFlags* RepFlags)
+{
+    bool bWrote = Super::ReplicateSubobjects(Channel, Bunch, RepFlags);
+    bWrote |= Channel->ReplicateSubobject(MySubObject, *Bunch, *RepFlags);
+    return bWrote;
+}
+```
+
+---
+
+## Client-Side Prediction
+
+Pattern (for non-movement systems without GAS):
+
+```cpp
+// 1. Client predicts immediately
+void AMyCharacter::LocalPredictAbility(int32 AbilityId)
+{
+    if (IsLocallyControlled())
+    {
+        ApplyAbilityEffectLocal(AbilityId); // immediate visual/audio
+        ServerActivateAbility(AbilityId);   // request server confirmation
+    }
+}
+
+// 2. Server validates, broadcasts, or corrects
+void AMyCharacter::ServerActivateAbility_Implementation(int32 AbilityId)
+{
+    if (CanActivateAbility(AbilityId))
+    {
+        ApplyAbilityEffectAuthority(AbilityId);
+        MulticastAbilityActivated(AbilityId);
+    }
+    else
+    {
+        ClientCorrectionAbilityFailed(AbilityId); // roll back client prediction
+    }
+}
+```
+
+When the server rejects a prediction, smooth the visual correction to avoid jarring
+snaps: interpolate the actor to the corrected position over 2-3 frames rather than
+teleporting. `UCharacterMovementComponent` handles this automatically via
+`NetworkSmoothingMode` (`Linear`, `Exponential`, or `Disabled`).
+
+**CharacterMovementComponent** has full built-in prediction. Extend
+`FSavedMove_Character` and override `PhysCustom` to support custom movement modes.
+
+**Prediction eligibility**: Only `UCharacterMovementComponent` and GAS (`UAbilitySystemComponent` with `FPredictionKey`) have engine-managed prediction and rollback. Raw `UPROPERTY(Replicated)` properties have no built-in prediction — if you write them locally before the server confirms, the server's replicated value overwrites the client value with no rollback. For non-CMC/GAS state, use local-only variables for visual prediction and apply the authoritative value in `OnRep_`.
+
+**GAS and FPredictionKey:** GAS uses `FPredictionKey` to link client-predicted actions
+with server confirmations. The key is generated on the client (via
+`FPredictionKey::CreateNewPredictionKey`), embedded in the Server RPC, and matched on the
+server when applying `GameplayEffect`s or activating abilities. If the server determines
+the prediction was invalid, every `GameplayEffect` and attribute change tagged with that
+key is automatically rolled back on the client. You do not construct `FPredictionKey`
+manually in most cases; `UAbilitySystemComponent::TryActivateAbility` manages the
+lifecycle. Relevant when writing custom `UGameplayAbility` subclasses that need
+scoped prediction windows (`FScopedPredictionWindow`). See `ue-gameplay-abilities`
+for the full GAS networking details.
+
+---
+
+## Actor Replication Setup Checklist
+
+```
+[ ] bReplicates = true in constructor
+[ ] SetNetUpdateFrequency / SetMinNetUpdateFrequency set appropriately
+[ ] All UPROPERTY(Replicated) / UPROPERTY(ReplicatedUsing=...) declared
+[ ] GetLifetimeReplicatedProps overridden; Super called first
+[ ] DOREPLIFETIME / DOREPLIFETIME_CONDITION for each property
+[ ] OnRep_ functions declared UFUNCTION() and implemented
+[ ] Server RPCs have WithValidation; _Validate implemented
+[ ] NetMulticast / Client RPCs guarded with HasAuthority() on call site
+[ ] Subobjects registered via AddReplicatedSubObject or ReplicateSubobjects
+[ ] SetOwner() called on server after spawning owned actors
+[ ] DORM_DormantAll set on actors that rarely update
+```
+
+---
+
+## Replication Graph
+
+For large player counts (50+ connections), the default net driver relevancy checks become expensive. `UReplicationGraph` replaces per-connection per-actor relevancy with spatial and policy-based nodes.
+
+```cpp
+// Build.cs: "ReplicationGraph"
+// Project: set ReplicationDriverClassName in DefaultEngine.ini
+// [/Script/OnlineSubsystemUtils.IpNetDriver]
+// ReplicationDriverClassName=/Script/MyGame.MyReplicationGraph
+
+UCLASS()
+class UMyReplicationGraph : public UReplicationGraph
+{
+    GENERATED_BODY()
+public:
+    virtual void InitGlobalActorClassSettings() override;
+    virtual void InitGlobalGraphNodes() override;
+    virtual void InitConnectionGraphNodes(UNetReplicationGraphConnection* RepGraphConnection) override;
+};
+```
+
+Key node types: `UReplicationGraphNode_GridSpatialization2D` (spatial), `UReplicationGraphNode_AlwaysRelevant` (GameState, managers), `UReplicationGraphNode_AlwaysRelevant_ForConnection` (PlayerController, PlayerState, HUD), `UReplicationGraphNode_ActorList` (custom lists).
+
+---
+
+## Common Mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| Modifying state without `HasAuthority()` guard | Add `if (!HasAuthority()) return;` |
+| Server RPC without `WithValidation` — client sends arbitrary values | Add `WithValidation`; validate in `_Validate` |
+| Calling `Client`/`NetMulticast` from the client — silently dropped | Only call from server; guard with `HasAuthority()` |
+| Plain `TArray` on replicated component — full array sent on every change | Use `FFastArraySerializer` |
+| Omitting `Super::GetLifetimeReplicatedProps` — parent properties silently dropped | Always call `Super` first |
+| Passing non-replicated `UObject*` in RPC params — arrives as `nullptr` | Pass an ID; look up object on remote side |
+| Using `NetMulticast` for persistent state — late-joining clients miss it | Use `UPROPERTY(Replicated)` for state |
+| Replicating cosmetic-only properties — increases bandwidth for data clients can compute locally | Only replicate gameplay-critical state; derive visuals client-side |
+
+---
+
+## APlayerController Replication Scope
+
+`APlayerController` exists only on the server and the owning client — not on other
+clients. Put data meant for all clients on `APawn` or `APlayerState`.
+
+From `PlayerController.h`:
+```cpp
+// nullptr on local players (server-side); points to the network connection otherwise
+UPROPERTY(DuplicateTransient)
+TObjectPtr<UNetConnection> NetConnection;
+```
+
+**UNetConnection** represents a single client's network connection on the server. Each
+connected client has exactly one `UNetConnection` owned by `UNetDriver`. Retrieve it
+with `APlayerController::GetNetConnection()`. It is used for:
+- Ownership checks: an actor's owning connection determines which client RPCs it can
+  receive and which `COND_OwnerOnly` properties it sees.
+- RPC routing: Server RPCs are only accepted from the actor's owning connection.
+- Detecting disconnects: bind to `AGameModeBase::OnLogout` or check
+  `NetConnection->GetConnectionState() == USOCK_Closed` (or `IsClosingOrClosed()`) rather than polling `NetConnection` directly.
+
+Use `APlayerController` for connection-scoped Client RPCs (HUD updates, voice,
+level streaming notifications). Use `APawn` or `APlayerState` for world-visible state.
+
+---
+
+## Related Skills
+
+- `ue-gameplay-framework` — AGameMode (server-only), AGameState / APlayerState
+  (replicated to all), APawn net roles
+- `ue-gameplay-abilities` — GAS prediction keys, attribute set replication,
+  GameplayEffect replication
+- `ue-cpp-foundations` — UPROPERTY/UFUNCTION macros, module includes
+
+## Reference Files
+
+- `references/replication-patterns.md` — health, inventory (FFastArraySerializer),
+  ability state, team data, subobject, dormancy, and custom relevancy patterns
+- `references/rpc-decision-guide.md` — Server/Client/NetMulticast decision flowchart,
+  Reliable vs Unreliable rules, ownership routing, and common RPC mistakes
+
+--- REFERENCE: replication-patterns.md ---
+# Replication Patterns
+
+Common patterns for replicating game state in Unreal Engine multiplayer projects.
+Each pattern includes the header declarations, implementation, and client callback.
+
+---
+
+## Pattern 1: Health with OnRep Callback
+
+The most common pattern. Health is authoritative on the server. Clients receive the
+updated value and react via `OnRep_Health` (update HUD, play hurt effects).
+
+```cpp
+// AMyCharacter.h
+UPROPERTY(ReplicatedUsing = OnRep_Health)
+float Health;
+
+UPROPERTY(ReplicatedUsing = OnRep_MaxHealth)
+float MaxHealth;
+
+UFUNCTION()
+void OnRep_Health(float PreviousHealth);
+
+UFUNCTION()
+void OnRep_MaxHealth(float PreviousMaxHealth);
+
+// Server RPC — clients request damage (usually called by server game logic instead)
+UFUNCTION(Server, Reliable, WithValidation)
+void ServerApplyHealing(float Amount);
+```
+
+```cpp
+// AMyCharacter.cpp
+#include "Net/UnrealNetwork.h"
+
+void AMyCharacter::GetLifetimeReplicatedProps(
+    TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME(AMyCharacter, Health);
+    DOREPLIFETIME(AMyCharacter, MaxHealth);
+}
+
+void AMyCharacter::OnRep_Health(float PreviousHealth)
+{
+    // Called on clients only — update UI and effects
+    OnHealthChanged.Broadcast(PreviousHealth, Health);
+    if (Health < PreviousHealth)
+    {
+        PlayHurtMontage();
+    }
+}
+
+void AMyCharacter::OnRep_MaxHealth(float PreviousMaxHealth)
+{
+    OnMaxHealthChanged.Broadcast(PreviousMaxHealth, MaxHealth);
+}
+
+// Called by game logic on server only
+void AMyCharacter::ApplyDamage_Authority(float Damage)
+{
+    if (!HasAuthority()) return;
+    Health = FMath::Clamp(Health - Damage, 0.f, MaxHealth);
+    if (Health <= 0.f)
+    {
+        Die_Authority();
+    }
+}
+
+void AMyCharacter::ServerApplyHealing_Implementation(float Amount)
+{
+    // Validate amount is positive and actor is alive
+    Health = FMath::Clamp(Health + Amount, 0.f, MaxHealth);
+}
+
+bool AMyCharacter::ServerApplyHealing_Validate(float Amount)
+{
+    return Amount > 0.f && Amount <= 500.f; // reject absurd values
+}
+```
+
+---
+
+## Pattern 2: Team Data (Owner-Only Private + All-Clients Public)
+
+Split information based on who needs it. Score is public; private currency is owner-only.
+
+```cpp
+// AMyPlayerState.h  (PlayerState replicates to all clients)
+UPROPERTY(ReplicatedUsing = OnRep_TeamId)
+int32 TeamId;
+
+UPROPERTY(Replicated)
+int32 Score;
+
+UPROPERTY(Replicated)
+int32 Kills;
+
+// Private to owning player only
+UPROPERTY(ReplicatedUsing = OnRep_Currency)
+int32 Currency;
+```
+
+```cpp
+// AMyPlayerState.cpp
+void AMyPlayerState::GetLifetimeReplicatedProps(
+    TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+    DOREPLIFETIME(AMyPlayerState, TeamId);
+    DOREPLIFETIME(AMyPlayerState, Score);
+    DOREPLIFETIME(AMyPlayerState, Kills);
+
+    // Only the owning client receives their own currency
+    DOREPLIFETIME_CONDITION(AMyPlayerState, Currency, COND_OwnerOnly);
+}
+
+void AMyPlayerState::OnRep_TeamId()
+{
+    // Update team color, nameplate, etc. on all clients
+    OnTeamChanged.Broadcast(TeamId);
+}
+
+void AMyPlayerState::OnRep_Currency()
+{
+    // Update shop UI — only fires on the owning client
+    OnCurrencyChanged.Broadcast(Currency);
+}
+```
+
+---
+
+## Pattern 3: Inventory Using FFastArraySerializer
+
+Efficient replicated inventory — only changed items are sent over the network,
+not the entire array.
+
+```cpp
+// InventoryTypes.h
+USTRUCT(BlueprintType)
+struct FInventoryItem : public FFastArraySerializerItem
+{
+    GENERATED_BODY()
+
+    UPROPERTY()
+    int32 ItemId = 0;
+
+    UPROPERTY()
+    int32 Quantity = 0;
+
+    UPROPERTY()
+    float Durability = 1.0f;
+
+    void PreReplicatedRemove(const struct FInventoryList& InArraySerializer);
+    void PostReplicatedAdd(const struct FInventoryList& InArraySerializer);
+    void PostReplicatedChange(const struct FInventoryList& InArraySerializer);
+};
+
+USTRUCT()
+struct FInventoryList : public FFastArraySerializer
+{
+    GENERATED_BODY()
+
+    UPROPERTY()
+    TArray<FInventoryItem> Items;
+
+    bool NetDeltaSerialize(FNetDeltaSerializeInfo& DeltaParms)
+    {
+        return FFastArraySerializer::FastArrayDeltaSerialize<FInventoryItem, FInventoryList>(
+            Items, DeltaParms, *this);
+    }
+};
+
+template<>
+struct TStructOpsTypeTraits<FInventoryList>
+    : public TStructOpsTypeTraitsBase2<FInventoryList>
+{
+    enum { WithNetDeltaSerializer = true };
+};
+```
+
+```cpp
+// UMyInventoryComponent.h
+UCLASS()
+class UMyInventoryComponent : public UActorComponent
+{
+    GENERATED_BODY()
+
+public:
+    virtual void GetLifetimeReplicatedProps(
+        TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
+    // Only the owning player sees their own inventory
+    UPROPERTY(ReplicatedUsing = OnRep_Inventory)
+    FInventoryList Inventory;
+
+    UFUNCTION()
+    void OnRep_Inventory();
+
+    // Server-side mutation
+    void AddItem_Authority(int32 ItemId, int32 Quantity);
+    void RemoveItem_Authority(int32 ItemId, int32 Quantity);
+};
+```
+
+```cpp
+// UMyInventoryComponent.cpp
+void UMyInventoryComponent::GetLifetimeReplicatedProps(
+    TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME_CONDITION(UMyInventoryComponent, Inventory, COND_OwnerOnly);
+}
+
+void UMyInventoryComponent::AddItem_Authority(int32 ItemId, int32 Quantity)
+{
+    if (!GetOwner()->HasAuthority()) return;
+
+    // Find existing stack
+    for (FInventoryItem& Item : Inventory.Items)
+    {
+        if (Item.ItemId == ItemId)
+        {
+            Item.Quantity += Quantity;
+            Inventory.MarkItemDirty(Item); // tell FastArray this item changed
+            return;
+        }
+    }
+
+    // Add new stack
+    FInventoryItem& NewItem = Inventory.Items.AddDefaulted_GetRef();
+    NewItem.ItemId = ItemId;
+    NewItem.Quantity = Quantity;
+    Inventory.MarkItemDirty(NewItem);
+}
+
+// Callbacks on client
+void FInventoryItem::PostReplicatedAdd(const FInventoryList& InArraySerializer)
+{
+    // New item appeared in inventory — update UI
+}
+
+void FInventoryItem::PostReplicatedChange(const FInventoryList& InArraySerializer)
+{
+    // Existing item quantity or durability changed — update slot UI
+}
+
+void FInventoryItem::PreReplicatedRemove(const FInventoryList& InArraySerializer)
+{
+    // Item is about to be removed — clear UI slot
+}
+```
+
+---
+
+## Pattern 4: Ability State (InitialOnly + Runtime Flags)
+
+Ability unlocks are set once; cooldowns and charges update dynamically.
+
+```cpp
+// UMyAbilityComponent.h
+// Which abilities are unlocked — sent once at spawn, never changes
+UPROPERTY(Replicated)
+TArray<int32> UnlockedAbilityIds;
+
+// Current cooldown end times per ability slot
+UPROPERTY(ReplicatedUsing = OnRep_Cooldowns)
+TArray<float> CooldownEndTimes;
+
+// Active ability flags bitmask
+UPROPERTY(ReplicatedUsing = OnRep_ActiveFlags)
+uint8 ActiveAbilityFlags;
+
+UFUNCTION()
+void OnRep_Cooldowns();
+
+UFUNCTION()
+void OnRep_ActiveFlags(uint8 PreviousFlags);
+```
+
+```cpp
+// UMyAbilityComponent.cpp
+void UMyAbilityComponent::GetLifetimeReplicatedProps(
+    TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+    // Unlocked abilities: all clients see which abilities a player has
+    DOREPLIFETIME_CONDITION(UMyAbilityComponent, UnlockedAbilityIds, COND_InitialOnly);
+
+    // Cooldowns: only the owning client needs exact cooldown timers
+    DOREPLIFETIME_CONDITION(UMyAbilityComponent, CooldownEndTimes, COND_OwnerOnly);
+
+    // Active flags: all clients see which abilities are currently active (for animation)
+    DOREPLIFETIME(UMyAbilityComponent, ActiveAbilityFlags);
+}
+
+void UMyAbilityComponent::OnRep_Cooldowns()
+{
+    // Refresh cooldown bar UI for owning player only
+}
+
+void UMyAbilityComponent::OnRep_ActiveFlags(uint8 PreviousFlags)
+{
+    // Determine which bits changed and trigger corresponding animations/effects
+    uint8 ChangedBits = ActiveAbilityFlags ^ PreviousFlags;
+    for (int32 i = 0; i < 8; ++i)
+    {
+        if (ChangedBits & (1 << i))
+        {
+            bool bNowActive = (ActiveAbilityFlags & (1 << i)) != 0;
+            OnAbilityActivationChanged.Broadcast(i, bNowActive);
+        }
+    }
+}
+```
+
+---
+
+## Pattern 5: Replicated Object Subobject (UE 5.1+ API)
+
+A `UObject` subobject with its own replicated properties, registered via the modern API.
+
+```cpp
+// UMyQuestData.h
+UCLASS()
+class UMyQuestData : public UObject
+{
+    GENERATED_BODY()
+
+public:
+    virtual void GetLifetimeReplicatedProps(
+        TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
+    virtual bool IsSupportedForNetworking() const override { return true; }
+
+    UPROPERTY(Replicated)
+    int32 QuestId;
+
+    UPROPERTY(Replicated)
+    int32 Progress;
+
+    UPROPERTY(Replicated)
+    bool bCompleted;
+};
+```
+
+```cpp
+// AMyPlayerController.cpp — register the subobject during BeginPlay on server
+void AMyPlayerController::BeginPlay()
+{
+    Super::BeginPlay();
+    if (HasAuthority())
+    {
+        ActiveQuest = NewObject<UMyQuestData>(this);
+        ActiveQuest->QuestId = 42;
+        // Register with COND_OwnerOnly so only this player's client receives it
+        AddReplicatedSubObject(ActiveQuest, COND_OwnerOnly);
+    }
+}
+
+void AMyPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    if (HasAuthority() && ActiveQuest)
+    {
+        RemoveReplicatedSubObject(ActiveQuest);
+    }
+    Super::EndPlay(EndPlayReason);
+}
+```
+
+```cpp
+// UMyQuestData.cpp
+void UMyQuestData::GetLifetimeReplicatedProps(
+    TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME(UMyQuestData, QuestId);
+    DOREPLIFETIME(UMyQuestData, Progress);
+    DOREPLIFETIME(UMyQuestData, bCompleted);
+}
+```
+
+---
+
+## Pattern 6: Replicated Actor Movement (FRepMovement)
+
+For actors that move but do not use `UCharacterMovementComponent`, replicate movement
+via `bReplicateMovement` and the built-in `FRepMovement` struct.
+
+```cpp
+// AMyVehicle.h
+AMyVehicle()
+{
+    bReplicates = true;
+    SetReplicateMovement(true); // enables FRepMovement replication via OnRep_ReplicatedMovement
+    SetNetUpdateFrequency(50.f);
+    NetPriority = 2.5f;
+}
+
+// Override to apply custom interpolation when movement data arrives on simulated proxies
+virtual void OnRep_ReplicatedMovement() override;
+```
+
+```cpp
+// AMyVehicle.cpp
+void AMyVehicle::OnRep_ReplicatedMovement()
+{
+    Super::OnRep_ReplicatedMovement(); // applies FRepMovement to root component
+
+    // Additional logic: apply physics state, snap wheels, etc.
+    SyncWheelPositions();
+}
+```
+
+For physics-simulated actors, set `bRepPhysics = true` on the `FRepMovement` to
+include linear and angular velocity, allowing clients to simulate physics correctly.
+
+---
+
+## Pattern 7: Custom Relevancy Override
+
+Override `IsNetRelevantFor` to implement game-specific relevancy (team-based, zone-based, etc.).
+
+```cpp
+// AMyActor.h
+virtual bool IsNetRelevantFor(
+    const AActor* RealViewer,
+    const AActor* ViewTarget,
+    const FVector& SrcLocation) const override;
+```
+
+```cpp
+// AMyActor.cpp — only replicate to players on the same team
+bool AMyActor::IsNetRelevantFor(
+    const AActor* RealViewer,
+    const AActor* ViewTarget,
+    const FVector& SrcLocation) const
+{
+    // Always relevant to owner
+    if (RealViewer == GetOwner()) return true;
+
+    // Check team
+    const AMyPlayerController* PC = Cast<AMyPlayerController>(RealViewer);
+    if (PC && PC->GetTeamId() == TeamId)
+    {
+        // Also respect distance — call default distance check
+        return Super::IsNetRelevantFor(RealViewer, ViewTarget, SrcLocation);
+    }
+
+    return false;
+}
+```
+
+---
+
+## Pattern 8: Dormancy for Rarely-Updated Actors
+
+Actors like pickups and map objectives update infrequently. Use dormancy to skip
+replication checks when nothing changes.
+
+```cpp
+// AMyPickup.h
+AMyPickup()
+{
+    bReplicates = true;
+    NetDormancy = DORM_DormantAll; // start dormant
+    SetNetUpdateFrequency(1.f);
+}
+
+void PickupCollected(ACharacter* Collector);
+```
+
+```cpp
+// AMyPickup.cpp
+void AMyPickup::PickupCollected(ACharacter* Collector)
+{
+    if (!HasAuthority()) return;
+
+    bPickedUp = true;
+    SetActorHiddenInGame(true);
+    SetActorEnableCollision(false);
+
+    // Wake up for one replication update to push bPickedUp to clients, then re-dormant
+    FlushNetDormancy();
+
+    // Schedule respawn
+    GetWorldTimerManager().SetTimer(
+        RespawnTimer, this, &AMyPickup::Respawn_Authority, RespawnTime, false);
+}
+
+void AMyPickup::Respawn_Authority()
+{
+    bPickedUp = false;
+    SetActorHiddenInGame(false);
+    SetActorEnableCollision(true);
+    FlushNetDormancy(); // push respawn state, then return to dormant
+}
+```
+
+---
+
+## Bandwidth Estimation Guide
+
+| Data Type                       | Approximate Bits per Update |
+|---------------------------------|-----------------------------|
+| `bool` (replicated)             | 1 bit + overhead (~8 bits)  |
+| `uint8`                         | 8 bits                      |
+| `int32`                         | 32 bits                     |
+| `float`                         | 32 bits                     |
+| `FVector` (full precision)      | 96 bits                     |
+| `FVector_NetQuantize`           | ~30-48 bits                 |
+| `FVector_NetQuantize10`         | ~30-48 bits (1/10 cm)       |
+| `FRotator` (full)               | 96 bits                     |
+| `FRotator` compressed           | ~24 bits                    |
+| `FRepMovement`                  | ~100-200 bits               |
+| RPC call overhead               | ~80-120 bits + params       |
+
+Use `FVector_NetQuantize` variants for world positions and directions to halve
+bandwidth compared to raw `FVector`. The precision tiers are:
+
+- `FVector_NetQuantize` — 1 cm precision
+- `FVector_NetQuantize10` — 0.1 cm precision
+- `FVector_NetQuantize100` — 0.01 cm precision
+- `FVector_NetQuantizeNormal` — unit vector, ~16 bits
+
+--- REFERENCE: rpc-decision-guide.md ---
+# RPC Decision Guide
+
+Reference for choosing the correct RPC type (Server, Client, NetMulticast) and
+reliability level (Reliable, Unreliable) in Unreal Engine multiplayer code.
+All patterns are grounded in real `APlayerController` usage from `PlayerController.h`.
+
+---
+
+## RPC Type Quick Reference
+
+| Specifier       | Called on  | Executes on              | Typical use                            |
+|-----------------|------------|--------------------------|----------------------------------------|
+| `Server`        | Client     | Server (Authority)       | Player input, purchase, ability use    |
+| `Client`        | Server     | Owning client only       | UI updates, player-specific feedback   |
+| `NetMulticast`  | Server     | Server + all clients     | World effects visible to everyone      |
+
+---
+
+## Decision Flowchart
+
+```
+Is this a request from a player to change game state?
+  YES --> use Server RPC (client calls, server executes)
+  NO  --> continue
+
+Should this run only on one specific player's machine?
+  YES --> use Client RPC (server calls, owning client executes)
+  NO  --> continue
+
+Should this run on the server AND every connected client simultaneously?
+  YES --> use NetMulticast RPC (server calls, all machines execute)
+  NO  --> reconsider: is property replication a better fit?
+```
+
+---
+
+## Server RPC
+
+**Who calls it**: the client (specifically the owning client of the actor).
+**Who executes it**: the server.
+**Primary use**: forwarding player intent to the authoritative machine.
+
+All Server RPCs that change game state must include `WithValidation`. This generates
+a `_Validate` function the engine calls before `_Implementation`. Returning `false`
+from `_Validate` kicks the calling client.
+
+```cpp
+// Declaration
+UFUNCTION(Server, Reliable, WithValidation)
+void ServerFireWeapon(FVector_NetQuantize MuzzleLocation,
+                      FVector_NetQuantizeNormal Direction);
+
+// Implementation (.cpp)
+void AMyCharacter::ServerFireWeapon_Implementation(
+    FVector_NetQuantize MuzzleLocation,
+    FVector_NetQuantizeNormal Direction)
+{
+    // Server performs authoritative hit trace
+    FHitResult Hit;
+    FCollisionQueryParams Params;
+    Params.AddIgnoredActor(this);
+
+    if (GetWorld()->LineTraceSingleByChannel(
+            Hit, MuzzleLocation, MuzzleLocation + Direction * 10000.f,
+            ECC_Pawn, Params))
+    {
+        if (AMyCharacter* Victim = Cast<AMyCharacter>(Hit.GetActor()))
+        {
+            Victim->ApplyDamage_Authority(WeaponDamage);
+        }
+    }
+
+    // Spawn bullet tracer effect on all clients
+    MulticastSpawnTracer(MuzzleLocation, Hit.ImpactPoint);
+}
+
+bool AMyCharacter::ServerFireWeapon_Validate(
+    FVector_NetQuantize MuzzleLocation,
+    FVector_NetQuantizeNormal Direction)
+{
+    // Reject zero directions
+    if (Direction.IsNearlyZero()) return false;
+    // Reject muzzle locations impossibly far from actor
+    if (FVector::Dist(MuzzleLocation, GetActorLocation()) > 500.f) return false;
+    return true;
+}
+```
+
+Real examples from `PlayerController.h`:
+
+```cpp
+// Player acknowledges pawn possession — must not be lost, Reliable
+UFUNCTION(reliable, server, WithValidation)
+void ServerAcknowledgePossession(class APawn* P);
+
+// Spectator position — sent frequently, OK to drop, Unreliable
+UFUNCTION(unreliable, server, WithValidation)
+void ServerSetSpectatorLocation(FVector NewLoc, FRotator NewRot);
+
+// Server restart — must not be dropped, Reliable
+UFUNCTION(reliable, server, WithValidation)
+void ServerRestartPlayer();
+
+// Camera update — sent frequently, can be dropped, Unreliable
+UFUNCTION(unreliable, server, WithValidation)
+void ServerUpdateCamera(FVector_NetQuantize CamLoc, int32 CamPitchAndYaw);
+```
+
+### When to use Reliable vs Unreliable for Server RPCs
+
+| Scenario                          | Reliability  |
+|-----------------------------------|--------------|
+| Purchase, ability activation      | Reliable     |
+| Possession / respawn              | Reliable     |
+| Player name or setting change     | Reliable     |
+| Level streaming notification      | Reliable     |
+| Frequent position / camera update | Unreliable   |
+| High-frequency input relay        | Unreliable   |
+
+---
+
+## Client RPC
+
+**Who calls it**: the server.
+**Who executes it**: the owning client of the actor.
+**Primary use**: sending player-specific information or triggering private feedback.
+
+`Client` RPCs do not need `WithValidation` — the server already has authority.
+
+```cpp
+// Declaration
+UFUNCTION(Client, Reliable)
+void ClientShowMatchResult(bool bWon, int32 FinalScore);
+
+// Implementation
+void AMyPlayerController::ClientShowMatchResult_Implementation(
+    bool bWon, int32 FinalScore)
+{
+    // Runs only on the owning client — safe to access local UI
+    if (UMyHUD* HUD = Cast<UMyHUD>(GetHUD()))
+    {
+        HUD->ShowMatchResult(bWon, FinalScore);
+    }
+}
+```
+
+Real examples from `PlayerController.h`:
+
+```cpp
+// Tell the client it's been muted — Reliable, player must know
+UFUNCTION(Reliable, Client)
+void ClientMutePlayer(FUniqueNetIdRepl PlayerId);
+
+// Send a localized message to the owning client — Reliable
+UFUNCTION(Reliable, Client)
+void ClientReceiveLocalizedMessage(TSubclassOf<ULocalMessage> Message,
+    int32 Switch,
+    APlayerState* RelatedPlayerState_1,
+    APlayerState* RelatedPlayerState_2,
+    UObject* OptionalObject);
+
+// Client spectator waiting state — Reliable, state change must not be lost
+UFUNCTION(client, reliable)
+void ClientSetSpectatorWaiting(bool bWaiting);
+
+// Async physics timestamp sync — Reliable, setup data
+UFUNCTION(Client, Reliable)
+void ClientSetupNetworkPhysicsTimestamp(FAsyncPhysicsTimestamp Timestamp);
+
+// Time dilation update — Unreliable, continuously corrected
+UFUNCTION(Client, Unreliable)
+void ClientAckTimeDilation(float TimeDilation, int32 ServerStep);
+```
+
+### When to use Reliable vs Unreliable for Client RPCs
+
+| Scenario                                   | Reliability  |
+|--------------------------------------------|--------------|
+| UI state change (match result, kill feed)  | Reliable     |
+| Player kicked / game over notification     | Reliable     |
+| View target / camera set                   | Reliable     |
+| Sound / haptic triggered by server event   | Reliable     |
+| Camera time dilation correction            | Unreliable   |
+| High-frequency positional feedback effect  | Unreliable   |
+
+---
+
+## NetMulticast RPC
+
+**Who calls it**: the server.
+**Who executes it**: the server AND all clients that have this actor replicated to them.
+**Primary use**: cosmetic world events that everyone should see.
+
+```cpp
+// Declaration
+UFUNCTION(NetMulticast, Unreliable)
+void MulticastPlayExplosionEffect(FVector Location, float Radius);
+
+// Implementation
+void AMyActor::MulticastPlayExplosionEffect_Implementation(
+    FVector Location, float Radius)
+{
+    // Runs on server and all clients — guard so server doesn't spawn visual effects
+    if (!HasAuthority())
+    {
+        UGameplayStatics::SpawnEmitterAtLocation(
+            GetWorld(), ExplosionFX, Location);
+        UGameplayStatics::PlaySoundAtLocation(
+            GetWorld(), ExplosionSound, Location);
+    }
+    // Both server and client: apply physics impulse to overlapping actors
+    ApplyExplosionImpulse(Location, Radius);
+}
+```
+
+### Multicast vs Property Replication
+
+Prefer multicast for **one-shot events** (sounds, VFX, transient animations).
+Prefer **property replication** for **persistent state** (health, flags, positions).
+
+| Data type                          | Mechanism                        |
+|------------------------------------|----------------------------------|
+| Plays once, no recovery needed     | NetMulticast (Unreliable)        |
+| Plays once, must not be missed     | NetMulticast (Reliable)          |
+| Persists on clients that join late | UPROPERTY(Replicated)            |
+| Different value per client         | Client RPC                       |
+
+---
+
+## Reliable vs Unreliable — Definitive Rules
+
+### Use Reliable when
+
+- The action has **permanent game state consequences** (purchase, death, spawn).
+- The receiver must **acknowledge** receipt to proceed (possession, level load).
+- The data is **not redundant** — there is no future update that carries the same info.
+- Dropping the packet would cause a **visible or gameplay-breaking desync**.
+
+### Use Unreliable when
+
+- The data is **superseded frequently** by the next tick's update (position, rotation).
+- It is purely **cosmetic** (hit sparks, footstep dust, screenshake).
+- Dropping it produces only a minor visual glitch, not a gameplay error.
+- The RPC is called **very often** (every tick or multiple times per second) — using
+  Reliable for high-frequency calls saturates the reliable channel and causes lag spikes.
+
+### Reliable Channel Saturation Warning
+
+The reliable channel is a FIFO queue. If too many reliable messages queue up (e.g.,
+a Server Reliable RPC called every frame), the connection will stall waiting for
+acknowledgments. This manifests as rubberbanding and eventually a timeout disconnect.
+
+**Rule**: never call a Reliable RPC more than once per server tick per connection.
+
+---
+
+## Ownership Requirement for RPCs
+
+RPCs will silently fail (not execute, not error) if the actor does not have a valid
+network connection through its ownership chain.
+
+### Server RPC routing
+
+The calling client must own the actor in the chain:
+`APlayerController -> APawn -> AWeapon`
+
+```
+Client calls WeaponActor->ServerFire()
+  -> Engine looks up WeaponActor->GetOwner() -> APawn
+  -> APawn->GetOwner() -> APlayerController
+  -> APlayerController->NetConnection == the calling client connection
+  -> RPC is routed correctly
+```
+
+If `WeaponActor->GetOwner()` is `nullptr` or another player's controller, the RPC
+will be dropped on the client. Fix: call `SetOwner(PlayerController)` on the server
+after spawning the weapon.
+
+### Client RPC routing
+
+The server must own the actor and it must be associated with a specific player's
+`NetConnection`. This is why most Client RPCs are called on `APlayerController`
+directly:
+
+```cpp
+// Server code — send a message to a specific player
+APlayerController* PC = GetPlayerController(PlayerIndex);
+PC->ClientReceiveLocalizedMessage(Message, Switch, nullptr, nullptr, nullptr);
+```
+
+Calling a Client RPC on an actor with no owning player connection will silently fail.
+
+---
+
+## Common RPC Mistakes
+
+### Calling a Server RPC from the Server
+
+A Server RPC called from the server's own code executes locally — the engine
+skips routing. This is not harmful but is misleading and wastes a function call.
+Prefer calling the `_Implementation` function directly from server code if you need
+to invoke the logic without network routing.
+
+```cpp
+// MISLEADING — on the server, this just calls Implementation directly
+ServerDoThing();
+
+// CLEAR — explicitly call the implementation when you know you're on the server
+if (HasAuthority())
+{
+    ServerDoThing_Implementation(Params);
+}
+```
+
+### Calling a Client RPC from the Client
+
+A Client RPC called from the client is silently ignored — it does not route up to
+the server and back down. If you need to trigger something on the server that then
+responds to the client, use a Server RPC + Client RPC pair.
+
+### Using NetMulticast Instead of Property Replication for State
+
+Multicast RPCs are not replayed for clients that join after the call. If a new player
+joins after an explosion, they will not see the aftermath if it was communicated only
+via multicast. Use replicated properties for persistent state.
+
+```cpp
+// WRONG — late-joining clients miss this
+MulticastSetDoorOpen(true);
+
+// CORRECT — new clients see the correct state on join
+bDoorOpen = true; // replicated property — MARK_PROPERTY_DIRTY if using Iris
+```
+
+### Missing WithValidation on Server RPCs That Modify State
+
+Any Server RPC that changes game state (inventory, health, abilities) without
+validation is a security hole. Malicious clients can send arbitrary parameter values.
+
+```cpp
+// INSECURE
+UFUNCTION(Server, Reliable)
+void ServerAddItem(int32 ItemId, int32 Quantity); // client can claim any quantity
+
+// SECURE
+UFUNCTION(Server, Reliable, WithValidation)
+void ServerRequestPurchase(int32 ItemId); // server looks up price from data tables
+```
+
+### RPC Parameters Containing Non-Replicated Object Pointers
+
+Object pointers in RPC parameters must be net-addressable. Passing a pointer to a
+locally spawned, non-replicated UObject will result in a `nullptr` on the remote side.
+
+```cpp
+// WRONG — LocalEffect is not replicated; remote gets nullptr
+ServerDoThingWithEffect(LocalEffect);
+
+// CORRECT — pass a data class reference or an ID, look it up on the remote side
+UFUNCTION(Server, Reliable, WithValidation)
+void ServerActivateEffectById(int32 EffectDataId);
+```
+
+---
+
+## RPC vs Property Replication Decision
+
+| Situation                                          | Preferred mechanism                        |
+|----------------------------------------------------|--------------------------------------------|
+| Value changes on server, clients just read it      | `UPROPERTY(Replicated)`                    |
+| Value changes, client needs custom callback logic  | `UPROPERTY(ReplicatedUsing = OnRep_Func)`  |
+| One-shot event, all clients react simultaneously   | `NetMulticast` RPC                         |
+| One-shot event, only one specific client reacts    | `Client` RPC                               |
+| Client requests server to do something             | `Server` RPC                               |
+| Ordering matters AND property replication is lossy | `Client` RPC (as noted in `PlayerController.h` comments) |
+| High-frequency cosmetic (dust, sparks)             | `NetMulticast Unreliable` RPC              |
+| Late-join clients must see current state           | `UPROPERTY(Replicated)` always             |
+
+---
+
+## RPC Implementation Naming Convention
+
+UE generates the implementation and validation function names automatically from the
+declared function name:
+
+| Declared name           | Generated names                                    |
+|-------------------------|----------------------------------------------------|
+| `ServerFireWeapon`      | `ServerFireWeapon_Implementation`, `ServerFireWeapon_Validate` |
+| `ClientShowResult`      | `ClientShowResult_Implementation`                  |
+| `MulticastPlayEffect`   | `MulticastPlayEffect_Implementation`               |
+
+The `UFUNCTION` macro declaration uses the base name. The body you write is always
+`_Implementation`. Only Server RPCs with `WithValidation` also need `_Validate`.
+

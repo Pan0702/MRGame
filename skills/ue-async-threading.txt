@@ -1,0 +1,974 @@
+# SKILL: ue-async-threading
+
+---
+name: ue-async-threading
+description: "Use this skill when working with Unreal Engine async operations, threading, parallel execution, or concurrency. Also use when the user mentions 'FRunnable', 'FAsyncTask', 'TaskGraph', 'UE::Tasks', 'ParallelFor', 'TFuture', 'TPromise', 'Async()', 'thread safety', 'FCriticalSection', 'FRWLock', 'background thread', 'game thread dispatch', or 'thread pool'. For networking async (RPCs, replication), see ue-networking-replication. For asset streaming, see ue-data-assets-tables."
+metadata:
+  version: 1.0.0
+---
+
+# UE Async and Threading
+
+You are an expert in Unreal Engine's threading model, async task systems, and concurrent programming patterns.
+
+## Context Check
+
+Read `.agents/ue-project-context.md` before proceeding. Engine version matters: `UE::Tasks::Launch` is the modern preferred API (UE 5.0+), while `FAsyncTask` and TaskGraph remain fully supported. Determine: What work needs to be offloaded? Is UObject access required? What latency/throughput tradeoff is acceptable?
+
+## Information Gathering
+
+Ask the user if unclear:
+- **Offload type** — CPU-bound computation, I/O wait, or periodic background work?
+- **UObject interaction** — Does the background work need to read/write UObject state?
+- **Lifetime** — One-shot task, recurring work, or long-lived thread?
+- **Result delivery** — Fire-and-forget, or does the game thread need results back?
+
+---
+
+## UE Threading Model
+
+UE runs several named threads plus a scalable worker pool. Understanding which thread owns what prevents the most common threading bugs.
+
+**Named threads:**
+- **Game Thread** — All UObject access, Blueprint execution, gameplay logic. Check with `IsInGameThread()`.
+- **Render Thread** — Render commands, scene proxy updates. `IsInRenderingThread()`.
+- **RHI Thread** — GPU command submission (platform-dependent).
+- **Worker Threads** — Unnamed pool threads for task dispatch. Count scales with CPU cores.
+
+**The golden rule:** UObjects are game-thread-only. No UPROPERTY reads, no UFUNCTION calls, no `GetWorld()`, no spawning from background threads. Violating this causes intermittent crashes that depend on GC timing and are extremely difficult to diagnose.
+
+---
+
+## Pattern Selection Guide
+
+Choose the simplest API that fits your needs.
+
+| Pattern | Best For | Lifetime | Result? |
+|---------|----------|----------|---------|
+| `AsyncTask(GameThread, Lambda)` | Dispatch to game thread from background | One-shot | No |
+| `UE::Tasks::Launch` | General async work (preferred, UE5+) | One-shot | `TTask<T>` |
+| `Async(EAsyncExecution, Lambda)` | Flexible dispatch with `TFuture` | One-shot | `TFuture<T>` |
+| `FAsyncTask<T>` | Reusable pooled work units | Reusable | Via `GetTask()` |
+| `FAutoDeleteAsyncTask<T>` | Fire-and-forget pooled work | One-shot | No |
+| `TGraphTask<T>` | Complex dependency graphs | One-shot | `FGraphEvent` |
+| `ParallelFor` | Data-parallel loops | Blocking | No |
+| `FRunnable` + `FRunnableThread` | Long-lived dedicated threads | Persistent | Manual |
+
+---
+
+## FRunnable and FRunnableThread
+
+Use `FRunnable` only when you need a **dedicated, long-lived thread** -- a socket listener, a file watcher, or a continuous processing loop. For one-shot work, prefer `UE::Tasks::Launch` or `FAsyncTask`.
+
+**Lifecycle:** `Init()` (new thread) -> `Run()` (new thread) -> `Exit()` (new thread, after Run returns). `Stop()` is called externally to request shutdown.
+
+**FRunnableThread::Create** signature: `static FRunnableThread* Create(FRunnable*, const TCHAR* ThreadName, uint32 StackSize = 0, EThreadPriority = TPri_Normal, uint64 AffinityMask, EThreadCreateFlags)`.
+
+**Key points:** `Stop()` signals the thread -- it does not block. `Kill(true)` calls `Stop()` then waits for completion. Always `delete` the `FRunnableThread*` after `Kill`. Use `std::atomic<bool> bShouldStop` in `Run()` loop, set it in `Stop()`.
+
+See `references/threading-patterns.md` for a complete `FRunnable` subclass template with proper shutdown.
+
+---
+
+## FAsyncTask and FAutoDeleteAsyncTask
+
+For **reusable work units** on the engine thread pool (`GThreadPool`). Subclass `FNonAbandonableTask` and implement `DoWork()` + `GetStatId()`.
+
+```cpp
+class FMyComputeTask : public FNonAbandonableTask
+{
+    friend class FAsyncTask<FMyComputeTask>;
+    int32 Result = 0;
+    TArray<int32> InputData;
+
+    FMyComputeTask(TArray<int32> InData) : InputData(MoveTemp(InData)) {}
+
+    void DoWork()
+    {
+        for (int32 Val : InputData) { Result += Val; }
+    }
+
+    FORCEINLINE TStatId GetStatId() const
+    {
+        RETURN_QUICK_DECLARE_CYCLE_STAT(FMyComputeTask, STATGROUP_ThreadPoolAsyncTasks);
+    }
+};
+```
+
+**Usage:**
+
+```cpp
+// Reusable — you manage lifetime
+auto* Task = new FAsyncTask<FMyComputeTask>(MoveTemp(Data));
+Task->StartBackgroundTask();          // dispatches to GThreadPool
+Task->EnsureCompletion();             // blocks or runs inline if not started
+int32 R = Task->GetTask().Result;
+delete Task;
+
+// Fire-and-forget — auto-deletes on completion
+(new FAutoDeleteAsyncTask<FMyComputeTask>(MoveTemp(Data)))->StartBackgroundTask();
+```
+
+`IsWorkDone()` is the non-blocking completion check. `Cancel()` prevents execution if not yet started. `StartSynchronousTask()` runs inline on the calling thread.
+
+---
+
+## TaskGraph
+
+For work with **complex dependency chains**. Each task declares prerequisites; the scheduler handles ordering.
+
+```cpp
+class FMyGraphTask
+{
+public:
+    FMyGraphTask(int32 InValue) : Value(InValue) {}
+
+    static ESubsequentsMode::Type GetSubsequentsMode()
+    { return ESubsequentsMode::TrackSubsequents; }
+
+    ENamedThreads::Type GetDesiredThread()
+    { return ENamedThreads::AnyThread; }
+
+    TStatId GetStatId() const
+    { RETURN_QUICK_DECLARE_CYCLE_STAT(FMyGraphTask, STATGROUP_TaskGraphTasks); }
+
+    void DoTask(ENamedThreads::Type CurrentThread, const FGraphEventRef& MyCompletionGraphEvent)
+    { /* work here */ }
+
+private:
+    int32 Value;
+};
+```
+
+**Dispatching with prerequisites:**
+
+```cpp
+FGraphEventArray Prerequisites;  // TArray<FGraphEventRef, TInlineAllocator<4>>
+Prerequisites.Add(SomePriorEvent);
+
+FGraphEventRef TaskEvent = TGraphTask<FMyGraphTask>::CreateTask(&Prerequisites)
+    .ConstructAndDispatchWhenReady(42);  // args forwarded to constructor
+
+FTaskGraphInterface::Get().WaitUntilTaskCompletes(TaskEvent, ENamedThreads::GameThread);
+```
+
+**Quick dispatch** (no custom class needed):
+
+```cpp
+AsyncTask(ENamedThreads::GameThread, [this]()
+{
+    MyActor->UpdateHealth(NewValue); // safe — runs on game thread
+});
+```
+
+---
+
+## UE::Tasks::Launch (Modern Preferred API)
+
+Recommended for new code (UE 5.0+). Simpler syntax than TaskGraph, automatic thread pool dispatch, built-in chaining.
+
+```cpp
+#include "Tasks/Task.h"
+
+UE::Tasks::TTask<int32> Task = UE::Tasks::Launch(
+    UE_SOURCE_LOCATION,
+    []() { return ExpensiveComputation(); }
+);
+int32 Result = Task.GetResult(); // blocks until complete
+
+// With prerequisites
+UE::Tasks::TTask<FVector> TaskA = UE::Tasks::Launch(UE_SOURCE_LOCATION,
+    []() { return ComputePosition(); });
+
+UE::Tasks::TTask<void> TaskB = UE::Tasks::Launch(UE_SOURCE_LOCATION,
+    [&TaskA]() { ProcessPosition(TaskA.GetResult()); },
+    UE::Tasks::Prerequisites(TaskA)
+);
+```
+
+**TTask<T> API:** `GetResult()` blocks and returns result. `IsCompleted()` non-blocking. `Wait()` / `Wait(FTimespan)` for timed blocking. `TryRetractAndExecute()` runs inline if not yet started (work stealing).
+
+**FTaskEvent** for manual synchronization -- call `Trigger()` to unblock dependent tasks.
+
+---
+
+## Async, TFuture, and TPromise
+
+`Async()` is the most flexible one-shot dispatch. Returns `TFuture<T>` with execution context control.
+
+```cpp
+TFuture<FMyResult> Future = Async(EAsyncExecution::ThreadPool,
+    []() -> FMyResult { return ComputeResult(); },
+    []() { /* completion callback — runs on unspecified thread */ }
+);
+FMyResult R = Future.Get(); // blocks, does NOT invalidate (unlike std::future)
+```
+
+**EAsyncExecution modes:**
+
+| Mode | Thread |
+|------|--------|
+| `TaskGraph` | Worker via TaskGraph |
+| `TaskGraphMainThread` | Game thread via TaskGraph |
+| `Thread` | New dedicated thread |
+| `ThreadPool` | `GThreadPool` worker |
+| `LargeThreadPool` | `GLargeThreadPool` (WITH_EDITOR only) |
+
+**Convenience:** `AsyncPool(GThreadPool, Lambda)`, `AsyncThread(Lambda, StackSize, Priority)`.
+
+### TFuture<T> API
+
+Key difference from `std::future`: `Get()` does **not** invalidate. Call it multiple times safely. `Consume()` invalidates like `std::future::get()`.
+
+- `IsReady()` -- non-blocking check
+- `Wait()` / `WaitFor(FTimespan)` -- block without consuming
+- `Then(Continuation)` / `Next(Continuation)` -- chaining, continuation runs on any thread
+- `Share()` -- convert to shared future
+
+### TPromise<T>
+
+For producer-consumer patterns where producing and consuming sides are decoupled.
+
+```cpp
+TPromise<FMyData> Promise;
+TFuture<FMyData> Future = Promise.GetFuture(); // call once
+
+Async(EAsyncExecution::ThreadPool, [P = MoveTemp(Promise)]() mutable
+{
+    P.SetValue(GenerateData()); // or EmplaceValue()
+});
+
+FMyData Result = Future.Get(); // blocks on game thread
+```
+
+---
+
+## ParallelFor
+
+For **data-parallel loops** where each iteration is independent. The calling thread participates -- `ParallelFor` blocks until all iterations complete.
+
+```cpp
+ParallelFor(Meshes.Num(), [&Meshes](int32 Index)
+{
+    ProcessMesh(Meshes[Index]);
+});
+
+// With MinBatchSize — prevents overhead for small workloads
+ParallelFor(TEXT("ProcessMeshes"), Meshes.Num(), 64,
+    [&Meshes](int32 Index) { ProcessMesh(Meshes[Index]); }
+);
+```
+
+**EParallelForFlags:**
+
+| Flag | Value | Effect |
+|------|-------|--------|
+| `None` | 0 | Default behavior |
+| `ForceSingleThread` | 1 | Debug: run sequentially |
+| `Unbalanced` | 2 | Iterations have variable cost |
+| `PumpRenderingThread` | 4 | Pump render commands while waiting |
+| `BackgroundPriority` | 8 | Lower priority for workers |
+
+`ParallelForWithTaskContext` provides a per-worker context object -- use when workers need scratch memory to avoid per-iteration allocation.
+
+---
+
+## Game Thread Safety
+
+Threading bugs in UE are **silent** -- they corrupt state, cause GC races, and produce bugs that only reproduce under load. See `references/thread-safety-guide.md` for complete patterns.
+
+### UObject Access Rules
+
+1. **All UObject access must happen on the game thread.** No reads, writes, or function calls from background threads.
+2. **GC can destroy UObjects between ticks.** A raw `UObject*` captured in a lambda may be dangling by execution time.
+3. **Spawning, destroying, modifying components** -- game thread only.
+
+### Safe Dispatch Pattern
+
+```cpp
+AsyncTask(ENamedThreads::GameThread, [WeakActor = TWeakObjectPtr<AActor>(MyActor)]()
+{
+    if (AActor* Actor = WeakActor.Get()) // nullptr if GC'd
+    {
+        Actor->UpdateFromBackgroundWork(NewData);
+    }
+});
+```
+
+**Always capture `TWeakObjectPtr`**, never raw `UObject*`. For non-UObject shared data, use `TSharedPtr<T, ESPMode::ThreadSafe>` -- the default `ESPMode::NotThreadSafe` has non-atomic refcounting.
+
+---
+
+## Synchronization Primitives
+
+### FCriticalSection (Recursive Mutex)
+
+`FCriticalSection` is `UE::FPlatformRecursiveMutex`. Same thread can lock multiple times without deadlocking.
+
+```cpp
+FCriticalSection DataLock;
+void AddPosition(const FVector& Pos)
+{
+    FScopeLock Lock(&DataLock);  // RAII — unlocks on scope exit
+    SharedPositions.Add(Pos);
+}
+```
+
+### FRWLock (Read-Write Lock)
+
+Multiple readers OR one exclusive writer. `FRWLock` is **not** recursive -- do not nest.
+
+```cpp
+FRWLock CacheLock;
+FVector Read(FName Key)  { FReadScopeLock  RL(CacheLock); return Cache.FindRef(Key); }
+void Write(FName K, FVector V) { FWriteScopeLock WL(CacheLock); Cache.Add(K, V); }
+```
+
+### FEventRef and Atomics
+
+`FEventRef` is the RAII wrapper for thread signaling. Prefer over raw `FEvent*`.
+
+```cpp
+FEventRef WorkReady(EEventMode::AutoReset);
+WorkReady->Trigger(); // producer signals
+WorkReady->Wait();    // consumer blocks
+```
+
+`FThreadSafeCounter` and `FThreadSafeBool` are deprecated -- use `std::atomic<int32>` and `std::atomic<bool>` directly.
+
+---
+
+## TQueue (Lock-Free Queue)
+
+Thread-safe queue for producer-consumer without locks.
+
+```cpp
+TQueue<FMyMessage, EQueueMode::Mpsc> MessageQueue;
+
+// Producer (any thread)
+MessageQueue.Enqueue(FMyMessage{...});
+
+// Consumer (game thread tick)
+FMyMessage Msg;
+while (MessageQueue.Dequeue(Msg)) { ProcessMessage(Msg); }
+```
+
+`Spsc` -- single-producer, single-consumer (slightly faster). `Mpsc` -- multiple-producer, single-consumer (most common). `Peek()` reads without dequeuing.
+
+---
+
+## Common Mistakes
+
+**Accessing UObject from background thread -- dispatch results back:**
+```cpp
+// WRONG — UObject access off game thread
+Async(EAsyncExecution::ThreadPool, [this]()
+{ MyActor->Health = ComputeNewHealth(); });
+
+// RIGHT — compute off-thread, apply on game thread via weak pointer
+Async(EAsyncExecution::ThreadPool, [WeakActor = TWeakObjectPtr<AActor>(MyActor)]()
+{
+    float NewHealth = ComputeNewHealth();
+    AsyncTask(ENamedThreads::GameThread, [WeakActor, NewHealth]()
+    { if (AActor* A = WeakActor.Get()) { A->SetHealth(NewHealth); } });
+});
+```
+
+**TSharedPtr with default ESPMode across threads:**
+```cpp
+// WRONG — non-atomic refcount
+auto Data = MakeShared<FMyData>();
+// RIGHT
+auto Data = MakeShared<FMyData, ESPMode::ThreadSafe>();
+```
+
+**FRWLock nested acquisition -- deadlock:**
+```cpp
+// WRONG — FRWLock is NOT recursive
+FReadScopeLock Outer(Lock);
+FReadScopeLock Inner(Lock);  // DEADLOCK on some platforms
+// RIGHT — acquire once, do all reads, release
+```
+
+**ParallelFor with shared mutable state:**
+```cpp
+// WRONG — concurrent writes
+int32 Total = 0;
+ParallelFor(Data.Num(), [&](int32 i) { Total += Data[i]; });
+// RIGHT — atomic accumulation
+std::atomic<int32> Total{0};
+ParallelFor(Data.Num(), [&](int32 i)
+{ Total.fetch_add(Data[i], std::memory_order_relaxed); });
+```
+
+---
+
+## Related Skills
+
+- `ue-cpp-foundations` -- TSharedPtr, TWeakObjectPtr, GC lifetime, smart pointer rules
+- `ue-gameplay-framework` -- game thread tick flow, actor lifecycle ordering
+- `ue-networking-replication` -- RPC dispatch threads, replication callbacks
+- `ue-data-assets-tables` -- FStreamableManager async loading, soft references
+
+--- REFERENCE: thread-safety-guide.md ---
+# Thread Safety Guide
+
+Patterns and rules for safe cross-thread data access in Unreal Engine.
+
+---
+
+## UObject Access Rules
+
+UObjects are managed by the garbage collector, which runs on the game thread. Any access from another thread risks reading a dangling pointer or corrupting GC bookkeeping.
+
+**What counts as "access":** Reading any UPROPERTY, calling any UFUNCTION, calling `GetWorld()`, `GetOwner()`, `GetComponentByClass()`, iterating component arrays, spawning or destroying actors, modifying transform -- all of these are game-thread-only operations.
+
+**Why it seems to work sometimes:** GC only runs at specific points in the frame. A background thread that finishes quickly may never collide with GC. But under load, longer GC pauses, or different hardware timing, the race condition triggers -- producing crashes that are nearly impossible to reproduce in development.
+
+---
+
+## TWeakObjectPtr for Cross-Thread UObject References
+
+Never capture raw `UObject*` in lambdas dispatched to other threads or deferred to future game-thread ticks. The object may be garbage collected before execution.
+
+```cpp
+// Capture weak pointer BEFORE dispatching
+TWeakObjectPtr<AMyActor> WeakActor(MyActor);
+
+UE::Tasks::Launch(UE_SOURCE_LOCATION, [WeakActor]()
+{
+    float Result = ExpensiveCompute();
+
+    // Dispatch result back to game thread with safety check
+    AsyncTask(ENamedThreads::GameThread, [WeakActor, Result]()
+    {
+        if (AMyActor* Actor = WeakActor.Get())
+        {
+            Actor->ApplyComputedResult(Result);
+        }
+        // If Get() returns nullptr, actor was GC'd — silently skip
+    });
+});
+```
+
+**Rule:** Create the `TWeakObjectPtr` on the game thread, then copy it into lambdas. `TWeakObjectPtr::Get()` is safe to call from the game thread to check validity.
+
+---
+
+## TSharedPtr Thread Safety Modes
+
+`TSharedPtr<T>` defaults to `ESPMode::NotThreadSafe` -- the reference count uses non-atomic operations. Sharing across threads causes data races on the refcount itself.
+
+```cpp
+// WRONG — default ESPMode is not thread-safe
+TSharedPtr<FComputeBuffer> Buffer = MakeShared<FComputeBuffer>();
+
+// RIGHT — atomic refcount for cross-thread sharing
+TSharedPtr<FComputeBuffer, ESPMode::ThreadSafe> Buffer =
+    MakeShared<FComputeBuffer, ESPMode::ThreadSafe>();
+
+// The data INSIDE the buffer still needs its own synchronization
+// ESPMode::ThreadSafe only protects the pointer/refcount operations
+```
+
+**Key distinction:** `ESPMode::ThreadSafe` makes the *pointer operations* (copy, destroy, reset) thread-safe. It does NOT protect the pointed-to data. You still need locks or atomics for the actual data if mutated concurrently.
+
+---
+
+## FCriticalSection + FScopeLock Pattern
+
+Use `FCriticalSection` (recursive mutex) when multiple threads read and write shared non-UObject data.
+
+```cpp
+class FThreadSafeAccumulator
+{
+public:
+    void AddSample(float Value)
+    {
+        FScopeLock Lock(&CriticalSection);  // acquires on construction
+        Samples.Add(Value);
+        Total += Value;
+    }   // releases when Lock goes out of scope
+
+    float GetAverage() const
+    {
+        FScopeLock Lock(&CriticalSection);
+        return Samples.Num() > 0 ? Total / Samples.Num() : 0.0f;
+    }
+
+private:
+    mutable FCriticalSection CriticalSection;
+    TArray<float> Samples;
+    float Total = 0.0f;
+};
+```
+
+**Always use `FScopeLock`** -- never call `Lock()` / `Unlock()` manually. Manual lock/unlock risks missing the unlock path on early returns or exceptions.
+
+---
+
+## FRWLock for Read-Heavy Scenarios
+
+When reads vastly outnumber writes, `FRWLock` allows concurrent readers while writers get exclusive access. Significant performance win over `FCriticalSection` in read-heavy workloads.
+
+```cpp
+class FThreadSafeCache
+{
+public:
+    FVector LookupPosition(FName Key) const
+    {
+        FReadScopeLock ReadLock(RWLock);  // multiple readers allowed
+        const FVector* Found = PositionCache.Find(Key);
+        return Found ? *Found : FVector::ZeroVector;
+    }
+
+    void UpdatePosition(FName Key, FVector NewPos)
+    {
+        FWriteScopeLock WriteLock(RWLock);  // exclusive access
+        PositionCache.Add(Key, NewPos);
+    }
+
+private:
+    mutable FRWLock RWLock;
+    TMap<FName, FVector> PositionCache;
+};
+```
+
+**Critical:** `FRWLock` is NOT recursive. Do not acquire a read lock while holding a read lock, and do not acquire a write lock while holding a read lock. Both cause deadlocks on some platforms.
+
+---
+
+## std::atomic Patterns
+
+`FThreadSafeCounter` and `FThreadSafeBool` are deprecated in engine source comments. Use `std::atomic` directly.
+
+```cpp
+class FBackgroundProcessor
+{
+public:
+    void RequestStop() { bShouldStop.store(true, std::memory_order_relaxed); }
+    bool IsStopped() const { return bShouldStop.load(std::memory_order_relaxed); }
+
+    int32 GetProcessedCount() const { return ProcessedCount.load(std::memory_order_relaxed); }
+    void IncrementProcessed() { ProcessedCount.fetch_add(1, std::memory_order_relaxed); }
+
+private:
+    std::atomic<bool> bShouldStop{false};
+    std::atomic<int32> ProcessedCount{0};
+};
+```
+
+**Memory ordering:** `std::memory_order_relaxed` is sufficient for simple flags and counters where you do not need happens-before guarantees with other data. Use `std::memory_order_acquire` / `std::memory_order_release` when the atomic guards visibility of other non-atomic writes.
+
+---
+
+## Double-Buffering Pattern
+
+For transferring bulk data from a background thread to the game thread without locks during the hot path. The background thread writes to one buffer while the game thread reads from the other.
+
+```cpp
+class FDoubleBufferedData
+{
+public:
+    // Background thread writes to back buffer
+    void WriteBackBuffer(TArray<FVector>&& NewData)
+    {
+        FScopeLock Lock(&SwapLock);
+        BackBuffer = MoveTemp(NewData);
+        bSwapPending.store(true, std::memory_order_release);
+    }
+
+    // Game thread swaps and reads — call once per tick
+    const TArray<FVector>& SwapAndRead()
+    {
+        if (bSwapPending.load(std::memory_order_acquire))
+        {
+            FScopeLock Lock(&SwapLock);
+            Swap(FrontBuffer, BackBuffer);
+            bSwapPending.store(false, std::memory_order_relaxed);
+        }
+        return FrontBuffer;  // lock-free read on game thread
+    }
+
+private:
+    TArray<FVector> FrontBuffer;  // game thread reads
+    TArray<FVector> BackBuffer;   // background thread writes
+    FCriticalSection SwapLock;    // only held during swap
+    std::atomic<bool> bSwapPending{false};
+};
+```
+
+The lock is only contended during the brief swap operation. The game thread reads the front buffer without any synchronization for the rest of the frame.
+
+---
+
+## Lock Ordering Rules
+
+When multiple locks must be held simultaneously, always acquire them in a consistent global order. Inconsistent ordering between threads causes deadlocks.
+
+**Rules:**
+1. **Define a total order** for all locks in your system (e.g., by subsystem, then by allocation order).
+2. **Always acquire in ascending order.** If thread A holds Lock1 and needs Lock2, Lock2 must have a higher order than Lock1.
+3. **Never hold a lock while calling unknown code** (callbacks, delegates, virtual functions). The callee may try to acquire a lock with a lower order.
+4. **Prefer lock-free patterns** (`TQueue`, `std::atomic`, double-buffering) when they fit. No locks means no deadlocks.
+5. **Keep critical sections short.** Do expensive computation outside the lock, then lock briefly to commit results.
+
+```cpp
+// WRONG — inconsistent order causes deadlock
+// Thread 1: Lock(A) -> Lock(B)
+// Thread 2: Lock(B) -> Lock(A)
+
+// RIGHT — consistent order
+// Thread 1: Lock(A) -> Lock(B)
+// Thread 2: Lock(A) -> Lock(B)
+```
+
+When in doubt, restructure to use a single lock or a lock-free queue. Two locks that must be held simultaneously usually indicate a design that can be simplified.
+
+--- REFERENCE: threading-patterns.md ---
+# Threading Patterns Reference
+
+Complete code templates for UE async and threading patterns. Each template is production-ready with proper lifecycle management and error handling.
+
+---
+
+## FRunnable Subclass Template
+
+Full dedicated-thread pattern with cooperative shutdown via `std::atomic<bool>`.
+
+```cpp
+#include "HAL/Runnable.h"
+#include "HAL/RunnableThread.h"
+#include "HAL/PlatformProcess.h"
+#include <atomic>
+
+class FMyBackgroundWorker : public FRunnable
+{
+public:
+    FMyBackgroundWorker() = default;
+
+    // Start the thread — call from game thread
+    void StartThread()
+    {
+        Thread = FRunnableThread::Create(
+            this,
+            TEXT("MyBackgroundWorker"),
+            0,                    // StackSize (0 = platform default)
+            TPri_BelowNormal,    // lower than game thread
+            FPlatformAffinity::GetPoolThreadMask()
+        );
+    }
+
+    // Request shutdown and wait — call from game thread
+    ~FMyBackgroundWorker()
+    {
+        if (Thread)
+        {
+            Thread->Kill(true);  // calls Stop(), then blocks until Run() exits
+            delete Thread;
+            Thread = nullptr;
+        }
+    }
+
+    // --- FRunnable interface ---
+
+    bool Init() override
+    {
+        // Runs on NEW thread before Run() starts
+        // Return false to abort thread creation
+        return true;
+    }
+
+    uint32 Run() override
+    {
+        // Runs on the NEW thread
+        while (!bShouldStop.load(std::memory_order_relaxed))
+        {
+            // --- Do your work here ---
+            ProcessNextWorkItem();
+
+            // Yield to prevent CPU spin when no work available
+            FPlatformProcess::Sleep(0.001f);
+        }
+        return 0;
+    }
+
+    void Stop() override
+    {
+        // Called from OUTSIDE the thread (by Kill or directly)
+        // Must be thread-safe — only set the atomic flag
+        bShouldStop.store(true, std::memory_order_relaxed);
+    }
+
+    void Exit() override
+    {
+        // Runs on the worker thread AFTER Run() returns
+        // Clean up thread-local resources here
+    }
+
+private:
+    std::atomic<bool> bShouldStop{false};
+    FRunnableThread* Thread = nullptr;
+
+    void ProcessNextWorkItem()
+    {
+        // Your actual work implementation
+    }
+};
+```
+
+---
+
+## FNonAbandonableTask + FAsyncTask Template
+
+Thread pool work unit pattern. The `friend` declaration lets `FAsyncTask` construct the inner task.
+
+```cpp
+#include "Async/AsyncWork.h"
+
+class FChunkProcessTask : public FNonAbandonableTask
+{
+    friend class FAsyncTask<FChunkProcessTask>;
+
+public:
+    // Results accessible after completion
+    TArray<FVector> ProcessedVertices;
+
+private:
+    // Constructor — args forwarded from FAsyncTask constructor
+    FChunkProcessTask(TArray<FVector> InRawVertices, float InScale)
+        : RawVertices(MoveTemp(InRawVertices))
+        , Scale(InScale)
+    {}
+
+    void DoWork()
+    {
+        ProcessedVertices.Reserve(RawVertices.Num());
+        for (const FVector& V : RawVertices)
+        {
+            ProcessedVertices.Add(V * Scale);
+        }
+    }
+
+    FORCEINLINE TStatId GetStatId() const
+    {
+        RETURN_QUICK_DECLARE_CYCLE_STAT(FChunkProcessTask, STATGROUP_ThreadPoolAsyncTasks);
+    }
+
+    TArray<FVector> RawVertices;
+    float Scale;
+};
+
+// --- Usage: reusable task ---
+auto* Task = new FAsyncTask<FChunkProcessTask>(MoveTemp(Vertices), 2.0f);
+Task->StartBackgroundTask();          // dispatch to GThreadPool
+// ... do other game thread work ...
+Task->EnsureCompletion();             // block until done
+TArray<FVector> Result = MoveTemp(Task->GetTask().ProcessedVertices);
+delete Task;
+
+// --- Usage: fire-and-forget ---
+(new FAutoDeleteAsyncTask<FChunkProcessTask>(MoveTemp(Vertices), 2.0f))
+    ->StartBackgroundTask();
+// Task auto-deletes when DoWork completes — no result retrieval possible
+```
+
+---
+
+## TGraphTask Template with Prerequisites
+
+Custom TaskGraph task with dependency chaining.
+
+```cpp
+#include "Async/TaskGraphInterfaces.h"
+
+class FComputeNavTask
+{
+public:
+    FComputeNavTask(TArray<FVector>& InOutPath) : Path(InOutPath) {}
+
+    static ESubsequentsMode::Type GetSubsequentsMode()
+    {
+        return ESubsequentsMode::TrackSubsequents;
+    }
+
+    ENamedThreads::Type GetDesiredThread()
+    {
+        return ENamedThreads::AnyThread;
+    }
+
+    TStatId GetStatId() const
+    {
+        RETURN_QUICK_DECLARE_CYCLE_STAT(FComputeNavTask, STATGROUP_TaskGraphTasks);
+    }
+
+    void DoTask(ENamedThreads::Type CurrentThread, const FGraphEventRef& MyCompletionGraphEvent)
+    {
+        // Compute path — runs on worker thread
+        for (FVector& Point : Path)
+        {
+            Point = SmoothPoint(Point);
+        }
+    }
+
+private:
+    TArray<FVector>& Path;
+};
+
+// --- Dispatch with prerequisites ---
+FGraphEventArray NoPrereqs;
+FGraphEventRef StepA = TGraphTask<FComputeNavTask>::CreateTask(&NoPrereqs)
+    .ConstructAndDispatchWhenReady(PathData);
+
+FGraphEventArray StepAPrereq;
+StepAPrereq.Add(StepA);
+FGraphEventRef StepB = TGraphTask<FApplyNavTask>::CreateTask(&StepAPrereq)
+    .ConstructAndDispatchWhenReady(PathData);
+
+// Wait for final step on game thread
+FTaskGraphInterface::Get().WaitUntilTaskCompletes(StepB, ENamedThreads::GameThread);
+```
+
+---
+
+## UE::Tasks::Launch with Prerequisites
+
+Modern preferred API (UE 5.0+).
+
+```cpp
+#include "Tasks/Task.h"
+
+// Step 1: compute positions
+UE::Tasks::TTask<TArray<FVector>> PosTask = UE::Tasks::Launch(
+    UE_SOURCE_LOCATION,
+    []() -> TArray<FVector>
+    {
+        TArray<FVector> Positions;
+        // ... expensive computation ...
+        return Positions;
+    }
+);
+
+// Step 2: depends on step 1
+UE::Tasks::TTask<TArray<FVector>> SmoothTask = UE::Tasks::Launch(
+    UE_SOURCE_LOCATION,
+    [&PosTask]() -> TArray<FVector>
+    {
+        TArray<FVector> Raw = PosTask.GetResult();
+        // ... smooth positions ...
+        return Raw;
+    },
+    UE::Tasks::Prerequisites(PosTask)
+);
+
+// Retrieve on game thread (blocks until chain completes)
+TArray<FVector> Final = SmoothTask.GetResult();
+
+// Non-blocking check
+if (SmoothTask.IsCompleted()) { /* safe to GetResult without blocking */ }
+
+// Timed wait
+if (SmoothTask.Wait(FTimespan::FromMilliseconds(5.0)))
+{
+    // completed within timeout
+}
+```
+
+---
+
+## ParallelFor Variants
+
+```cpp
+#include "Async/ParallelFor.h"
+
+// Basic — all iterations equal cost
+ParallelFor(Meshes.Num(), [&Meshes](int32 Index)
+{
+    ProcessMesh(Meshes[Index]);
+});
+
+// With MinBatchSize — avoids thread overhead for small counts
+ParallelFor(TEXT("MeshProcess"), Meshes.Num(), 128,
+    [&Meshes](int32 Index) { ProcessMesh(Meshes[Index]); }
+);
+
+// With flags — variable-cost iterations at background priority
+ParallelFor(Meshes.Num(), [&Meshes](int32 Index)
+{
+    ProcessMesh(Meshes[Index]);
+}, EParallelForFlags::Unbalanced | EParallelForFlags::BackgroundPriority);
+
+// With per-thread context — avoids per-iteration allocation
+TArray<FMyThreadContext> OutContexts;
+ParallelForWithTaskContext(TEXT("GenNormals"), OutContexts, Meshes.Num(), 64,
+    [&Meshes](FMyThreadContext& Ctx, int32 Index)
+    {
+        // Ctx is unique per worker thread — use as scratch buffer
+        Ctx.TempBuffer.Reset();
+        ComputeNormals(Meshes[Index], Ctx.TempBuffer);
+    }
+);
+```
+
+---
+
+## Async() with EAsyncExecution Modes
+
+```cpp
+#include "Async/Async.h"
+
+// ThreadPool — most common for CPU work
+TFuture<int32> F1 = Async(EAsyncExecution::ThreadPool,
+    []() { return HeavyCompute(); });
+
+// TaskGraphMainThread — runs on game thread next tick
+TFuture<void> F2 = Async(EAsyncExecution::TaskGraphMainThread,
+    []() { /* safe for UObject access */ });
+
+// Thread — dedicated thread for blocking I/O
+TFuture<TArray<uint8>> F3 = Async(EAsyncExecution::Thread,
+    []() { return FFileHelper::LoadFileToArray(...); });
+
+// Convenience wrappers
+TFuture<int32> F4 = AsyncPool(GThreadPool,
+    []() { return Compute(); });
+TFuture<void> F5 = AsyncThread(
+    []() { BlockingIOWork(); },
+    0,             // StackSize (0 = default)
+    TPri_Normal);
+```
+
+---
+
+## TPromise/TFuture Producer-Consumer
+
+Decouples the code that produces a value from the code that consumes it.
+
+```cpp
+#include "Async/Future.h"
+#include "Async/Async.h"
+
+// Create promise/future pair
+TPromise<FAnalyticsResult> Promise;
+TFuture<FAnalyticsResult> Future = Promise.GetFuture(); // call exactly once
+
+// Producer — moves promise into background work
+Async(EAsyncExecution::ThreadPool, [P = MoveTemp(Promise)]() mutable
+{
+    FAnalyticsResult Result;
+    Result.PlayerCount = GatherPlayerMetrics();
+    Result.FrameStats = GatherFrameMetrics();
+    P.SetValue(MoveTemp(Result)); // or P.EmplaceValue(args...)
+});
+
+// Consumer — chain continuation or block
+Future.Then([](TFuture<FAnalyticsResult> F)
+{
+    FAnalyticsResult R = F.Get(); // Get() does NOT invalidate
+    UE_LOG(LogGame, Log, TEXT("Players: %d"), R.PlayerCount);
+});
+
+// Or block directly on game thread (use sparingly)
+FAnalyticsResult R = Future.Get();
+```
+

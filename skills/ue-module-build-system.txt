@@ -1,0 +1,1269 @@
+# SKILL: ue-module-build-system
+
+---
+name: ue-module-build-system
+description: Use when working with Build.cs, Target.cs, module creation, plugin setup, or build errors in Unreal Engine — including "unresolved external symbol," "cannot open include file," IWYU violations, missing API macros, or dependency configuration. See also ue-cpp-foundations for UObject macro patterns.
+metadata:
+  version: 1.0.0
+---
+
+# UE Module & Build System
+
+You are an expert in Unreal Engine's module and build system. You understand Unreal Build Tool (UBT), ModuleRules, TargetRules, the .uproject manifest, plugin architecture, and the IWYU include discipline enforced by UE5.
+
+## Before Starting
+
+Read `.agents/ue-project-context.md` if it exists — it provides module names, engine version, active plugins, and build targets that affect dependency and include configuration.
+
+Ask which situation applies:
+1. Configuring dependencies in an existing Build.cs
+2. Creating a new module from scratch
+3. Creating a new plugin
+4. Resolving a build error (linker, include, or IWYU)
+5. Setting up Target.cs for a new build target
+
+---
+
+## Build.cs Anatomy
+
+Every UE module has a `ModuleName.Build.cs` file next to its `Public/` and `Private/` directories.
+
+```csharp
+// Source/MyModule/MyModule.Build.cs
+using UnrealBuildTool;
+
+public class MyModule : ModuleRules
+{
+    public MyModule(ReadOnlyTargetRules Target) : base(Target)
+    {
+        // PCH settings — use IWYU in UE5
+        PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+        // Enable strict IWYU (recommended for new modules in UE5)
+        bEnforceIWYU = true;
+
+        // Types accessible to modules that depend on MyModule
+        PublicDependencyModuleNames.AddRange(new string[]
+        {
+            "Core",
+            "CoreUObject",
+            "Engine",
+        });
+
+        // Types used only internally (not re-exported in public headers)
+        PrivateDependencyModuleNames.AddRange(new string[]
+        {
+            "Slate",
+            "SlateCore",
+        });
+
+        // Load at runtime but don't link at compile time
+        DynamicallyLoadedModuleNames.Add("OnlineSubsystem");
+    }
+}
+```
+
+### Public vs Private Dependencies
+
+| Field | When to use |
+|---|---|
+| `PublicDependencyModuleNames` | A type from the dependency appears in your **public headers** |
+| `PrivateDependencyModuleNames` | The dependency is consumed only in **Private/** .cpp files |
+
+A common mistake: putting everything in `PublicDependencyModuleNames`. This bloats transitive include paths for every downstream module. Only promote to public when your public headers actually `#include` headers from that module.
+
+### Include Paths
+
+```csharp
+// Expose extra paths to modules that depend on you
+PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "Public/Interfaces"));
+
+// Expose extra paths only to this module's own source
+PrivateIncludePaths.Add(Path.Combine(ModuleDirectory, "Private/Helpers"));
+```
+
+UBT automatically adds `Public/` and `Private/` — you rarely need to set these manually unless you have nested subdirectory headers you want to import without path prefixes.
+
+### API Export Macro
+
+UBT generates `MODULENAME_API` from the module's directory name, uppercased. Any class, function, or variable that must be visible across DLL boundaries needs this macro:
+
+```cpp
+// Public/MyClass.h
+#pragma once
+#include "CoreMinimal.h"
+
+class MYMODULE_API FMyClass
+{
+public:
+    void DoSomething();
+};
+
+// Standalone exported function
+MYMODULE_API void MyFreeFunction();
+```
+
+Missing `MYMODULE_API` on a class that another module references causes "unresolved external symbol" linker errors.
+
+### PCH and IWYU
+
+```csharp
+// UE5 recommended — each file includes exactly what it uses
+PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+bEnforceIWYU = true;
+
+// Legacy — one monolithic PCH (avoid for new modules)
+PCHUsage = PCHUsageMode.UseSharedPCHs;
+```
+
+With IWYU, every `.cpp` file includes its own `.h` first, then only what it directly uses:
+
+```cpp
+// Private/MyClass.cpp
+#include "MyClass.h"       // own header first
+#include "Engine/Actor.h"  // only includes this file directly uses
+```
+
+### Compiler Flags
+
+```csharp
+// C++ exceptions — disable unless third-party code requires them
+bEnableExceptions = false;
+
+// Runtime type information — disable unless using dynamic_cast
+bUseRTTI = false;
+
+// Third-party static libraries shipped with the engine
+AddEngineThirdPartyPrivateStaticDependencies(Target, "zlib", "OpenSSL");
+```
+
+---
+
+## Target.cs
+
+Located at `Source/ProjectName.Target.cs` (and `Source/ProjectNameEditor.Target.cs`).
+
+```csharp
+// Source/MyGame.Target.cs
+using UnrealBuildTool;
+using System.Collections.Generic;
+
+public class MyGameTarget : TargetRules
+{
+    public MyGameTarget(TargetInfo Target) : base(Target)
+    {
+        Type = TargetType.Game;
+        DefaultBuildSettings = BuildSettingsVersion.Latest;
+        IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
+
+        // All game modules that UBT should compile
+        ExtraModuleNames.AddRange(new string[] { "MyGame", "MyGameUtilities" });
+    }
+}
+
+// Source/MyGameEditor.Target.cs
+public class MyGameEditorTarget : TargetRules
+{
+    public MyGameEditorTarget(TargetInfo Target) : base(Target)
+    {
+        Type = TargetType.Editor;
+        DefaultBuildSettings = BuildSettingsVersion.Latest;
+        IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
+        ExtraModuleNames.AddRange(new string[] { "MyGame", "MyGameEditor" });
+    }
+}
+```
+
+### Target Types
+
+| TargetType | Use for |
+|---|---|
+| `Game` | Standalone game executable |
+| `Editor` | Editor build (includes editor-only modules) |
+| `Client` | Networked client without server logic |
+| `Server` | Dedicated server (no renderer) |
+| `Program` | Standalone non-game tool |
+
+**Build configurations**: `Debug` (full symbols, no optimization), `DebugGame` (engine optimized, game debug), `Development` (default; balanced), `Test` (like shipping but with console/stats), `Shipping` (final release, strips all debug).
+
+---
+
+## .uproject File
+
+```json
+{
+    "FileVersion": 3,
+    "EngineAssociation": "5.4",
+    "Category": "",
+    "Description": "",
+    "Modules": [
+        {
+            "Name": "MyGame",
+            "Type": "Runtime",
+            "LoadingPhase": "Default"
+        },
+        {
+            "Name": "MyGameEditor",
+            "Type": "Editor",
+            "LoadingPhase": "Default"
+        }
+    ],
+    "Plugins": [
+        {
+            "Name": "ModelingToolsEditorMode",
+            "Enabled": true
+        },
+        {
+            "Name": "MyPlugin",
+            "Enabled": true
+        }
+    ]
+}
+```
+
+### Module Types
+
+| Type | When to use |
+|---|---|
+| `Runtime` | Core game logic, ships with game |
+| `RuntimeNoCommandlet` | Runtime, excluded from commandlet processes |
+| `Editor` | Editor-only — stripped from shipping builds |
+| `EditorNoCommandlet` | Editor, excluded from commandlets |
+| `Developer` | Tools usable in Editor and Development builds |
+| `DeveloperTool` | Developer module, shows in editor UI |
+| `CookedOnly` | Included only in cooked (packaged) builds |
+| `UncookedOnly` | Included only in uncooked (development) builds |
+| `RuntimeAndProgram` | Runtime module that also compiles into standalone Programs |
+| `EditorAndProgram` | Editor module that also compiles into standalone Programs |
+| `Program` | Standalone programs (UnrealHeaderTool etc.) |
+
+### Loading Phases
+
+| Phase | Use for |
+|---|---|
+| `EarliestPossible` | First possible phase — core engine modules only |
+| `PostSplashScreen` | After splash screen renders |
+| `PreEarlyLoadingScreen` | Before the early loading screen |
+| `PreLoadingScreen` | Before the main loading screen |
+| `PostConfigInit` | Systems that must configure before engine starts |
+| `PreDefault` | Modules that must be ready before Default modules |
+| `Default` | Standard game modules (most common) |
+| `PostDefault` | Modules that depend on Default modules being up |
+| `PostEngineInit` | After full engine initialization |
+| `None` | Not auto-loaded — requires `FModuleManager::LoadModule()` |
+
+---
+
+## Creating a New Module
+
+### Directory Structure
+
+```
+Source/
+  MyModule/
+    Public/
+      MyModule.h          (optional module interface header)
+      MyClass.h
+    Private/
+      MyModule.cpp        (module registration)
+      MyClass.cpp
+    MyModule.Build.cs
+```
+
+### Module Interface
+
+```cpp
+// Public/MyModule.h
+#pragma once
+#include "Modules/ModuleManager.h"
+
+class IMyModule : public IModuleInterface
+{
+public:
+    static IMyModule& Get()
+    {
+        return FModuleManager::LoadModuleChecked<IMyModule>("MyModule");
+    }
+
+    static bool IsAvailable()
+    {
+        return FModuleManager::Get().IsModuleLoaded("MyModule");
+    }
+};
+```
+
+```cpp
+// Private/MyModule.cpp
+#include "MyModule.h"
+
+class FMyModule : public IMyModule
+{
+public:
+    virtual void StartupModule() override
+    {
+        // Initialize subsystems, register delegates, etc.
+    }
+
+    virtual void ShutdownModule() override
+    {
+        // Unregister delegates, clean up
+    }
+};
+
+// Use IMPLEMENT_MODULE for non-gameplay modules
+IMPLEMENT_MODULE(FMyModule, MyModule)
+
+// Use IMPLEMENT_GAME_MODULE for modules containing UObject/gameplay code
+// IMPLEMENT_GAME_MODULE(FMyModule, MyModule)
+
+// Use IMPLEMENT_PRIMARY_GAME_MODULE for the main game module
+// IMPLEMENT_PRIMARY_GAME_MODULE(FMyModule, MyGame, "MyGame")
+```
+
+The `IMPLEMENT_MODULE` macro (defined in `Modules/ModuleManager.h`) registers the module's initializer function. In DLL builds it registers a static `FModuleInitializerEntry` that maps the module name to its factory function. In monolithic builds it registers a static `FStaticallyLinkedModuleRegistrant`.
+
+`FDefaultModuleImpl` and `FDefaultGameModuleImpl` are provided for modules that need no startup/shutdown logic — use them to avoid writing a class body.
+
+### Add to .uproject
+
+```json
+{
+    "Name": "MyModule",
+    "Type": "Runtime",
+    "LoadingPhase": "Default"
+}
+```
+
+---
+
+## Creating a Plugin
+
+### Directory Structure
+
+```
+Plugins/
+  MyPlugin/
+    MyPlugin.uplugin
+    Source/
+      MyPlugin/
+        Public/
+          IMyPlugin.h
+        Private/
+          MyPlugin.cpp
+        MyPlugin.Build.cs
+      MyPluginEditor/           (optional editor-only module)
+        Public/
+        Private/
+          MyPluginEditor.cpp
+        MyPluginEditor.Build.cs
+    Content/                    (optional, for content plugins)
+    Resources/
+      Icon128.png
+```
+
+### .uplugin File
+
+```json
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0",
+    "FriendlyName": "My Plugin",
+    "Description": "Does something useful.",
+    "Category": "Gameplay",
+    "CreatedBy": "MyStudio",
+    "CreatedByURL": "",
+    "DocsURL": "",
+    "MarketplaceURL": "",
+    "CanContainContent": true,
+    "IsBetaVersion": false,
+    "IsExperimentalVersion": false,
+    "Installed": false,
+    "Modules": [
+        {
+            "Name": "MyPlugin",
+            "Type": "Runtime",
+            "LoadingPhase": "Default"
+        },
+        {
+            "Name": "MyPluginEditor",
+            "Type": "Editor",
+            "LoadingPhase": "Default"
+        }
+    ]
+}
+```
+
+### Plugin with Runtime + Editor Modules
+
+The runtime module must not include editor-only headers. Gate editor code:
+
+```cpp
+// MyPlugin.Build.cs — runtime module
+public class MyPlugin : ModuleRules
+{
+    public MyPlugin(ReadOnlyTargetRules Target) : base(Target)
+    {
+        PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
+        PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine" });
+
+        // Editor-only dependency, only when compiling an editor build
+        if (Target.bBuildEditor)
+        {
+            PrivateDependencyModuleNames.Add("UnrealEd");
+        }
+    }
+}
+```
+
+```cpp
+// MyPluginEditor.Build.cs — editor module
+public class MyPluginEditor : ModuleRules
+{
+    public MyPluginEditor(ReadOnlyTargetRules Target) : base(Target)
+    {
+        PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
+        PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "UnrealEd" });
+        PrivateDependencyModuleNames.Add("MyPlugin");
+    }
+}
+```
+
+### Engine vs Project Plugins
+
+**Engine plugins** (`Engine/Plugins/`): available to all projects using that engine installation. Ship with Epic or marketplace installs. **Project plugins** (`YourProject/Plugins/`): project-specific, travel with the project. When both exist with the same name, the project plugin wins.
+
+**Content-only plugins**: No `Source/` directory, no `Modules` array in `.uplugin`. Contains only `Content/` and `Resources/`. Set `"CanContainContent": true`. Used for distributing Blueprint libraries and asset packs without C++ compilation.
+
+**Edge case -- launcher vs source builds**: Launcher (binary) installs only include pre-built engine module binaries. Adding a dependency on an engine module not in the pre-built set causes LNK1104. Source builds from GitHub expose all engine modules. Use `Target.LinkType` to conditionally include source-build-only dependencies.
+
+---
+
+## Resolving Build Errors
+
+Most build errors fall into a few categories: **LNK2019** (missing dependency or missing `MODULENAME_API`), **C1083** (missing dependency or wrong include path under IWYU), **IWYU violations** (include every header each file directly uses), and **circular dependencies** (extract a shared interface module or use `DynamicallyLoadedModuleNames`). Guard editor-only code in runtime modules with `#if WITH_EDITOR` and `if (Target.bBuildEditor)` in Build.cs. See [references/common-build-errors.md](references/common-build-errors.md) for full error message lookup, causes, and fix patterns.
+
+---
+
+## Common Anti-Patterns
+
+- **Putting everything in PublicDependencyModuleNames** — inflates transitive include paths for every downstream module. Only promote to public when your public headers require it.
+- **Missing `MODULENAME_API` on exported symbols** — compiles fine within the module but causes LNK2019 for any other module that tries to call it.
+- **Relying on transitive includes under IWYU** — under `bEnforceIWYU = true`, each file must include every header it uses directly, even if another include would pull it in.
+- **Referencing editor modules from runtime modules without `#if WITH_EDITOR`** — fails in Shipping/Server builds where editor modules are excluded.
+- **Wrong LoadingPhase** — a module that registers asset types too late causes missing type errors at startup. Use `PreDefault` or `PostConfigInit` when needed.
+- **Not adding the module to .uproject** — UBT will not compile a module that isn't listed in `.uproject` or a `.uplugin`.
+
+---
+
+## Related Skills
+
+- **ue-cpp-foundations** — UObject macros (UCLASS, UPROPERTY, UFUNCTION), reflection, and what must be in public headers for UHT to process
+
+For detailed Build.cs field reference, see [references/build-cs-reference.md](references/build-cs-reference.md).
+For error message lookup, see [references/common-build-errors.md](references/common-build-errors.md).
+
+--- REFERENCE: build-cs-reference.md ---
+# Build.cs Complete Field Reference
+
+This reference covers every significant `ModuleRules` property used in Unreal Engine's C# build scripts. All fields are set inside the constructor of a class that derives from `ModuleRules`.
+
+---
+
+## Class Structure
+
+```csharp
+using UnrealBuildTool;
+using System.IO;             // for Path.Combine
+using System.Collections.Generic;
+
+public class MyModule : ModuleRules
+{
+    public MyModule(ReadOnlyTargetRules Target) : base(Target)
+    {
+        // All fields are set here
+    }
+}
+```
+
+`ReadOnlyTargetRules Target` gives you read access to everything about the build target: platform, configuration, build type, editor flag, etc.
+
+---
+
+## Dependency Fields
+
+### PublicDependencyModuleNames
+
+```csharp
+PublicDependencyModuleNames.AddRange(new string[]
+{
+    "Core",           // FString, TArray, TMap, logging
+    "CoreUObject",    // UObject, UClass, reflection
+    "Engine",         // AActor, UWorld, UGameInstance
+    "InputCore",      // FKey, EKeys — needed when using Enhanced Input
+});
+```
+
+Adds modules whose **public headers** are re-exported through your own public headers. Any module that depends on yours will also inherit these include paths transitively.
+
+Use this when a type from the dependency appears in:
+- A parameter or return type in your public header
+- A base class of a type declared in your public header
+- A field in a UPROPERTY in your public header
+
+### PrivateDependencyModuleNames
+
+```csharp
+PrivateDependencyModuleNames.AddRange(new string[]
+{
+    "Slate",          // SWidget, SCompoundWidget
+    "SlateCore",      // FSlateColor, FSlateBrush
+    "RenderCore",     // FRenderCommandFence
+    "RHI",            // FRHITexture, FRHICommandList
+    "Json",           // FJsonObject, FJsonSerializer
+    "HTTP",           // FHttpModule, IHttpRequest
+});
+```
+
+Adds modules used only inside `Private/` implementation files. These are not inherited by downstream modules. Prefer private for anything you can — it minimizes transitive compilation overhead.
+
+### DynamicallyLoadedModuleNames
+
+```csharp
+DynamicallyLoadedModuleNames.AddRange(new string[]
+{
+    "OnlineSubsystem",
+    "OnlineSubsystemSteam",
+});
+```
+
+Tells UBT the module may be loaded at runtime via `FModuleManager::LoadModule()`, but does not create a compile-time link dependency. Use this when you load plugins or platform-specific backends conditionally.
+
+---
+
+## Include Path Fields
+
+### PublicIncludePaths
+
+```csharp
+// Expose subdirectories to downstream modules
+PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "Public", "Interfaces"));
+PublicIncludePaths.Add(Path.Combine(ModuleDirectory, "Public", "Subsystems"));
+```
+
+UBT automatically adds `ModuleDirectory/Public` — only add this when you have headers in subdirectories that downstream modules need to include without a path prefix.
+
+### PrivateIncludePaths
+
+```csharp
+// Only visible inside this module
+PrivateIncludePaths.Add(Path.Combine(ModuleDirectory, "Private", "Helpers"));
+PrivateIncludePaths.Add(Path.Combine(ModuleDirectory, "Private", "Internal"));
+```
+
+Only accessible to this module's own source files.
+
+### PublicSystemIncludePaths
+
+```csharp
+// For third-party C headers — suppresses warnings
+PublicSystemIncludePaths.Add(Path.Combine(ThirdPartyPath, "include"));
+```
+
+Treated as system include paths. Compiler warnings are suppressed for headers in these paths.
+
+### PrivateIncludePathModuleNames
+
+```csharp
+// Access headers from another module's Public/ without creating a link dependency
+PrivateIncludePathModuleNames.AddRange(new string[] { "AssetRegistry" });
+```
+
+Adds include paths from a module without linking against it. Use when you only need type-forward declarations or data structures, not exported symbols.
+
+---
+
+## PCH Fields
+
+### PCHUsage
+
+```csharp
+// UE5 default — IWYU, each file includes what it uses
+PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
+// Legacy — shared PCH, all files implicitly get engine types
+PCHUsage = PCHUsageMode.UseSharedPCHs;
+
+// No precompiled headers at all
+PCHUsage = PCHUsageMode.NoPCHs;
+
+// Each module uses its own private PCH (slower build, maximum isolation)
+PCHUsage = PCHUsageMode.NoSharedPCHs;
+```
+
+Always use `UseExplicitOrSharedPCHs` for new UE5 modules.
+
+### PrivatePCHHeaderFile
+
+```csharp
+// When you want to define your own PCH header
+PrivatePCHHeaderFile = "Private/MyModulePCH.h";
+```
+
+Specifies a custom PCH for this module. The referenced file is compiled as the PCH and prepended to all translation units in the module.
+
+### bEnforceIWYU
+
+```csharp
+// Enforce Include What You Use — each file must include every header it directly uses
+bEnforceIWYU = true;
+```
+
+When true, UBT checks that no source file relies on transitive includes. Strongly recommended for new modules; required when `PCHUsage = UseExplicitOrSharedPCHs`.
+
+---
+
+## Compiler and Linker Flags
+
+### bEnableExceptions
+
+```csharp
+// Enable C++ exception handling (try/catch/throw)
+// Default: false — most UE code uses ensure/check/UE_LOG instead
+bEnableExceptions = true;
+```
+
+Only enable when integrating third-party code that throws exceptions. UE's own code does not use exceptions.
+
+### bUseRTTI
+
+```csharp
+// Enable runtime type information (typeid, dynamic_cast)
+// Default: false
+bUseRTTI = true;
+```
+
+Only enable when third-party code requires it. UE uses its own reflection system instead.
+
+### bUseAVX
+
+```csharp
+// Allow AVX instruction set on supported platforms
+bUseAVX = true;
+```
+
+### OptimizeCode
+
+```csharp
+// Force optimization on or off regardless of build configuration
+OptimizeCode = CodeOptimization.Always;   // even in Debug
+OptimizeCode = CodeOptimization.Never;    // even in Shipping (debugging)
+OptimizeCode = CodeOptimization.Default;  // follow build config (normal)
+```
+
+### bDisableStaticAnalysis
+
+```csharp
+// Disable static analysis for this module (use sparingly)
+bDisableStaticAnalysis = true;
+```
+
+### CppStandard
+
+```csharp
+// Override C++ standard for this module
+CppStandard = CppStandardVersion.Cpp20;
+CppStandard = CppStandardVersion.Cpp17;   // UE default
+```
+
+---
+
+## Third-Party Libraries
+
+### AddEngineThirdPartyPrivateStaticDependencies
+
+```csharp
+// Link a third-party static library shipped with the engine
+AddEngineThirdPartyPrivateStaticDependencies(Target,
+    "zlib",
+    "OpenSSL",
+    "libcurl"
+);
+```
+
+This is the preferred way to consume engine-bundled third-party libraries. UBT looks up the library definition in `Engine/Source/ThirdParty/`.
+
+### PublicAdditionalLibraries / PublicDelayLoadDLLs
+
+```csharp
+// Link against an external static library
+PublicAdditionalLibraries.Add(Path.Combine(ThirdPartyDir, "Win64", "MyLib.lib"));
+
+// Delay-load a DLL (Windows only)
+PublicDelayLoadDLLs.Add("MyLib.dll");
+RuntimeDependencies.Add(Path.Combine(ThirdPartyDir, "Win64", "MyLib.dll"));
+```
+
+### RuntimeDependencies
+
+```csharp
+// Copy files to the output directory when packaging
+RuntimeDependencies.Add("$(PluginDir)/Binaries/Win64/MyLib.dll");
+RuntimeDependencies.Add(new RuntimeDependency(
+    Path.Combine(PluginDirectory, "Content", "MyData.bin")));
+```
+
+---
+
+## Platform-Conditional Patterns
+
+```csharp
+public MyModule(ReadOnlyTargetRules Target) : base(Target)
+{
+    PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
+    PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine" });
+
+    // Editor-only dependencies
+    if (Target.bBuildEditor)
+    {
+        PrivateDependencyModuleNames.AddRange(new string[]
+        {
+            "UnrealEd",
+            "EditorFramework",
+        });
+    }
+
+    // Platform-specific libraries
+    if (Target.Platform == UnrealTargetPlatform.Win64)
+    {
+        PublicAdditionalLibraries.Add(Path.Combine(ModuleDirectory, "lib", "Win64", "MyLib.lib"));
+        PublicDelayLoadDLLs.Add("MyLib.dll");
+    }
+    else if (Target.Platform == UnrealTargetPlatform.Mac)
+    {
+        PublicAdditionalLibraries.Add(Path.Combine(ModuleDirectory, "lib", "Mac", "libMyLib.a"));
+    }
+
+    // Development-only code
+    if (Target.Configuration != UnrealTargetConfiguration.Shipping)
+    {
+        PrivateDependencyModuleNames.Add("EngineSettings");
+        PublicDefinitions.Add("ENABLE_MY_DEBUG_FEATURES=1");
+    }
+    else
+    {
+        PublicDefinitions.Add("ENABLE_MY_DEBUG_FEATURES=0");
+    }
+}
+```
+
+### Target.Platform Values
+
+| Value | Platform |
+|---|---|
+| `UnrealTargetPlatform.Win64` | Windows 64-bit |
+| `UnrealTargetPlatform.Mac` | macOS |
+| `UnrealTargetPlatform.Linux` | Linux |
+| `UnrealTargetPlatform.IOS` | iOS |
+| `UnrealTargetPlatform.Android` | Android |
+
+### Target.Configuration Values
+
+| Value | Description |
+|---|---|
+| `UnrealTargetConfiguration.Debug` | Full debug, no optimization |
+| `UnrealTargetConfiguration.DebugGame` | Debug game code, optimized engine |
+| `UnrealTargetConfiguration.Development` | Standard development build |
+| `UnrealTargetConfiguration.Test` | Like Shipping, with some stats |
+| `UnrealTargetConfiguration.Shipping` | Final release, stripped |
+
+---
+
+## Preprocessor Definitions
+
+```csharp
+// Add a preprocessor definition to all compilation units in this module
+PublicDefinitions.Add("MY_FEATURE_ENABLED=1");
+
+// Private definitions only visible inside this module
+PrivateDefinitions.Add("INTERNAL_BUILD_VERSION=42");
+```
+
+---
+
+## TargetRules Reference (Target.cs)
+
+```csharp
+public class MyGameTarget : TargetRules
+{
+    public MyGameTarget(TargetInfo Target) : base(Target)
+    {
+        Type = TargetType.Game;
+
+        // Use latest UBT build settings (sets sensible defaults)
+        DefaultBuildSettings = BuildSettingsVersion.Latest;
+
+        // Use latest include order (required for IWYU with UE5)
+        IncludeOrderVersion = EngineIncludeOrderVersion.Latest;
+
+        // Modules UBT must compile for this target
+        ExtraModuleNames.AddRange(new string[]
+        {
+            "MyGame",
+            "MyGameCore",
+        });
+
+        // Disable unity builds for faster incremental iteration (slower full builds)
+        bUseUnityBuild = false;
+
+        // Enable link time code generation in Shipping
+        bAllowLTCG = Target.Configuration == UnrealTargetConfiguration.Shipping;
+    }
+}
+```
+
+### TargetType Values
+
+| Value | Executable type |
+|---|---|
+| `TargetType.Game` | Game client, no editor tooling |
+| `TargetType.Editor` | Editor build, all editor modules included |
+| `TargetType.Client` | Client-only, server code excluded |
+| `TargetType.Server` | Server-only, renderer excluded |
+| `TargetType.Program` | Standalone program (not a game) |
+
+---
+
+## Common Engine Module Reference
+
+These are the modules you most often add as dependencies:
+
+| Module | Provides |
+|---|---|
+| `Core` | `FString`, `TArray`, `TMap`, `FName`, `FText`, `UE_LOG`, `check`, `ensure` |
+| `CoreUObject` | `UObject`, `UClass`, UPROPERTY/UFUNCTION reflection |
+| `Engine` | `AActor`, `UWorld`, `UGameInstance`, `UActorComponent` |
+| `InputCore` | `FKey`, `EKeys` |
+| `EnhancedInput` | `UInputAction`, `UInputMappingContext` |
+| `GameplayTags` | `FGameplayTag`, `FGameplayTagContainer` |
+| `Slate` | `SWidget`, `SCompoundWidget`, `SWindow` |
+| `SlateCore` | `FSlateColor`, `FSlateBrush`, `FGeometry` |
+| `UMG` | `UUserWidget`, `UButton`, `UTextBlock` |
+| `RenderCore` | `FRenderCommandFence`, render thread utilities |
+| `RHI` | `FRHITexture`, `FRHICommandList`, GPU resources |
+| `Json` | `FJsonObject`, `FJsonSerializer` |
+| `HTTP` | `FHttpModule`, `IHttpRequest` |
+| `AssetRegistry` | `IAssetRegistry`, `FAssetData` |
+| `UnrealEd` | Editor subsystems, `UEditorEngine` (editor-only) |
+| `EditorFramework` | `IToolkit`, toolkit base (editor-only) |
+| `PropertyEditor` | Details panel customization (editor-only) |
+| `DeveloperSettings` | `UDeveloperSettings` config objects |
+| `NetCore` | Networking primitives |
+| `OnlineSubsystem` | `IOnlineSubsystem`, sessions, leaderboards |
+| `AIModule` | `UAIController`, `UBehaviorTree` |
+| `NavigationSystem` | `UNavigationSystemV1`, pathfinding |
+| `PhysicsCore` | Physics engine abstractions |
+| `Chaos` | Chaos physics (UE5+ default) |
+
+---
+
+## API Macro Generation Rules
+
+UBT generates the export macro by:
+1. Taking the module's directory name
+2. Converting to uppercase
+3. Appending `_API`
+
+Examples:
+- Module directory `MyPlugin` → `MYPLUGIN_API`
+- Module directory `MyPlugin_Runtime` → `MYPLUGIN_RUNTIME_API`
+- Module directory `Core` → `CORE_API`
+- Module directory `Engine` → `ENGINE_API`
+
+The macro expands to `__declspec(dllexport)` on Windows or `__attribute__((visibility("default")))` on Linux/Mac in DLL builds, and to nothing in monolithic builds.
+
+--- REFERENCE: common-build-errors.md ---
+# Common UE Build Errors: Causes and Solutions
+
+This reference maps common Unreal Build Tool (UBT) and compiler/linker error messages to their root causes and concrete fixes.
+
+---
+
+## Linker Errors (LNK)
+
+### LNK2019 — Unresolved External Symbol
+
+**Full message pattern**:
+```
+error LNK2019: unresolved external symbol "public: void __cdecl FSomeClass::SomeMethod(void)"
+    referenced in function "..."
+```
+
+**Cause A: Missing module dependency**
+
+The module containing `FSomeClass` is not listed as a dependency.
+
+Fix: Add the module to `Build.cs`:
+```csharp
+PrivateDependencyModuleNames.Add("TheModuleThatDefinesFSomeClass");
+```
+
+**Cause B: Missing `MODULENAME_API` export macro**
+
+`FSomeClass` exists in another module but was never marked for DLL export.
+
+Fix: Add the macro to the class or function declaration:
+```cpp
+// Before:
+class FSomeClass { void SomeMethod(); };
+
+// After:
+class MYMODULE_API FSomeClass { void SomeMethod(); };
+```
+
+**Cause C: Function defined in a .cpp but declared in a header without the macro**
+
+```cpp
+// Header — export the declaration
+MYMODULE_API void SomeFreeFunction();
+
+// .cpp — no macro needed here, definition is in the same module
+void SomeFreeFunction() { ... }
+```
+
+**Cause D: Dependency listed in PrivateDependencyModuleNames but type appears in a public header**
+
+A type from a private dependency cannot be used in your public headers. Either:
+- Move the type usage to your Private/ .cpp files, OR
+- Promote the dependency to `PublicDependencyModuleNames`
+
+### LNK2001 — Unresolved External Symbol (variant)
+
+```
+error LNK2001: unresolved external symbol __declspec(dllimport) ...
+```
+
+This is the same problem as LNK2019. Follow the same fixes.
+
+### LNK4099 — PDB Not Found
+
+```
+warning LNK4099: PDB 'SomeLib.pdb' was not found
+```
+
+Usually harmless for third-party libraries. Suppress with a linker flag in Build.cs:
+```csharp
+// Suppress PDB warnings for external libraries
+PublicAdditionalLibraries can omit .pdb — or suppress via:
+// bDisableSymbolLocalization = true  (or ignore in project linker settings)
+```
+
+### LNK1104 — Cannot Open File
+
+```
+fatal error LNK1104: cannot open file 'SomeLib.lib'
+```
+
+**Cause**: A library path in `PublicAdditionalLibraries` points to a file that doesn't exist.
+
+**Fix**: Verify the path. Use `Path.Combine` to build platform-correct paths:
+```csharp
+string LibPath = Path.Combine(ModuleDirectory, "lib", "Win64", "SomeLib.lib");
+if (File.Exists(LibPath))
+{
+    PublicAdditionalLibraries.Add(LibPath);
+}
+```
+
+---
+
+## Compiler Errors (C-series, clang)
+
+### C1083 — Cannot Open Include File
+
+```
+fatal error C1083: Cannot open include file: 'SomeHeader.h': No such file or directory
+```
+
+**Cause A: Missing module dependency**
+
+The module that owns `SomeHeader.h` is not a dependency.
+
+Fix:
+```csharp
+PublicDependencyModuleNames.Add("TheModuleThatOwnsSomeHeader");
+// or
+PrivateDependencyModuleNames.Add("TheModuleThatOwnsSomeHeader");
+```
+
+**Cause B: Wrong include path in IWYU mode**
+
+UE5 with `PCHUsage = UseExplicitOrSharedPCHs` requires full paths relative to a module's `Public/` root.
+
+```cpp
+// Wrong — works only if PCH pulls it in transitively
+#include "Actor.h"
+
+// Correct — explicit path from module root
+#include "GameFramework/Actor.h"
+```
+
+**Cause C: Third-party header not on include path**
+
+```csharp
+// In Build.cs:
+PublicSystemIncludePaths.Add(Path.Combine(ThirdPartyDir, "include"));
+```
+
+**Cause D: Missing header generated by UHT**
+
+If the included file is a `.generated.h`, you may need to regenerate project files. Run "Generate Project Files" from the .uproject or from the Unreal Editor.
+
+### C2039 — Member Not Found
+
+```
+error C2039: 'SomeMember': is not a member of 'FSomeClass'
+```
+
+Often caused by:
+- Stale generated header (`.generated.h`) — regenerate project files
+- Forward declaration without full include — add `#include "SomeClass.h"` in the .cpp
+- IWYU violation — the type was previously pulled in by a PCH header that's no longer included
+
+### C2027 / C2371 — Incomplete Type / Type Redefinition
+
+```
+error C2027: use of undefined type 'FSomeClass'
+error C2371: 'FSomeClass': redefinition; different basic types
+```
+
+**Cause**: Forward declaration used where full definition is needed, OR the same header included via two different paths (`SomeClass.h` vs `SubDir/SomeClass.h`).
+
+**Fix for incomplete type**: Replace forward declaration with full include in the .cpp:
+```cpp
+// Header — keep forward declaration for pointer/reference params
+class FSomeClass;
+class MYMODULE_API FMyClass
+{
+    void DoThing(FSomeClass* Param);
+};
+
+// CPP — include the full definition
+#include "SomeClass.h"
+void FMyClass::DoThing(FSomeClass* Param) { ... }
+```
+
+**Fix for redefinition**: Use consistent paths. Prefer includes from a module root:
+```cpp
+// Inconsistent — may cause ODR violations
+#include "SomeClass.h"           // resolved via PublicIncludePaths
+#include "SubDir/SomeClass.h"   // different resolved path, same file
+
+// Consistent — always use full path from module root
+#include "SubDir/SomeClass.h"
+```
+
+---
+
+## UHT Errors (Unreal Header Tool)
+
+### Missing #include for generated header
+
+```
+error: include 'MyClass.generated.h' must be the last include in the header
+```
+
+**Fix**: Move the `.generated.h` include to the very last line of your header's includes:
+```cpp
+#pragma once
+
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "MyClass.generated.h"   // MUST be last
+```
+
+### UCLASS / USTRUCT not found by UHT
+
+```
+error: Expected type name after 'class' keyword
+```
+
+Common causes:
+- The file is in the wrong directory (UHT only scans `Public/` and `Private/`)
+- The file is not listed in the project (ensure .uproject or .uplugin has the module)
+- `GENERATED_BODY()` or `GENERATED_USTRUCT_BODY()` is missing inside the class/struct
+
+### Missing MODULE_API on exported UCLASS
+
+UHT-generated reflection requires that classes with `UCLASS()` macro are exported if they're in a module:
+
+```cpp
+UCLASS()
+class MYMODULE_API UMyObject : public UObject
+{
+    GENERATED_BODY()
+    // ...
+};
+```
+
+Omitting `MYMODULE_API` here will compile but causes reflection failures when the class is referenced across module boundaries.
+
+---
+
+## IWYU Violations
+
+### Symptom: Builds in unity mode, fails with standalone compile
+
+With `bUseUnityBuild = true` (default), UBT combines multiple .cpp files. A violation is only caught when:
+- `bUseUnityBuild = false` (set in Target.cs for iteration)
+- `bEnforceIWYU = true` (set in Build.cs)
+- Building with `-singlefile` flag
+
+**Fix pattern**: For each compilation unit, include exactly what it uses:
+
+```cpp
+// MyActor.cpp
+#include "MyActor.h"              // own header first — always
+#include "Engine/World.h"         // uses GetWorld()
+#include "GameFramework/PlayerController.h"  // uses APlayerController
+// Do NOT include "CoreMinimal.h" and rely on it to pull in FString — include what you need
+```
+
+### Relying on Transitive Includes
+
+```cpp
+// ActorA.h includes Engine.h which includes World.h
+// Your file:
+#include "ActorA.h"
+// ... uses UWorld without including Engine/World.h
+
+// This breaks when ActorA.h changes its includes
+```
+
+**Fix**: Include every header you directly use.
+
+---
+
+## Module Not Found at Runtime
+
+### Symptom
+
+```
+LogModuleManager: Warning: ModuleNotFound: Could not find module 'MyModule'
+```
+
+or a crash at startup with module load failure.
+
+**Checklist**:
+1. Module is listed in `.uproject` or `.uplugin` `Modules` array
+2. `LoadingPhase` is appropriate — if you load the module via C++ at a specific time, the module must have loaded by then
+3. The module binary exists — rebuild the project
+4. If it's a plugin module, the plugin is enabled in `.uproject`'s `Plugins` array
+
+---
+
+## Circular Dependency
+
+### Symptom
+
+```
+Error: Circular dependency detected: ModuleA -> ModuleB -> ModuleA
+```
+
+UBT cannot build a static dependency graph that includes cycles.
+
+**Resolution strategies**:
+
+**Strategy 1: Extract a shared interface module**
+
+Before:
+- `ModuleA` depends on `ModuleB` (for `IServiceB`)
+- `ModuleB` depends on `ModuleA` (for `IServiceA`)
+
+After:
+- `ModuleInterfaces` defines both `IServiceA` and `IServiceB`
+- `ModuleA` depends on `ModuleInterfaces`
+- `ModuleB` depends on `ModuleInterfaces`
+
+**Strategy 2: Use DynamicallyLoadedModuleNames**
+
+```csharp
+// ModuleB.Build.cs — no compile-time dependency on ModuleA
+DynamicallyLoadedModuleNames.Add("ModuleA");
+```
+
+Then at runtime:
+```cpp
+IModuleA* ModuleA = FModuleManager::GetModulePtr<IModuleA>("ModuleA");
+if (ModuleA) { ModuleA->DoThing(); }
+```
+
+**Strategy 3: Forward declare and use pointers/references**
+
+Move full includes from headers to .cpp files and use forward declarations in the header.
+
+---
+
+## Hot Reload Failures
+
+### Symptom: Changes not reflected after recompile
+
+Hot Reload (Live Coding in UE5) has limitations:
+- New UPROPERTY fields on existing UClasses are not applied to existing instances
+- New UFUNCTIONs added to existing classes may not bind correctly
+- Changes to class hierarchy require a full restart
+
+**Fix**: For structural changes to UObject classes, always do a full restart rather than hot reload.
+
+### Symptom: Crash on hot reload
+
+```
+Assertion failed: Class->ClassDefaultObject ...
+```
+
+Caused by:
+- Adding/removing fields from USTRUCTs without restarting
+- Changing the memory layout of UObjects that already have instances
+
+**Fix**: Full rebuild and editor restart.
+
+---
+
+## Packaging / Cooking Errors
+
+### Missing module in cooked build
+
+```
+LogPackageName: Error: DoesPackageExist: DoesPackageExistFast FAILED: 'MyModule'
+```
+
+**Cause**: A module with `Type: "Editor"` or `Type: "Developer"` was referenced from runtime code.
+
+**Fix**:
+- In C++: guard editor-only code with `#if WITH_EDITOR`
+- In Build.cs: use `if (Target.bBuildEditor)` for editor-only dependencies
+- In .uproject: ensure the module type matches actual usage
+
+### Blueprint assets referencing stripped modules
+
+If Blueprint graphs reference C++ functions from editor-only modules, cooking strips the module and breaks the Blueprint.
+
+**Fix**: Move the referenced functions to a Runtime module, or use `CallInEditor = true` UFUNCTION specifier for functions that should only call from editor — ensuring they're never called from game code paths.
+
+---
+
+## Build Configuration Quick Reference
+
+| Error type | First thing to check |
+|---|---|
+| LNK2019 unresolved symbol | Missing dependency or missing `MODULENAME_API` |
+| C1083 cannot open include | Missing dependency or wrong include path |
+| IWYU violation | Missing direct include, relying on transitive pull |
+| UHT parse error | Missing `.generated.h` last, missing `GENERATED_BODY()` |
+| Module not found at runtime | Not listed in .uproject/.uplugin, or wrong LoadingPhase |
+| Circular dependency | Extract interface module or use dynamic loading |
+| Cooking failure | Editor-only code/module referenced from runtime path |
+| Hot reload crash | Structural UObject change — full restart required |
+

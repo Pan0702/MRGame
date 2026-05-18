@@ -1,0 +1,1539 @@
+# SKILL: ue-animation-system
+
+---
+name: ue-animation-system
+description: "Use this skill when working with Unreal Engine animation: AnimInstance, montage playback, blend space, state machine, anim notify, IK, AnimGraph, skeletal mesh, or linked anim graphs. See references/anim-notify-reference.md for notify patterns and references/locomotion-setup.md for locomotion setup. For montage integration with GAS, see ue-gameplay-abilities."
+metadata:
+  version: 1.0.0
+---
+
+# UE Animation System
+
+You are an expert in Unreal Engine's animation system.
+
+## Context Check
+
+Read `.agents/ue-project-context.md` first. Note which plugins are enabled
+(Control Rig, Motion Matching, Full Body IK), whether GAS is in use, and the
+skeleton/character hierarchy.
+
+## Information to Gather
+
+1. What animation need? (locomotion, ability, cinematic, IK, procedural)
+2. C++ only, Blueprint only, or mixed?
+3. Does the character use `ACharacter` with an existing `USkeletalMeshComponent`?
+4. Is GAS active? (affects montage replication)
+5. Multiplayer? (determines replication strategy)
+6. Does the project use modular linked anim layers?
+
+---
+
+## Architecture
+
+```
+ACharacter / AActor
+  └── USkeletalMeshComponent
+        └── UAnimInstance subclass
+              ├── NativeInitializeAnimation()           [setup, game thread]
+              ├── NativeUpdateAnimation(float dt)       [game thread]
+              ├── NativeThreadSafeUpdateAnimation(dt)   [worker thread]
+              ├── FAnimInstanceProxy                    [worker thread eval]
+              └── Montage API / Linked Layers
+```
+
+Animation updates run in two phases. Game thread: `NativeUpdateAnimation` —
+safe to read gameplay state. Worker thread: blend tree evaluation. Write all
+shared state as `UPROPERTY() Transient` members in `NativeUpdateAnimation`;
+read those cached values in `NativeThreadSafeUpdateAnimation`.
+
+---
+
+## AnimInstance
+
+### Subclass Pattern
+
+```cpp
+// MyAnimInstance.h
+UCLASS()
+class MYGAME_API UMyAnimInstance : public UAnimInstance
+{
+    GENERATED_BODY()
+
+    virtual void NativeInitializeAnimation() override;
+    virtual void NativeUpdateAnimation(float DeltaSeconds) override;
+    virtual void NativeThreadSafeUpdateAnimation(float DeltaSeconds) override;
+
+protected:
+    UPROPERTY(Transient) TObjectPtr<ACharacter> OwningCharacter;
+    UPROPERTY(Transient) TObjectPtr<UCharacterMovementComponent> MovementComp;
+
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Locomotion")
+    float Speed = 0.f;
+
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Locomotion")
+    float Direction = 0.f;
+
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Locomotion")
+    bool bIsInAir = false;
+};
+```
+
+```cpp
+// MyAnimInstance.cpp
+void UMyAnimInstance::NativeInitializeAnimation()
+{
+    Super::NativeInitializeAnimation(); // ALWAYS call super
+    OwningCharacter = Cast<ACharacter>(TryGetPawnOwner());
+    if (OwningCharacter)
+        MovementComp = OwningCharacter->GetCharacterMovement();
+}
+
+void UMyAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
+{
+    Super::NativeUpdateAnimation(DeltaSeconds);
+    if (!OwningCharacter || !MovementComp) return;
+
+    const FVector Velocity = MovementComp->Velocity;
+    Speed    = Velocity.Size2D();
+    bIsInAir = MovementComp->IsFalling();
+
+    if (Speed > 3.f)
+    {
+        const FRotator ActorRot    = OwningCharacter->GetActorRotation();
+        const FRotator VelocityRot = Velocity.ToOrientationRotator();
+        Direction = UKismetMathLibrary::NormalizedDeltaRotator(
+            VelocityRot, ActorRot).Yaw;
+    }
+}
+
+void UMyAnimInstance::NativeThreadSafeUpdateAnimation(float DeltaSeconds)
+{
+    Super::NativeThreadSafeUpdateAnimation(DeltaSeconds);
+    // Only read UPROPERTY members written in NativeUpdateAnimation above.
+    // Do NOT call any UObject functions not marked BlueprintThreadSafe.
+}
+```
+
+### FAnimInstanceProxy — Thread-Safe Access
+
+Heavy animation logic can run on worker threads via
+`NativeThreadSafeUpdateAnimation`. Access shared data through the proxy:
+
+```cpp
+void UMyAnimInstance::NativeThreadSafeUpdateAnimation(float DeltaSeconds)
+{
+    FMyAnimInstanceProxy& Proxy = GetProxyOnAnyThread<FMyAnimInstanceProxy>();
+    Proxy.Speed = Proxy.Velocity.Size();
+    Proxy.bIsFalling = Proxy.MovementMode == EMovementMode::MOVE_Falling;
+}
+```
+
+```cpp
+// FAnimInstanceProxy declaration — worker thread data container
+USTRUCT()
+struct FMyAnimInstanceProxy : public FAnimInstanceProxy
+{
+    GENERATED_BODY()
+    FMyAnimInstanceProxy() = default;
+    explicit FMyAnimInstanceProxy(UAnimInstance* Instance) : FAnimInstanceProxy(Instance) {}
+
+    float Speed = 0.f;
+    FVector Velocity = FVector::ZeroVector;
+    TEnumAsByte<EMovementMode> MovementMode = MOVE_None;
+
+    virtual void PreUpdate(UAnimInstance* AnimInstance, float DeltaSeconds) override;
+    virtual void Update(float DeltaSeconds) override;
+};
+
+// In UMyAnimInstance: override CreateAnimInstanceProxy to return your proxy
+virtual FAnimInstanceProxy* CreateAnimInstanceProxy() override
+{ return new FMyAnimInstanceProxy(this); }
+```
+
+The engine copies data between game thread and worker thread at safe sync points.
+
+---
+
+## Montages
+
+Source: `AnimMontage.h`, `AnimInstance.h`
+
+Key API (`UAnimInstance`):
+```cpp
+float Montage_Play(UAnimMontage*, float PlayRate=1.f,
+    EMontagePlayReturnType=MontageLength, float StartAt=0.f, bool bStopAll=true);
+void  Montage_Stop(float BlendOut, const UAnimMontage* Montage=nullptr);
+void  Montage_Pause(const UAnimMontage* Montage=nullptr);
+void  Montage_Resume(const UAnimMontage* Montage);
+void  Montage_JumpToSection(FName Section, const UAnimMontage* Montage=nullptr);
+void  Montage_SetNextSection(FName From, FName To, const UAnimMontage* Montage=nullptr);
+bool  Montage_IsActive(const UAnimMontage*) const;
+bool  Montage_IsPlaying(const UAnimMontage*) const;
+FName Montage_GetCurrentSection(const UAnimMontage* Montage=nullptr) const;
+float Montage_GetPosition(const UAnimMontage*) const;
+```
+
+### Playing + Delegate Pattern
+
+```cpp
+void UMyComponent::PlayAttackMontage(UAnimMontage* Montage)
+{
+    UAnimInstance* AnimInst = GetMesh()->GetAnimInstance();
+    if (!AnimInst || !Montage) return;
+
+    // Play FIRST — Montage_SetEndDelegate calls GetActiveInstanceForMontage()
+    // internally, which returns nullptr until Montage_Play creates the instance.
+    if (AnimInst->Montage_Play(Montage) <= 0.f) return;
+
+    FOnMontageEnded EndDelegate;
+    EndDelegate.BindUObject(this, &UMyComponent::OnAttackEnded);
+    AnimInst->Montage_SetEndDelegate(EndDelegate, Montage);
+
+    FOnMontageBlendingOutStarted BlendOutDelegate;
+    BlendOutDelegate.BindUObject(this, &UMyComponent::OnAttackBlendingOut);
+    AnimInst->Montage_SetBlendingOutDelegate(BlendOutDelegate, Montage);
+}
+
+void UMyComponent::OnAttackEnded(UAnimMontage* Montage, bool bInterrupted) { }
+void UMyComponent::OnAttackBlendingOut(UAnimMontage* Montage, bool bInterrupted) { }
+```
+
+### Dynamic Slot Montage
+
+```cpp
+UAnimMontage* DynMontage = AnimInst->PlaySlotAnimationAsDynamicMontage(
+    SomeSequence, FName("UpperBody"), 0.25f, 0.25f, 1.f, 1);
+```
+
+### Multiplayer Replication
+
+- **With GAS**: use `UAbilitySystemComponent::PlayMontage()` — GAS handles
+  replication via `FGameplayAbilityRepAnimMontage`.
+- **Without GAS**: replicate a montage pointer or a custom rep struct; server
+  calls `Montage_Play`, clients play on `OnRep_`.
+- Never call `Montage_Play` independently on all net roles without sync.
+
+### GAS Integration — PlayMontageAndWait
+
+```cpp
+// GAS ability task — PlayMontageAndWait (requires GameplayAbilities module)
+UAbilityTask_PlayMontageAndWait* Task =
+    UAbilityTask_PlayMontageAndWait::CreatePlayMontageAndWaitProxy(
+        this, NAME_None, AttackMontage, 1.f);
+Task->OnCompleted.AddDynamic(this, &UMyAbility::OnMontageCompleted);
+Task->OnInterrupted.AddDynamic(this, &UMyAbility::OnMontageInterrupted);
+Task->ReadyForActivation();  // must call to start the task
+```
+
+---
+
+## Blend Spaces
+
+Blend spaces are data assets sampled in the AnimGraph. Drive them by setting
+`UPROPERTY` members on the AnimInstance that the AnimGraph reads.
+
+- **1D** (`UBlendSpace1D`): single axis, typically Speed (0–600).
+  Use `FInterpolationParameter` with `InterpolationType=SpringDamper`,
+  `InterpolationTime=0.15`, `DampingRatio=1.0`.
+- **2D** (`UBlendSpace`): two axes — Direction (-180 to 180) and Speed (0–600).
+  Cardinal direction samples at each speed tier.
+- **Aim Offset** (`UAimOffsetBlendSpace`): additive blend space for Yaw/Pitch
+  aiming, placed after the base locomotion pose in the AnimGraph.
+
+See `references/locomotion-setup.md` for complete axis configuration and
+sample placement.
+
+---
+
+## State Machines
+
+State machines live in the AnimGraph. Bind native C++ logic to transition rules
+and state entry/exit without Blueprint:
+
+```cpp
+// In NativeInitializeAnimation()
+AddNativeTransitionBinding(
+    FName("LocomotionSM"), FName("Idle"), FName("Walk/Run"),
+    FCanTakeTransition::CreateUObject(this, &UMyAnimInstance::CanStartMoving),
+    FName("IdleToMoving"));
+
+AddNativeStateEntryBinding(
+    FName("LocomotionSM"), FName("Land"),
+    FOnGraphStateChanged::CreateUObject(this, &UMyAnimInstance::OnLandEntered));
+```
+
+Query state machine at runtime:
+```cpp
+const FAnimNode_StateMachine* SM =
+    GetStateMachineInstanceFromName(FName("LocomotionSM"));
+float RunWeight = GetInstanceStateWeight(
+    GetStateMachineIndex(FName("LocomotionSM")), SM->GetCurrentState());
+```
+
+### Conduit Nodes
+
+Conduits evaluate a single boolean rule and fan out to multiple destination
+states — replacing duplicated transition logic. Add a Conduit in the AnimGraph
+editor; its `CanEnterTransition` runs once and all outgoing transitions share
+the result. Use conduits when three or more states need the same entry condition
+(e.g., "is grounded?"). For simple A-to-B transitions, a direct rule is clearer.
+
+---
+
+## Anim Notifies
+
+Source: `AnimNotify.h`, `AnimNotifyState.h`
+
+### UAnimNotify — Point-in-Time
+
+```cpp
+UCLASS(meta=(DisplayName="Footstep"))
+class MYGAME_API UFootstepNotify : public UAnimNotify
+{
+    GENERATED_BODY()
+public:
+    // Always override the UE5 3-argument signature
+    virtual void Notify(USkeletalMeshComponent* MeshComp,
+        UAnimSequenceBase* Animation,
+        const FAnimNotifyEventReference& EventReference) override;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Footstep")
+    FName FootSocket = FName("foot_l");
+};
+```
+
+### UAnimNotifyState — Duration (Begin/Tick/End)
+
+```cpp
+UCLASS(meta=(DisplayName="Weapon Collision Window"))
+class MYGAME_API UWeaponCollisionState : public UAnimNotifyState
+{
+    GENERATED_BODY()
+public:
+    virtual void NotifyBegin(USkeletalMeshComponent*, UAnimSequenceBase*,
+        float TotalDuration, const FAnimNotifyEventReference&) override;
+    virtual void NotifyEnd(USkeletalMeshComponent*, UAnimSequenceBase*,
+        const FAnimNotifyEventReference&) override;
+};
+```
+
+### BranchingPoint (Synchronous)
+
+Set `bIsNativeBranchingPoint = true` in the constructor. Override
+`BranchingPointNotify()` instead of `Notify()`. Fires synchronously during
+`Montage_Advance` — use for section jumps and precise timeline control. All
+other notifies are queued (fire after tick completes, safe for VFX/SFX).
+
+### Named Notify Delegate
+
+```cpp
+AnimInst->OnPlayMontageNotifyBegin.AddDynamic(
+    this, &UMyComponent::HandleNotifyBegin);
+
+void UMyComponent::HandleNotifyBegin(FName NotifyName,
+    const FBranchingPointNotifyPayload& Payload)
+{
+    if (NotifyName == FName("EnableHitbox")) ActivateHitDetection();
+}
+```
+
+See `references/anim-notify-reference.md` for built-in notify catalog and more
+custom patterns.
+
+---
+
+## IK and Procedural
+
+### Foot IK with Line Traces (NativeUpdateAnimation — game thread)
+
+```cpp
+FVector UMyAnimInstance::GetFootTarget(FName SocketName) const
+{
+    const FVector Foot = GetOwningComponent()->GetSocketLocation(SocketName);
+    FHitResult Hit;
+    FCollisionQueryParams P(SCENE_QUERY_STAT(FootIK), true);
+    P.AddIgnoredActor(OwningCharacter);
+    if (GetWorld()->LineTraceSingleByChannel(
+            Hit, Foot + FVector(0,0,50), Foot - FVector(0,0,75),
+            ECC_Visibility, P))
+        return Hit.ImpactPoint;
+    return Foot;
+}
+```
+
+Feed results into a Control Rig asset (UE5 recommended) or a
+**Two Bone IK** skeletal control node in the AnimGraph.
+
+**Skeletal control nodes** (AnimGraph):
+
+| Node | Purpose |
+|---|---|
+| Two Bone IK | Two-joint IK (arm, leg) — effector + joint target |
+| FABRIK | Multi-bone chain IK — tip bone + effector |
+| Look At | Single bone tracks target location with clamp |
+| Copy Bone | Copies transform components between bones |
+| Spline IK | Bones follow a spline curve (spine, tail) |
+
+### Layered Blend Per Bone (Upper/Lower Split)
+
+In the AnimGraph:
+1. Connect state machine output to **Base Pose**.
+2. Connect `UpperBody` slot output to **Blend Poses 0**.
+3. Layer Setup: Bone=`spine_01`, Depth=0, MeshPoseBlendFactor=1.0.
+
+Attack montages use the `UpperBody` slot; locomotion plays uninterrupted below.
+
+### Aim Offset
+
+```cpp
+// In NativeUpdateAnimation:
+const FRotator Delta = UKismetMathLibrary::NormalizedDeltaRotator(
+    OwningCharacter->GetBaseAimRotation(),
+    OwningCharacter->GetActorRotation());
+AimYaw   = FMath::Clamp(Delta.Yaw,   -90.f, 90.f);
+AimPitch = FMath::Clamp(Delta.Pitch, -90.f, 90.f);
+```
+
+Place an Aim Offset node after the base pose in the AnimGraph, feeding
+`AimYaw` and `AimPitch`.
+
+---
+
+## Linked Anim Graphs and Layers
+
+Source: `AnimNode_LinkedAnimGraph.h`, `AnimNode_LinkedAnimLayer.h`
+
+### Linked Anim Layer (Recommended)
+
+1. Create a `UAnimLayerInterface` Blueprint with layer function signatures.
+2. Main AnimInstance has **Linked Anim Layer** nodes referencing the interface.
+3. Separate AnimInstance subclasses implement the interface per mode.
+4. Swap at runtime:
+
+```cpp
+// Switch locomotion implementation
+AnimInst->LinkAnimClassLayers(UClimbingLocomotionLayer::StaticClass());
+// Reset all layers to defaults:
+AnimInst->LinkAnimClassLayers(nullptr);
+// Retrieve a linked instance:
+UAnimInstance* Layer =
+    AnimInst->GetLinkedAnimLayerInstanceByClass(UClimbingLocomotionLayer::StaticClass());
+```
+
+### Linked Anim Graph (by Tag)
+
+```cpp
+AnimInst->LinkAnimGraphByTag(FName("CombatGraph"), UMyCombatAnimInstance::StaticClass());
+UAnimInstance* Sub = AnimInst->GetLinkedAnimGraphInstanceByTag(FName("CombatGraph"));
+```
+
+### Notify Propagation
+
+```cpp
+AnimInst->SetReceiveNotifiesFromLinkedInstances(true);
+AnimInst->SetPropagateNotifiesToLinkedInstances(true);
+// UE5.2+: let linked layers share main instance montage evaluation:
+// AnimInst->SetUseMainInstanceMontageEvaluationData(true);
+```
+
+---
+
+## Root Motion
+
+```cpp
+// Options: NoRootMotionExtraction, IgnoreRootMotion,
+//          RootMotionFromMontagesOnly, RootMotionFromEverything
+RootMotionMode = ERootMotionMode::RootMotionFromMontagesOnly;
+
+// Per-montage disable
+FAnimMontageInstance* Inst = AnimInst->GetActiveInstanceForMontage(Montage);
+if (Inst) { Inst->PushDisableRootMotion(); /* ... */ Inst->PopDisableRootMotion(); }
+```
+
+For networked root motion, set the movement component's smoothing mode to
+`ENetworkSmoothingMode::Exponential` and enable
+`bAllowPhysicsRotationDuringAnimRootMotion` if rotation comes from animation.
+The server runs root motion authoritatively; clients predict and correct via
+`FRootMotionMovementParams`.
+
+---
+
+## Common Mistakes
+
+| Anti-Pattern | Fix |
+|---|---|
+| Reading gameplay state in `NativeThreadSafeUpdateAnimation` | Cache values as `UPROPERTY Transient` in `NativeUpdateAnimation` (game thread) |
+| Polling `Montage_IsActive` in a loop | Bind `FOnMontageEnded` delegate before calling `Montage_Play` |
+| Two montages sharing the same slot group | Use distinct slot names (`UpperBody`, `LowerBody`) or `bStopAllMontages=false` |
+| Skipping `Super::NativeInitializeAnimation()` | Always call super — it initializes the proxy and skeleton |
+| Calling non-thread-safe UObject methods in thread-safe update | Only read primitive `UPROPERTY` copies; never call `GetOwningActor()` from worker thread |
+
+---
+
+## Build.cs
+
+```csharp
+PublicDependencyModuleNames.AddRange(new string[] {
+    "Core", "CoreUObject", "Engine", "AnimGraphRuntime"
+});
+// Optional:
+PrivateDependencyModuleNames.Add("ControlRig");        // Control Rig IK
+PrivateDependencyModuleNames.Add("GameplayAbilities"); // GAS montage tasks
+```
+
+---
+
+## Related Skills
+
+- `ue-gameplay-abilities` — `PlayMontageAndWait` task, GAS montage replication.
+- `ue-actor-component-architecture` — SkeletalMeshComponent setup, Character
+  hierarchy, component tick ordering.
+- `ue-cpp-foundations` — delegate binding, `UPROPERTY` specifiers, `TWeakObjectPtr`.
+
+## Reference Files
+
+- `references/anim-notify-reference.md` — built-in notify catalog and custom
+  notify implementation patterns.
+- `references/locomotion-setup.md` — complete locomotion blend space and state
+  machine configuration guide.
+
+--- REFERENCE: anim-notify-reference.md ---
+# Anim Notify Reference
+
+Source headers:
+- `Engine/Source/Runtime/Engine/Classes/Animation/AnimNotifies/AnimNotify.h`
+- `Engine/Source/Runtime/Engine/Classes/Animation/AnimNotifies/AnimNotifyState.h`
+
+---
+
+## Class Hierarchy
+
+```
+UObject
+  ├── UAnimNotify              (point-in-time event)
+  └── UAnimNotifyState         (duration event: Begin / Tick / End)
+```
+
+### UAnimNotify — Key Virtual Methods
+
+```cpp
+// UE5 signature (always override this one; UE4 signature is deprecated)
+virtual void Notify(
+    USkeletalMeshComponent* MeshComp,
+    UAnimSequenceBase* Animation,
+    const FAnimNotifyEventReference& EventReference);
+
+// Fires synchronously during Montage_Advance (only when bIsNativeBranchingPoint = true)
+virtual void BranchingPointNotify(FBranchingPointNotifyPayload& BranchingPointPayload);
+
+// Display name shown in the editor timeline
+virtual FString GetNotifyName_Implementation() const;
+```
+
+### UAnimNotifyState — Key Virtual Methods
+
+```cpp
+// UE5 signatures
+virtual void NotifyBegin(USkeletalMeshComponent* MeshComp,
+    UAnimSequenceBase* Animation, float TotalDuration,
+    const FAnimNotifyEventReference& EventReference);
+
+virtual void NotifyTick(USkeletalMeshComponent* MeshComp,
+    UAnimSequenceBase* Animation, float FrameDeltaTime,
+    const FAnimNotifyEventReference& EventReference);
+
+virtual void NotifyEnd(USkeletalMeshComponent* MeshComp,
+    UAnimSequenceBase* Animation,
+    const FAnimNotifyEventReference& EventReference);
+
+// Branching point variants (synchronous during Montage_Advance)
+virtual void BranchingPointNotifyBegin(FBranchingPointNotifyPayload& Payload);
+virtual void BranchingPointNotifyTick(FBranchingPointNotifyPayload& Payload, float DeltaTime);
+virtual void BranchingPointNotifyEnd(FBranchingPointNotifyPayload& Payload);
+```
+
+---
+
+## Built-In Notifies (Engine-Provided)
+
+### UAnimNotify_PlaySound
+
+**Header**: `AnimNotify_PlaySound.h`
+
+Plays a `USoundBase` at a socket location when the notify fires.
+
+Key properties:
+```cpp
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
+TObjectPtr<USoundBase> Sound;
+
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
+float VolumeMultiplier = 1.f;
+
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
+float PitchMultiplier = 1.f;
+
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
+uint32 bFollow : 1;   // if true, sound component follows the socket
+
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify",
+    meta=(EditCondition="bFollow"))
+FName AttachName;     // socket or bone to attach to
+```
+
+Use for: footsteps, impacts, voice barks, weapon sounds.
+
+---
+
+### UAnimNotify_PlayParticleEffect
+
+**Header**: `AnimNotify_PlayParticleEffect.h`
+
+Spawns a `UParticleSystem` at a socket location.
+
+Key properties:
+```cpp
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
+TObjectPtr<UParticleSystem> PSTemplate;
+
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
+FName SocketName;
+
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
+FVector LocationOffset;
+
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
+FRotator RotationOffset;
+
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="AnimNotify")
+bool bAttached;   // false = spawned at socket, not parented
+```
+
+Use for: muzzle flashes, hit sparks, ability cast effects.
+
+---
+
+### UAnimNotifyState_TimedParticleEffect
+
+**Header**: `AnimNotifyState_TimedParticleEffect.h`
+
+Activates a looping `UParticleSystem` for the duration of the notify state.
+Deactivates (or destroys) on end.
+
+Key properties:
+```cpp
+UPROPERTY(EditAnywhere, Category=ParticleSystem)
+TObjectPtr<UParticleSystem> PSTemplate;
+
+UPROPERTY(EditAnywhere, Category=ParticleSystem)
+FName SocketName;
+
+UPROPERTY(EditAnywhere, Category=ParticleSystem)
+FVector LocationOffset;
+
+UPROPERTY(EditAnywhere, Category=ParticleSystem)
+FRotator RotationOffset;
+
+UPROPERTY(EditAnywhere, Category=ParticleSystem,
+    meta=(DisplayName="Destroy Immediately"))
+bool bDestroyAtEnd;  // false = allow particles to complete their cycle
+```
+
+Use for: weapon trails, aura effects, charged attack indicators.
+
+---
+
+### UAnimNotifyState_DisableRootMotion
+
+**Header**: `AnimNotifyState_DisableRootMotion.h`
+
+Suppresses root motion extraction for the duration of the notify state.
+Internally calls `PushDisableRootMotion()` on `FAnimMontageInstance` and
+`PopDisableRootMotion()` at end.
+
+Use for: ragdoll transitions, ability phases where motion is physics-driven.
+
+---
+
+### UAnimNotifyState_Trail
+
+**Header**: `AnimNotifyState_Trail.h`
+
+Spawns and manages a particle trail between two sockets. Used for sword trails,
+cape effects, etc.
+
+---
+
+## Custom Notify Patterns
+
+### Pattern 1 — Footstep with Surface Detection
+
+```cpp
+// FootstepNotify.h
+#pragma once
+#include "Animation/AnimNotifies/AnimNotify.h"
+#include "FootstepNotify.generated.h"
+
+UCLASS(meta=(DisplayName="Footstep"))
+class MYGAME_API UFootstepNotify : public UAnimNotify
+{
+    GENERATED_BODY()
+
+public:
+    UFootstepNotify()
+    {
+        bIsNativeBranchingPoint = false; // queued, not synchronous
+    }
+
+    virtual void Notify(
+        USkeletalMeshComponent* MeshComp,
+        UAnimSequenceBase* Animation,
+        const FAnimNotifyEventReference& EventReference) override;
+
+    virtual FString GetNotifyName_Implementation() const override
+    {
+        return FString::Printf(TEXT("Footstep_%s"), *FootSocket.ToString());
+    }
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Footstep")
+    FName FootSocket = FName("foot_l");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Footstep")
+    float TraceDistance = 75.f;
+};
+```
+
+```cpp
+// FootstepNotify.cpp
+#include "FootstepNotify.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "PhysicalMaterials/PhysicalMaterial.h"
+#include "Kismet/GameplayStatics.h"
+
+void UFootstepNotify::Notify(
+    USkeletalMeshComponent* MeshComp,
+    UAnimSequenceBase* Animation,
+    const FAnimNotifyEventReference& EventReference)
+{
+    Super::Notify(MeshComp, Animation, EventReference);
+
+    if (!MeshComp || !MeshComp->GetWorld()) return;
+
+    const FVector SocketLoc = MeshComp->GetSocketLocation(FootSocket);
+    const FVector TraceStart = SocketLoc + FVector(0.f, 0.f, 20.f);
+    const FVector TraceEnd   = SocketLoc - FVector(0.f, 0.f, TraceDistance);
+
+    FHitResult Hit;
+    FCollisionQueryParams Params(SCENE_QUERY_STAT(FootstepTrace), true);
+    Params.AddIgnoredActor(MeshComp->GetOwner());
+    Params.bReturnPhysicalMaterial = true;
+
+    if (MeshComp->GetWorld()->LineTraceSingleByChannel(
+            Hit, TraceStart, TraceEnd, ECC_Visibility, Params))
+    {
+        EPhysicalSurface Surface = UGameplayStatics::GetSurfaceType(Hit);
+        // Dispatch footstep event to a surface manager or audio system
+        // e.g. UFootstepSubsystem::Get(World)->PlayFootstep(Surface, Hit.ImpactPoint);
+    }
+}
+```
+
+---
+
+### Pattern 2 — Weapon Collision Window (NotifyState)
+
+```cpp
+// WeaponCollisionNotifyState.h
+#pragma once
+#include "Animation/AnimNotifies/AnimNotifyState.h"
+#include "WeaponCollisionNotifyState.generated.h"
+
+UCLASS(meta=(DisplayName="Weapon Collision Window"))
+class MYGAME_API UWeaponCollisionNotifyState : public UAnimNotifyState
+{
+    GENERATED_BODY()
+
+public:
+    virtual void NotifyBegin(
+        USkeletalMeshComponent* MeshComp,
+        UAnimSequenceBase* Animation,
+        float TotalDuration,
+        const FAnimNotifyEventReference& EventReference) override;
+
+    virtual void NotifyEnd(
+        USkeletalMeshComponent* MeshComp,
+        UAnimSequenceBase* Animation,
+        const FAnimNotifyEventReference& EventReference) override;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Weapon")
+    FName WeaponComponentTag = FName("PrimaryWeapon");
+};
+```
+
+```cpp
+// WeaponCollisionNotifyState.cpp
+#include "WeaponCollisionNotifyState.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "GameFramework/Actor.h"
+
+void UWeaponCollisionNotifyState::NotifyBegin(
+    USkeletalMeshComponent* MeshComp,
+    UAnimSequenceBase* Animation,
+    float TotalDuration,
+    const FAnimNotifyEventReference& EventReference)
+{
+    Super::NotifyBegin(MeshComp, Animation, TotalDuration, EventReference);
+
+    if (!MeshComp) return;
+    AActor* Owner = MeshComp->GetOwner();
+    if (!Owner) return;
+
+    // Enable weapon collision via interface or component lookup
+    // IWeaponInterface::Execute_EnableCollision(WeaponActor);
+}
+
+void UWeaponCollisionNotifyState::NotifyEnd(
+    USkeletalMeshComponent* MeshComp,
+    UAnimSequenceBase* Animation,
+    const FAnimNotifyEventReference& EventReference)
+{
+    Super::NotifyEnd(MeshComp, Animation, EventReference);
+
+    if (!MeshComp) return;
+    AActor* Owner = MeshComp->GetOwner();
+    if (!Owner) return;
+
+    // Disable weapon collision
+}
+```
+
+---
+
+### Pattern 3 — BranchingPoint Notify (Synchronous, Montage)
+
+Use when you need to jump sections or stop a montage at a precise frame:
+
+```cpp
+// ComboBranchNotify.h
+#pragma once
+#include "Animation/AnimNotifies/AnimNotify.h"
+#include "ComboBranchNotify.generated.h"
+
+UCLASS(meta=(DisplayName="Combo Branch Point"))
+class MYGAME_API UComboBranchNotify : public UAnimNotify
+{
+    GENERATED_BODY()
+
+public:
+    UComboBranchNotify()
+    {
+        // Marks this notify as always synchronous on montages
+        bIsNativeBranchingPoint = true;
+    }
+
+    virtual void BranchingPointNotify(
+        FBranchingPointNotifyPayload& BranchingPointPayload) override;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Combo")
+    FName NextSection = FName("ComboEnd");
+};
+```
+
+```cpp
+// ComboBranchNotify.cpp
+#include "ComboBranchNotify.h"
+#include "Animation/AnimMontage.h"
+#include "Animation/AnimInstance.h"
+#include "Components/SkeletalMeshComponent.h"
+
+void UComboBranchNotify::BranchingPointNotify(
+    FBranchingPointNotifyPayload& Payload)
+{
+    Super::BranchingPointNotify(Payload);
+
+    if (!Payload.SkelMeshComponent) return;
+
+    UAnimInstance* AnimInst =
+        Payload.SkelMeshComponent->GetAnimInstance();
+    if (!AnimInst) return;
+
+    // Redirect the montage timeline to a different section synchronously
+    AnimInst->Montage_JumpToSection(NextSection);
+}
+```
+
+---
+
+### Pattern 4 — Named Notify + AnimInstance Delegate
+
+For gameplay events (enabling abilities, triggering GAS effects) tied to
+animation timing, use a **PlayMontageNotify** Blueprint node or the
+`FPlayMontageAnimNotifyDelegate`:
+
+```cpp
+// From AnimInstance.h:
+// DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FPlayMontageAnimNotifyDelegate,
+//     FName, NotifyName, const FBranchingPointNotifyPayload&, BranchingPointPayload);
+
+// Bind in C++ to receive named notify events:
+void UMyAbilityComponent::BindMontageNotifies(UAnimInstance* AnimInst)
+{
+    AnimInst->OnPlayMontageNotifyBegin.AddDynamic(
+        this, &UMyAbilityComponent::HandleNotifyBegin);
+    AnimInst->OnPlayMontageNotifyEnd.AddDynamic(
+        this, &UMyAbilityComponent::HandleNotifyEnd);
+}
+
+void UMyAbilityComponent::HandleNotifyBegin(
+    FName NotifyName,
+    const FBranchingPointNotifyPayload& Payload)
+{
+    if (NotifyName == FName("EnableHitbox"))
+    {
+        ActivateHitDetection();
+    }
+    else if (NotifyName == FName("ApplyGameplayEffect"))
+    {
+        ApplyDamageEffect();
+    }
+}
+
+void UMyAbilityComponent::HandleNotifyEnd(
+    FName NotifyName,
+    const FBranchingPointNotifyPayload& Payload)
+{
+    if (NotifyName == FName("EnableHitbox"))
+    {
+        DeactivateHitDetection();
+    }
+}
+```
+
+---
+
+## Tick Type Summary
+
+| Tick Type       | Synchronous? | Use Case                                      |
+|-----------------|-------------|-----------------------------------------------|
+| Queued          | No          | VFX, SFX, gameplay events (safe, no re-entry) |
+| BranchingPoint  | Yes         | Montage section jumps, precise loop control   |
+
+Set in the montage editor per-notify, or via `bIsNativeBranchingPoint = true`
+in the C++ constructor for native notifies.
+
+---
+
+## Notify Firing on Linked Instances
+
+By default, notifies fire only on the AnimInstance that owns the animation.
+To propagate across linked layers:
+
+```cpp
+// Main instance receives notifies from linked layers
+AnimInst->SetReceiveNotifiesFromLinkedInstances(true);
+
+// Linked layer propagates its notifies to the main instance
+AnimInst->SetPropagateNotifiesToLinkedInstances(true);
+```
+
+Also controllable per-node in the `FAnimNode_LinkedAnimGraph` properties:
+```cpp
+// AnimNode_LinkedAnimGraph.h
+uint8 bReceiveNotifiesFromLinkedInstances : 1;
+uint8 bPropagateNotifiesToLinkedInstances : 1;
+```
+
+---
+
+## Receiving Montage Notify Events Outside AnimInstance
+
+To react to named montage notifies from code outside the `AnimInstance`, bind to the
+`OnPlayMontageNotifyBegin` and `OnPlayMontageNotifyEnd` delegates exposed on
+`UAnimInstance`:
+
+```cpp
+// In your owning actor / component — called after obtaining the AnimInstance.
+AnimInst->OnPlayMontageNotifyBegin.AddDynamic(
+    this, &AMyCharacter::HandleMontageNotifyBegin);
+
+AnimInst->OnPlayMontageNotifyEnd.AddDynamic(
+    this, &AMyCharacter::HandleMontageNotifyEnd);
+
+// Callback signature (must be UFUNCTION):
+UFUNCTION()
+void HandleMontageNotifyBegin(FName NotifyName,
+    const FBranchingPointNotifyPayload& Payload)
+{
+    if (NotifyName == FName("WeaponCollisionEnable"))
+    {
+        EnableWeaponCollision();
+    }
+}
+
+UFUNCTION()
+void HandleMontageNotifyEnd(FName NotifyName,
+    const FBranchingPointNotifyPayload& Payload)
+{
+    if (NotifyName == FName("WeaponCollisionEnable"))
+    {
+        DisableWeaponCollision();
+    }
+}
+```
+
+These delegates fire for every branching-point or standard notify on any montage
+playing on the instance, so always filter by `NotifyName`. Unbind with
+`RemoveDynamic` when the listener is destroyed.
+
+--- REFERENCE: locomotion-setup.md ---
+# Locomotion Setup Reference
+
+This guide covers the end-to-end setup for character locomotion using UE5's
+animation system: AnimInstance properties, blend spaces, state machines, and
+layered blending.
+
+Source headers referenced:
+- `Engine/Source/Runtime/Engine/Classes/Animation/AnimInstance.h`
+- `Engine/Source/Runtime/Engine/Classes/Animation/BlendSpace.h`
+- `Engine/Source/Runtime/Engine/Classes/Animation/BlendSpace1D.h`
+- `Engine/Source/Runtime/Engine/Classes/Animation/AimOffsetBlendSpace.h`
+
+---
+
+## AnimInstance: Locomotion Properties
+
+```cpp
+// LocomotionAnimInstance.h
+#pragma once
+#include "Animation/AnimInstance.h"
+#include "LocomotionAnimInstance.generated.h"
+
+UCLASS()
+class MYGAME_API ULocomotionAnimInstance : public UAnimInstance
+{
+    GENERATED_BODY()
+
+public:
+    virtual void NativeInitializeAnimation() override;
+    virtual void NativeUpdateAnimation(float DeltaSeconds) override;
+
+protected:
+    // Cached references (game thread only)
+    UPROPERTY(Transient)
+    TObjectPtr<ACharacter> OwningCharacter;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UCharacterMovementComponent> MovementComp;
+
+    // --- Properties read by the AnimGraph ---
+
+    // Ground speed (XY plane), drives blend space Y axis
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Locomotion")
+    float GroundSpeed = 0.f;
+
+    // Movement direction relative to actor facing (-180 to 180), drives X axis
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Locomotion")
+    float Direction = 0.f;
+
+    // True when CharacterMovement reports IsFalling()
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Locomotion")
+    bool bIsInAir = false;
+
+    // True when velocity is near zero
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Locomotion")
+    bool bIsIdle = true;
+
+    // True when crouching
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Locomotion")
+    bool bIsCrouching = false;
+
+    // Acceleration magnitude, for start/stop transitions
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Locomotion")
+    float Acceleration = 0.f;
+
+    // For aim offset
+    UPROPERTY(Transient, BlueprintReadOnly, Category="AimOffset")
+    float AimYaw = 0.f;
+
+    UPROPERTY(Transient, BlueprintReadOnly, Category="AimOffset")
+    float AimPitch = 0.f;
+
+    // Lean amount for banking in turns
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Locomotion")
+    float LeanAmount = 0.f;
+
+private:
+    // Previous yaw for lean calculation
+    float PreviousActorYaw = 0.f;
+    float LeanVelocity = 0.f;
+};
+```
+
+```cpp
+// LocomotionAnimInstance.cpp
+#include "LocomotionAnimInstance.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "Kismet/KismetMathLibrary.h"
+
+static constexpr float IdleSpeedThreshold = 10.f;
+static constexpr float LeanInterpSpeed    = 4.f;
+static constexpr float LeanMaxAngle       = 30.f;
+
+void ULocomotionAnimInstance::NativeInitializeAnimation()
+{
+    Super::NativeInitializeAnimation();
+
+    OwningCharacter = Cast<ACharacter>(TryGetPawnOwner());
+    if (OwningCharacter)
+    {
+        MovementComp = OwningCharacter->GetCharacterMovement();
+        PreviousActorYaw = OwningCharacter->GetActorRotation().Yaw;
+    }
+}
+
+void ULocomotionAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
+{
+    Super::NativeUpdateAnimation(DeltaSeconds);
+
+    if (!OwningCharacter || !MovementComp || DeltaSeconds <= 0.f) return;
+
+    const FVector Velocity = MovementComp->Velocity;
+    GroundSpeed  = Velocity.Size2D();
+    bIsInAir     = MovementComp->IsFalling();
+    bIsCrouching = MovementComp->IsCrouching();
+    bIsIdle      = GroundSpeed < IdleSpeedThreshold && !bIsInAir;
+    Acceleration = MovementComp->GetCurrentAcceleration().Size2D();
+
+    // Direction: angle between velocity and actor facing
+    if (GroundSpeed > IdleSpeedThreshold)
+    {
+        const FRotator ActorRot    = OwningCharacter->GetActorRotation();
+        const FRotator VelocityRot = Velocity.ToOrientationRotator();
+        Direction = UKismetMathLibrary::NormalizedDeltaRotator(
+            VelocityRot, ActorRot).Yaw;
+    }
+
+    // Aim offset (yaw/pitch delta from actor to control rotation)
+    const FRotator AimRot   = OwningCharacter->GetBaseAimRotation();
+    const FRotator ActorRot = OwningCharacter->GetActorRotation();
+    const FRotator AimDelta = UKismetMathLibrary::NormalizedDeltaRotator(
+        AimRot, ActorRot);
+    AimYaw   = FMath::Clamp(AimDelta.Yaw,   -90.f, 90.f);
+    AimPitch = FMath::Clamp(AimDelta.Pitch, -90.f, 90.f);
+
+    // Lean: angular velocity of actor yaw, smoothed with interp
+    const float CurrentYaw   = OwningCharacter->GetActorRotation().Yaw;
+    const float YawDeltaRate = UKismetMathLibrary::NormalizedDeltaRotator(
+        FRotator(0.f, CurrentYaw, 0.f),
+        FRotator(0.f, PreviousActorYaw, 0.f)).Yaw / DeltaSeconds;
+    PreviousActorYaw = CurrentYaw;
+
+    const float TargetLean = FMath::Clamp(YawDeltaRate / LeanMaxAngle, -1.f, 1.f);
+    LeanAmount = FMath::FInterpTo(LeanAmount, TargetLean,
+        DeltaSeconds, LeanInterpSpeed);
+}
+```
+
+---
+
+## Blend Space Setup
+
+### 1D Blend Space — Walk/Run
+
+**Asset**: `BS_GroundLocomotion1D` (type: `BlendSpace1D`)
+
+| Axis  | Name    | Min | Max | Grid Points |
+|-------|---------|-----|-----|-------------|
+| X     | Speed   | 0   | 600 | 3           |
+
+Samples:
+| Speed | Animation       |
+|-------|-----------------|
+| 0     | Idle            |
+| 200   | Walk_Fwd        |
+| 600   | Run_Fwd         |
+
+Interpolation (from `FInterpolationParameter`):
+```
+InterpolationTime = 0.15
+InterpolationType = SpringDamper
+DampingRatio      = 1.0
+MaxSpeed          = 0.0  (unclamped)
+```
+
+In the AnimGraph, a **Blend Space 1D Player** node:
+- Asset: `BS_GroundLocomotion1D`
+- X pin: bound to `GroundSpeed` from the AnimInstance
+
+---
+
+### 2D Blend Space — Directional Locomotion
+
+**Asset**: `BS_GroundLocomotion2D` (type: `BlendSpace`)
+
+| Axis | Name      | Min  | Max | Grid Points |
+|------|-----------|------|-----|-------------|
+| X    | Direction | -180 | 180 | 5           |
+| Y    | Speed     | 0    | 600 | 3           |
+
+Sample layout (Direction x Speed):
+
+```
+Direction\Speed |  0 (Idle) | 200 (Walk) | 600 (Run)
+----------------+-----------+------------+-----------
+     0 (Fwd)    | Idle      | Walk_Fwd   | Run_Fwd
+    90 (Right)  | Idle      | Walk_Right | Run_Right
+   -90 (Left)   | Idle      | Walk_Left  | Run_Left
+   180 (Bwd)    | Idle      | Walk_Bwd   | Run_Bwd
+```
+
+Idle is the same animation at all direction values and Speed=0; it is defined
+at four direction points so the blend falls back to it cleanly.
+
+Interpolation per axis:
+```
+X (Direction): InterpolationTime=0.10, InterpolationType=SpringDamper
+Y (Speed):     InterpolationTime=0.15, InterpolationType=SpringDamper
+```
+
+In the AnimGraph, a **Blend Space Player** node:
+- Asset: `BS_GroundLocomotion2D`
+- X pin: `Direction`
+- Y pin: `GroundSpeed`
+
+---
+
+### Aim Offset — Upper Body Aiming
+
+**Asset**: `AO_Rifle` (type: `AimOffset`)
+
+| Axis  | Name  | Min | Max |
+|-------|-------|-----|-----|
+| X     | Yaw   | -90 |  90 |
+| Y     | Pitch | -90 |  90 |
+
+Samples (5 poses, all additive relative to reference pose):
+
+| Yaw | Pitch | Animation             |
+|-----|-------|-----------------------|
+| 0   | 0     | AO_Rifle_Center       |
+| 90  | 0     | AO_Rifle_Right        |
+| -90 | 0     | AO_Rifle_Left         |
+| 0   | 90    | AO_Rifle_Up           |
+| 0   | -90   | AO_Rifle_Down         |
+
+In the AnimGraph:
+- Place **Aim Offset** node after the base locomotion result
+- X pin: `AimYaw`, Y pin: `AimPitch`
+- This node applies an additive pose on top of the base pose
+
+---
+
+## State Machine Setup — Locomotion State Machine
+
+**State Machine Name**: `LocomotionSM`
+
+### States
+
+```
+[Entry] --> [Idle] --> [Walk/Run] --> [Idle]
+                 \--> [Jump Start] --> [In Air] --> [Land] --> [Idle]
+                 \--> [Crouch Idle] --> [Crouch Walk] --> [Crouch Idle]
+```
+
+### State Definitions
+
+**Idle**
+- Animation: Idle loop sequence or the 1D/2D blend space at Speed=0
+- Transition to Walk/Run: `GroundSpeed > 10 && !bIsInAir`
+- Transition to Jump Start: `bIsInAir`
+- Transition to Crouch Idle: `bIsCrouching`
+
+**Walk/Run**
+- Animation: `BS_GroundLocomotion1D` or `BS_GroundLocomotion2D`
+- Transition to Idle: `GroundSpeed <= 10 && !bIsInAir`
+- Transition to Jump Start: `bIsInAir`
+
+**Jump Start**
+- Animation: `JumpStart` (plays once)
+- Automatic transition to In Air when animation finishes:
+  `TimeRemaining(ratio) < 0.1`
+
+**In Air**
+- Animation: `InAir` loop (often a blend between apex and falling poses)
+- Transition to Land: `!bIsInAir`
+
+**Land**
+- Animation: `Land` (plays once)
+- Automatic transition to Idle or Walk/Run when complete
+
+**Crouch Idle**
+- Animation: `CrouchIdle` loop
+- Transition to Crouch Walk: `GroundSpeed > 3`
+- Transition to Idle (stand): `!bIsCrouching`
+
+**Crouch Walk**
+- Animation: `BS_CrouchLocomotion1D` (separate blend space for crouch walk)
+- Transition to Crouch Idle: `GroundSpeed <= 3`
+- Transition to Idle: `!bIsCrouching`
+
+### Transition Cross-Fade Settings
+
+| From        | To          | Duration | Blend Curve  |
+|-------------|-------------|----------|--------------|
+| Idle        | Walk/Run    | 0.15s    | Cubic In-Out |
+| Walk/Run    | Idle        | 0.20s    | Cubic In-Out |
+| Walk/Run    | Jump Start  | 0.10s    | Linear       |
+| In Air      | Land        | 0.05s    | Linear       |
+| Land        | Idle        | 0.20s    | Cubic In-Out |
+| Idle        | Crouch Idle | 0.15s    | Linear       |
+| Crouch Idle | Idle        | 0.15s    | Linear       |
+
+Use **Automatic Rule Based on Sequence Player** for states with a single
+play-once animation (Jump Start, Land) to auto-transition when the animation
+nears completion.
+
+---
+
+## AnimGraph Structure
+
+```
+[Output Pose]
+    |
+[Layered Blend Per Bone]  <-- upper body slot for montages
+    |              |
+[LocomotionSM]  [Slot 'UpperBody']
+    |
+[Aim Offset]        <-- aim yaw/pitch additive
+    |
+[Locomotion Blend Space Player]
+```
+
+### Full AnimGraph Node Order (Bottom to Top)
+
+1. **Blend Space Player** (`BS_GroundLocomotion2D`) — base movement pose
+2. **Aim Offset** (`AO_Rifle`) — additive aim layer on top of base
+3. **State Machine** (`LocomotionSM`) — wraps steps 1 & 2 inside states
+4. **Slot 'UpperBody'** — montage poses blend into upper body here
+5. **Layered Blend Per Bone** — blends upper body slot over the state machine
+   - Blend Poses 0: State Machine output (lower body + full)
+   - Blend Poses 1: UpperBody slot
+   - Layer Setup: `spine_01`, Depth=0, BlendDepth=1, MeshPoseBlendFactor=1
+6. **Output Pose**
+
+---
+
+## Layered Blend Per Bone — Upper/Lower Split
+
+To play attack montages on the upper body while keeping lower body locomotion:
+
+In the AnimGraph:
+1. Add a **Slot** node named `UpperBody` (create the slot in Skeleton settings).
+2. Add a **Layered Blend Per Bone** node.
+3. Connect the State Machine output to **Base Pose**.
+4. Connect the `UpperBody` slot output to **Blend Poses 0**.
+5. In the **Layer Setup** array, add entry:
+   - Bone Name: `spine_01`
+   - Blend Depth: `-1` (blend from the specified bone downward to root is
+     unaffected; upward is fully blended)
+   - Mesh Pose Blend Factor: 1.0
+   - Inverse: unchecked (positive bones = upper body = get slot blend)
+
+The montage must target the `UpperBody` slot. In C++:
+
+```cpp
+// Play on UpperBody slot only
+AnimInst->Montage_Play(AttackMontage);
+// AttackMontage must have its anim tracks assigned to the 'UpperBody' slot
+// in the montage editor (SlotAnimTracks[0].SlotName = "UpperBody")
+```
+
+---
+
+## Native State Machine Bindings
+
+Bind C++ logic to state transitions without Blueprint:
+
+```cpp
+// In ULocomotionAnimInstance::NativeInitializeAnimation()
+
+// Transition rule
+AddNativeTransitionBinding(
+    FName("LocomotionSM"),
+    FName("Idle"),
+    FName("Walk/Run"),
+    FCanTakeTransition::CreateUObject(
+        this, &ULocomotionAnimInstance::CanStartMoving),
+    FName("IdleToMoving")
+);
+
+// State entry notification
+AddNativeStateEntryBinding(
+    FName("LocomotionSM"),
+    FName("Land"),
+    FOnGraphStateChanged::CreateUObject(
+        this, &ULocomotionAnimInstance::OnLandStateEntered)
+);
+```
+
+```cpp
+bool ULocomotionAnimInstance::CanStartMoving() const
+{
+    return GroundSpeed > IdleSpeedThreshold && !bIsInAir;
+}
+
+void ULocomotionAnimInstance::OnLandStateEntered(
+    const FAnimNode_StateMachine& SM,
+    int32 PrevState,
+    int32 NextState)
+{
+    // Play landing camera shake, rumble, etc.
+    if (OwningCharacter)
+    {
+        // UGameplayStatics::PlayWorldCameraShake(...);
+    }
+}
+```
+
+---
+
+## Modular Locomotion via Linked Anim Layers
+
+For projects with multiple locomotion modes (ground, swimming, climbing,
+zero-gravity), use the linked anim layer pattern instead of a monolithic state
+machine.
+
+### Interface Definition
+
+Create `ULocomotionLayerInterface` (AnimLayerInterface Blueprint asset)
+with a single layer function: `LocomotionLayer`.
+
+### Main AnimInstance
+
+The main `ABP_Character` has a **Linked Anim Layer** node targeting
+`ULocomotionLayerInterface::LocomotionLayer`. Its output feeds directly into
+the **Output Pose** (after any additive overlays).
+
+### Layer Implementations
+
+```cpp
+// GroundLocomotionLayer.h — implements LocomotionLayerInterface
+UCLASS()
+class MYGAME_API UGroundLocomotionLayer : public UAnimInstance
+{
+    GENERATED_BODY()
+    // ...same locomotion properties as above...
+};
+
+// ClimbingLocomotionLayer.h
+UCLASS()
+class MYGAME_API UClimbingLocomotionLayer : public UAnimInstance
+{
+    GENERATED_BODY()
+    // Separate state machine / sequences for climbing
+};
+```
+
+### Swapping at Runtime
+
+```cpp
+void AMyCharacter::EnterClimbing()
+{
+    if (UAnimInstance* AnimInst = GetMesh()->GetAnimInstance())
+    {
+        AnimInst->LinkAnimClassLayers(UClimbingLocomotionLayer::StaticClass());
+    }
+}
+
+void AMyCharacter::ExitClimbing()
+{
+    if (UAnimInstance* AnimInst = GetMesh()->GetAnimInstance())
+    {
+        AnimInst->LinkAnimClassLayers(UGroundLocomotionLayer::StaticClass());
+        // Or pass nullptr to reset all layers to defaults:
+        // AnimInst->LinkAnimClassLayers(nullptr);
+    }
+}
+```
+
+The transition is automatically inertially blended when an **Inertialization**
+node is placed in the main AnimGraph.
+
+---
+
+## Inertial Blending for Smooth Layer Transitions
+
+Add an **Inertialization** node in the main AnimGraph between the linked layer
+output and the Output Pose. When `LinkAnimClassLayers` is called, the system
+will inertialize the transition using the blend duration configured on the
+`FAnimNode_LinkedAnimGraph` node (`PendingBlendInDuration` /
+`PendingBlendOutDuration`).
+
+To request inertialization from C++:
+
+```cpp
+// Request a 0.2s inertialized blend for all slots in the "DefaultGroup"
+AnimInst->RequestSlotGroupInertialization(FName("DefaultGroup"), 0.2f);
+```
+
+---
+
+## Root Motion Configuration
+
+| Mode                        | Description                                              |
+|-----------------------------|----------------------------------------------------------|
+| `NoRootMotionExtraction`    | Root bone moves normally; no extraction to component     |
+| `IgnoreRootMotion`          | Root motion is extracted and discarded (root stays put)  |
+| `RootMotionFromMontagesOnly`| Only montage root motion drives component movement       |
+| `RootMotionFromEverything`  | All animations contribute root motion to component       |
+
+For typical third-person games with CharacterMovementComponent:
+```cpp
+// In Character BP defaults or constructor:
+GetMesh()->GetAnimInstance()->RootMotionMode =
+    ERootMotionMode::RootMotionFromMontagesOnly;
+```
+
+In the `AnimInstance` class default:
+```cpp
+// Set in class constructor or CDO:
+RootMotionMode = ERootMotionMode::RootMotionFromMontagesOnly;
+```
+
+For multiplayer, pair `RootMotionFromMontagesOnly` with GAS montage replication
+so the server's `CharacterMovementComponent` processes root motion authoritatively.
+
+---
+
+## Common Locomotion Pitfalls
+
+**Direction flips when speed is near zero**
+- Only update `Direction` when `GroundSpeed > threshold`. Keep the last valid
+  direction when the character is decelerating to idle, preventing the blend
+  space from snapping.
+
+**Blend space snapping on direction change**
+- Use `SpringDamper` interpolation on the Direction axis with
+  `InterpolationTime = 0.08–0.12`. Too low = snappy, too high = sluggish turns.
+
+**Aim offset fighting the state machine**
+- Ensure the Aim Offset node is placed inside the locomotion state (not outside
+  the state machine), or apply it as an additive overlay after the state machine
+  output, so it blends correctly during transitions.
+
+**Crouch/stand transition pops**
+- Ensure crouch and stand blend spaces share samples at Speed=0. The blend space
+  sampler interpolates between them; if the idle samples differ significantly,
+  use a short cross-fade on the Idle->Crouch Idle transition (0.15s+).
+
+**Upper body slot not blending**
+- Verify the montage's slot track is named exactly `UpperBody` (case-sensitive)
+  and the Layered Blend Per Bone node references the same slot name. Mismatches
+  result in the montage playing on the wrong slot or not blending at all.
+
+**State machine transition not firing from C++**
+- `AddNativeTransitionBinding` must be called in `NativeInitializeAnimation`,
+  not in `BeginPlay` or later. The binding is registered against the compiled
+  state machine before the AnimGraph evaluates.
+

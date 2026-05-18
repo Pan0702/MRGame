@@ -1,0 +1,1658 @@
+# SKILL: ue-gameplay-abilities
+
+---
+name: ue-gameplay-abilities
+description: "Use this skill when working with GAS, Gameplay Ability System, GameplayAbility, GameplayEffect, AttributeSet, GameplayTags, ability system, buffs, debuffs, cooldowns, or attribute modification. See references/ for detailed setup patterns, effect configuration, and ability task usage."
+metadata:
+  version: 1.0.0
+---
+
+# Gameplay Ability System (GAS)
+
+You are an expert in Unreal Engine's Gameplay Ability System (GAS).
+
+## Context Check
+
+Before proceeding, read `.agents/ue-project-context.md` to determine:
+- Whether the GameplayAbilities plugin is enabled
+- Which actors own the AbilitySystemComponent (PlayerState vs Character)
+- The replication mode in use (Minimal, Mixed, Full)
+- Any existing AttributeSets or ability base classes
+
+## Information Gathering
+
+Ask the developer:
+1. What type of abilities are needed? (active, passive, triggered, instant)
+2. What attributes are required? (health, mana, stamina, custom stats)
+3. Is this multiplayer? If so, which actors carry the ASC?
+4. Are cooldowns and costs required, or is this a passive/trigger system?
+5. Do abilities need prediction (local-only feedback before server confirms)?
+
+---
+
+## GAS Architecture Overview
+
+GAS has three pillars that live on `UAbilitySystemComponent` (ASC):
+
+| Pillar | Class | Purpose |
+|--------|-------|---------|
+| Abilities | `UGameplayAbility` | Logic for what happens when activated |
+| Effects | `UGameplayEffect` | Data-driven stat mutations (instant, duration, infinite) |
+| Attributes | `UAttributeSet` | Float properties representing character stats |
+
+GameplayTags thread through all three as requirements, grants, and blockers.
+
+---
+
+## GAS Setup
+
+### 1. Enable the Plugin
+
+Enable `GameplayAbilities` in `.uproject` Plugins array, then in `[ProjectName].Build.cs`:
+```csharp
+PublicDependencyModuleNames.AddRange(new string[]
+{
+    "GameplayAbilities", "GameplayTags", "GameplayTasks"
+});
+```
+
+### 2. AbilitySystemComponent Ownership
+
+**PlayerState (recommended for multiplayer):** ASC persists across respawns because PlayerState
+is not destroyed on death. Use this for player characters in networked games.
+
+**Character/Pawn:** Simpler. Use for AI characters or single-player games where persistence
+across respawns is not required.
+
+See `references/gas-setup-patterns.md` for full initialization sequences for both patterns.
+
+### 3. IAbilitySystemInterface
+
+Every actor that owns or exposes an ASC must implement `IAbilitySystemInterface`:
+
+```cpp
+#include "AbilitySystemInterface.h"
+
+UCLASS()
+class AMyCharacter : public ACharacter, public IAbilitySystemInterface
+{
+    GENERATED_BODY()
+public:
+    virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override
+        { return AbilitySystemComponent; }
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GAS")
+    TObjectPtr<UAbilitySystemComponent> AbilitySystemComponent;
+};
+```
+
+### 4. Replication Modes
+
+Set on the ASC after creation (server-side only):
+
+```cpp
+// In BeginPlay or PossessedBy on the server:
+AbilitySystemComponent->SetReplicationMode(EGameplayEffectReplicationMode::Mixed);
+```
+
+| Mode | When to Use |
+|------|-------------|
+| `Minimal` | AI or non-player actors; no GE replication to simulated proxies |
+| `Mixed` | Player-controlled characters (owner gets full info, others get minimal) |
+| `Full` | Non-player games or debugging; all GEs replicate to all clients |
+
+### 5. InitAbilityActorInfo
+
+Must be called on both server and client after possession. Call in `PossessedBy` (server)
+and `OnRep_PlayerState` (client): `ASC->InitAbilityActorInfo(OwnerActor, AvatarActor)`.
+See `references/gas-setup-patterns.md` for full dual-path code with respawn handling.
+
+---
+
+## GameplayAbilities
+
+### Subclass UGameplayAbility
+
+```cpp
+#include "Abilities/GameplayAbility.h"
+
+UCLASS()
+class UMyFireballAbility : public UGameplayAbility
+{
+    GENERATED_BODY()
+public:
+    UMyFireballAbility();
+    virtual void ActivateAbility(const FGameplayAbilitySpecHandle Handle,
+        const FGameplayAbilityActorInfo* ActorInfo,
+        const FGameplayAbilityActivationInfo ActivationInfo,
+        const FGameplayEventData* TriggerEventData) override;
+    virtual void EndAbility(const FGameplayAbilitySpecHandle Handle,
+        const FGameplayAbilityActorInfo* ActorInfo,
+        const FGameplayAbilityActivationInfo ActivationInfo,
+        bool bReplicateEndAbility, bool bWasCancelled) override;
+    // Ability Tasks — async building blocks for latent abilities:
+    // UAbilityTask_WaitTargetData    — waits for targeting (crosshair/AoE confirm)
+    // UAbilityTask_WaitGameplayEvent — waits for a GameplayEvent tag (e.g., anim notify)
+    // UAbilityTask_WaitDelay         — simple timer
+    // UAbilityTask_PlayMontageAndWait — montage with callbacks (see ue-animation-system)
+    // See references/ability-task-reference.md for full list and custom task pattern.
+    // CancelAbility — called by CancelAbilitiesWithTag or ASC->CancelAbility(Handle)
+    // Internally calls EndAbility with bWasCancelled=true. Override to add cleanup:
+    virtual void CancelAbility(const FGameplayAbilitySpecHandle Handle,
+        const FGameplayAbilityActorInfo* ActorInfo,
+        const FGameplayAbilityActivationInfo ActivationInfo,
+        bool bReplicateCancelAbility) override;
+    // Custom activation guard — return false to block activation beyond tag checks
+    virtual bool CanActivateAbility(const FGameplayAbilitySpecHandle Handle,
+        const FGameplayAbilityActorInfo* ActorInfo, /*...*/) const override;
+    // Must call Super first. Add custom checks (resource availability, cooldown state).
+protected:
+    UPROPERTY(EditDefaultsOnly, Category = "GAS")
+    TSubclassOf<UGameplayEffect> DamageEffect;
+};
+```
+
+### ActivateAbility Pattern
+
+```cpp
+void UMyFireballAbility::ActivateAbility(const FGameplayAbilitySpecHandle Handle,
+    const FGameplayAbilityActorInfo* ActorInfo,
+    const FGameplayAbilityActivationInfo ActivationInfo,
+    const FGameplayEventData* TriggerEventData)
+{
+    // 1. Commit: validates and applies cost + cooldown
+    if (!CommitAbility(Handle, ActorInfo, ActivationInfo))
+    {
+        EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
+        return;
+    }
+    // 2. Apply effect / spawn projectile / etc.
+    FGameplayEffectSpecHandle Spec = MakeOutgoingGameplayEffectSpec(DamageEffect, GetAbilityLevel());
+    FGameplayAbilityTargetDataHandle TargetData =
+        UAbilitySystemBlueprintLibrary::AbilityTargetDataFromActor(
+            ActorInfo->AvatarActor.Get());
+    ApplyGameplayEffectSpecToTarget(Handle, ActorInfo, ActivationInfo, Spec, TargetData);
+    // 3. End (instant abilities end immediately; latent abilities wait for tasks)
+    EndAbility(Handle, ActorInfo, ActivationInfo, true, false);
+}
+```
+
+`CommitAbility` is shorthand for `CommitAbilityCost` + `CommitAbilityCooldown`. Call them
+separately when needed -- e.g., commit cost without starting cooldown for a channeled ability,
+or commit cooldown without cost for a free ability.
+
+### Instancing and Net Execution Policy
+
+Set in the ability constructor:
+
+```cpp
+UMyFireballAbility::UMyFireballAbility()
+{
+    // InstancedPerActor  - one instance per actor; cheapest for persistent abilities
+    // InstancedPerExecution - new instance each activation; safe for concurrency
+    // NonInstanced       - CDO runs the ability; no per-execution state
+    InstancingPolicy = EGameplayAbilityInstancingPolicy::InstancedPerActor;
+
+    // LocalPredicted  - client runs immediately, server validates (player abilities)
+    // ServerOnly      - authority only, no prediction
+    // LocalOnly       - local client only (UI, cosmetic)
+    // ServerInitiated - server activates, clients run non-authoritative predicted copy
+    NetExecutionPolicy = EGameplayAbilityNetExecutionPolicy::LocalPredicted;
+}
+```
+
+### Granting and Activating Abilities
+
+```cpp
+// Grant (server/authority only):
+FGameplayAbilitySpecHandle Handle = ASC->GiveAbility(
+    FGameplayAbilitySpec(UMyFireballAbility::StaticClass(), 1 /*Level*/));
+
+ASC->TryActivateAbility(Handle);                                       // by handle
+ASC->TryActivateAbilityByClass(UMyFireballAbility::StaticClass());    // by class
+ASC->TryActivateAbilitiesByTag(                                        // by tag
+    FGameplayTagContainer(FGameplayTag::RequestGameplayTag("Ability.Skill.Fireball")));
+```
+
+### Ability Tags
+
+Configure in the ability CDO constructor:
+
+```cpp
+// Tags this ability grants to its owner while active:
+ActivationOwnedTags.AddTag(FGameplayTag::RequestGameplayTag("Ability.Active.Casting"));
+// Tags that prevent this ability from activating:
+ActivationBlockedTags.AddTag(FGameplayTag::RequestGameplayTag("State.Stunned"));
+// Cancel other active abilities with these tags on activation:
+CancelAbilitiesWithTag.AddTag(FGameplayTag::RequestGameplayTag("Ability.Active.Melee"));
+```
+
+---
+
+## GameplayEffects
+
+### Duration Policies
+
+| Policy | Behavior |
+|--------|----------|
+| `Instant` | Executes once; modifies attribute base value permanently |
+| `HasDuration` | Active for set duration; uses `DurationMagnitude` (seconds) |
+| `Infinite` | Active until `RemoveActiveGameplayEffect` is called |
+
+### Applying Effects
+
+```cpp
+FGameplayEffectContextHandle Ctx = ASC->MakeEffectContext();
+FGameplayEffectSpecHandle Spec = ASC->MakeOutgoingSpec(UMyDamageEffect::StaticClass(), Level, Ctx);
+
+// SetByCaller: inject runtime magnitude using a tag key
+Spec.Data->SetSetByCallerMagnitude(
+    FGameplayTag::RequestGameplayTag("SetByCaller.Damage"), 75.f);
+
+ASC->ApplyGameplayEffectSpecToSelf(*Spec.Data.Get());         // self
+ASC->ApplyGameplayEffectSpecToTarget(*Spec.Data.Get(), TargetASC); // target
+
+ASC->RemoveActiveGameplayEffect(ActiveHandle);                // by handle
+ASC->RemoveActiveGameplayEffectBySourceEffect(
+    UMyDamageEffect::StaticClass(), nullptr);                  // by class
+```
+
+See `references/gameplay-effect-reference.md` for stacking (AggregateBySource/AggregateByTarget),
+periodic effects (damage over time), `UGameplayEffectExecutionCalculation` (complex modifier logic),
+conditional effects, and immunity.
+
+---
+
+## AttributeSet
+
+### Define Attributes
+
+```cpp
+// MyHealthSet.h
+#include "AttributeSet.h"
+#include "AbilitySystemComponent.h"
+
+// Convenience macro - define in your project headers
+#define ATTRIBUTE_ACCESSORS(ClassName, PropertyName) \
+    GAMEPLAYATTRIBUTE_PROPERTY_GETTER(ClassName, PropertyName) \
+    GAMEPLAYATTRIBUTE_VALUE_GETTER(PropertyName) \
+    GAMEPLAYATTRIBUTE_VALUE_SETTER(PropertyName) \
+    GAMEPLAYATTRIBUTE_VALUE_INITTER(PropertyName)
+
+UCLASS()
+class UMyHealthSet : public UAttributeSet
+{
+    GENERATED_BODY()
+public:
+    UMyHealthSet();
+
+    // Called BEFORE any modification - use for clamping current value
+    virtual void PreAttributeChange(const FGameplayAttribute& Attribute, float& NewValue) override;
+
+    // Called AFTER instant GE executes - react to changes (death, events)
+    virtual void PostGameplayEffectExecute(const FGameplayEffectModCallbackData& Data) override;
+
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
+    UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_Health, Category = "Health")
+    FGameplayAttributeData Health;
+    ATTRIBUTE_ACCESSORS(UMyHealthSet, Health)
+
+    UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_MaxHealth, Category = "Health")
+    FGameplayAttributeData MaxHealth;
+    ATTRIBUTE_ACCESSORS(UMyHealthSet, MaxHealth)
+
+protected:
+    UFUNCTION()
+    void OnRep_Health(const FGameplayAttributeData& OldHealth);
+
+    UFUNCTION()
+    void OnRep_MaxHealth(const FGameplayAttributeData& OldMaxHealth);
+};
+```
+
+In the `.cpp`, implement replication and callbacks:
+
+```cpp
+void UMyHealthSet::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME_CONDITION_NOTIFY(UMyHealthSet, Health, COND_None, REPNOTIFY_Always);
+    DOREPLIFETIME_CONDITION_NOTIFY(UMyHealthSet, MaxHealth, COND_None, REPNOTIFY_Always);
+}
+
+void UMyHealthSet::OnRep_Health(const FGameplayAttributeData& OldHealth)
+{
+    GAMEPLAYATTRIBUTE_REPNOTIFY(UMyHealthSet, Health, OldHealth);
+}
+
+// PreAttributeChange: clamp CURRENT value before any modification
+void UMyHealthSet::PreAttributeChange(const FGameplayAttribute& Attribute, float& NewValue)
+{
+    Super::PreAttributeChange(Attribute, NewValue);
+    if (Attribute == GetHealthAttribute())
+        NewValue = FMath::Clamp(NewValue, 0.f, GetMaxHealth());
+}
+
+// PostGameplayEffectExecute: react AFTER instant GE modifies base value (damage, death)
+void UMyHealthSet::PostGameplayEffectExecute(const FGameplayEffectModCallbackData& Data)
+{
+    Super::PostGameplayEffectExecute(Data);
+    if (Data.EvaluatedData.Attribute == GetHealthAttribute())
+    {
+        SetHealth(FMath::Clamp(GetHealth(), 0.f, GetMaxHealth()));
+        if (GetHealth() <= 0.f) { /* trigger death */ }
+    }
+}
+```
+
+### Register AttributeSet on ASC
+
+```cpp
+// In PlayerState or Character constructor:
+// Option 1: CreateDefaultSubobject (auto-registered as subobject)
+HealthSet = CreateDefaultSubobject<UMyHealthSet>(TEXT("HealthSet"));
+
+// Option 2: Runtime (authority only) — create and register as subobject:
+UMyHealthSet* NewSet = NewObject<UMyHealthSet>(this);
+AbilitySystemComponent->AddSpawnedAttribute(NewSet);
+
+// Read attribute value:
+float CurrentHealth = AbilitySystemComponent->GetNumericAttribute(
+    UMyHealthSet::GetHealthAttribute());
+```
+
+**Multiple AttributeSets**: An ASC can host multiple `UAttributeSet` subclasses (e.g.,
+`UHealthSet` + `UOffenseSet`), each auto-discovered via subobject enumeration. Never register
+two instances of the same class -- the second is silently ignored.
+
+---
+
+## GameplayTags
+
+### Defining Tags
+
+In `Config/DefaultGameplayTags.ini` or via native tags (preferred for code references):
+
+```cpp
+// MyGameplayTags.h
+#include "NativeGameplayTags.h"
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_Ability_Fireball)
+UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_State_Stunned)
+
+// MyGameplayTags.cpp
+UE_DEFINE_GAMEPLAY_TAG_COMMENT(TAG_Ability_Fireball, "Ability.Skill.Fireball", "Fireball ability")
+UE_DEFINE_GAMEPLAY_TAG_COMMENT(TAG_State_Stunned, "State.Stunned", "Actor is stunned")
+```
+
+### Tag Matching
+
+`"A.1".MatchesTag("A") == true` (hierarchical); `MatchesTagExact` requires exact match.
+
+```cpp
+FGameplayTagContainer Tags;
+Tags.HasTag(FireballTag);      // parent-aware match
+Tags.HasTagExact(FireballTag); // exact only
+Tags.HasAny(OtherContainer);
+Tags.HasAll(OtherContainer);
+
+// Query ASC:
+ASC->HasMatchingGameplayTag(TAG_State_Stunned);
+ASC->GetOwnedGameplayTags(); // FGameplayTagContainer
+
+// Listen for changes:
+ASC->RegisterGameplayTagEvent(TAG_State_Stunned, EGameplayTagEventType::NewOrRemoved)
+    .AddUObject(this, &AMyCharacter::OnStunnedTagChanged);
+```
+
+### Loose Tags (Manual, No GE)
+
+```cpp
+ASC->AddLooseGameplayTag(TAG_State_Stunned);
+ASC->RemoveLooseGameplayTag(TAG_State_Stunned);
+// Loose tags are NOT replicated by default. To replicate a loose tag,
+// pass EGameplayTagReplicationState::TagOnly as the third argument:
+ASC->AddLooseGameplayTag(TAG_State_Buffed, 1, EGameplayTagReplicationState::TagOnly);
+ASC->RemoveLooseGameplayTag(TAG_State_Buffed, 1, EGameplayTagReplicationState::TagOnly);
+```
+
+---
+
+## GameplayCues
+
+Cosmetic-only (particles, sounds, decals). Never affect gameplay state. Tag prefix: `GameplayCue.`
+
+In the GE asset, add `FGameplayEffectCue` entries with `GameplayCueTags` and level range.
+
+```cpp
+// Burst (one-shot):
+ASC->ExecuteGameplayCue(FGameplayTag::RequestGameplayTag("GameplayCue.Hit.Fire"),
+    ASC->MakeEffectContext());
+
+// Persistent (add/remove pair):
+ASC->AddGameplayCue(FGameplayTag::RequestGameplayTag("GameplayCue.Buff.Speed"));
+ASC->RemoveGameplayCue(FGameplayTag::RequestGameplayTag("GameplayCue.Buff.Speed"));
+
+// Poll active state:
+bool bActive = ASC->IsGameplayCueActive(FGameplayTag::RequestGameplayTag("GameplayCue.Buff.Speed"));
+```
+
+Cue Notify classes:
+- `AGameplayCueNotify_Actor`: Persistent/looping. Overrides `OnActive`, `WhileActive`, `OnRemove`.
+- `AGameplayCueNotify_Static`: Burst/one-shot. Overrides `OnExecute`.
+
+Place cue notify assets in `/Game/GAS/GameplayCues/` for `UGameplayCueManager` auto-discovery.
+
+---
+
+## Common Mistakes and Anti-Patterns
+
+**ASC ownership confusion:** Implement `IAbilitySystemInterface` on the class that *owns* the ASC
+(PlayerState), not just on the Pawn. Otherwise `UAbilitySystemBlueprintLibrary` lookups fail.
+
+**InitAbilityActorInfo only on server:** Clients need it too. Call in `OnRep_PlayerState` (client)
+and `PossessedBy` (server). Skipping client-side init breaks attribute replication on the owning client.
+
+**GEs applied before InitAbilityActorInfo:** The ASC is not ready; attributes are not registered.
+Always complete init before granting abilities or applying effects.
+
+**PreAttributeChange vs PostGameplayEffectExecute:** `PreAttributeChange` fires on every current-value
+change (aggregator updates, buff adds/removes). Use it only to clamp. Use `PostGameplayEffectExecute`
+to react to instant GE base-value execution (damage, death). Never send game events from `PreAttributeChange`.
+
+**Forgetting CommitAbility:** Without it, the ability runs but consumes no mana and starts no cooldown.
+
+**Loose tags not replicated:** `AddLooseGameplayTag` does not replicate by default. Pass
+`EGameplayTagReplicationState::TagOnly` as the third argument to replicate the tag, or grant
+via a GE for fully replicated effect-driven tags.
+
+**Effect stacking overflow:** Stacks beyond `LimitCount` are silently rejected. Use `GetCurrentStackCount`
+to inspect the current level before attempting further stack applications.
+
+**GAS with AI:** AI has no PlayerState. Place the ASC on the AICharacter, call
+`InitAbilityActorInfo(AICharacter, AICharacter)`, set replication mode to `Minimal`.
+
+**Hot-joining**: Late-joining clients receive active effects via `FActiveGameplayEffectsContainer`
+replication after `InitAbilityActorInfo`. Never apply startup GEs in `BeginPlay` unconditionally
+-- server-only, or late joiners double-apply.
+
+---
+
+## Reference Files
+
+- `references/gas-setup-patterns.md` — Full ASC ownership patterns and initialization sequences
+  for PlayerState and Character owners, multiplayer and single-player
+- `references/gameplay-effect-reference.md` — Effect configuration, stacking rules, modifier
+  types, execution calculations, periodic effects, conditional effects
+- `references/ability-task-reference.md` — Common built-in ability tasks and custom task patterns
+
+## Related Skills
+
+- `ue-actor-component-architecture` — Component setup and subobject registration
+- `ue-networking-replication` — Replication modes, RPCs, prediction keys
+- `ue-animation-system` — Montage ability tasks (PlayMontageAndWait)
+- `ue-gameplay-framework` — PlayerState ownership pattern, Pawn/Controller lifecycle
+- `ue-cpp-foundations` — Delegate binding, UPROPERTY macros, TSubclassOf patterns
+
+--- REFERENCE: ability-task-reference.md ---
+# Ability Task Reference
+
+Common built-in `UAbilityTask` subclasses and how to create custom tasks.
+Ability tasks extend ability execution across multiple frames using internal latent logic.
+
+All tasks must be called from within `ActivateAbility` (or from within other tasks).
+Tasks broadcast results via dynamic delegates. When the task completes, call `EndAbility`
+if the ability is meant to end at that point.
+
+---
+
+## How Ability Tasks Work
+
+1. Create the task via a static factory function (never call `new` directly).
+2. Bind delegates for each outcome (OnCompleted, OnInterrupted, etc.).
+3. Call `ReadyForActivation()` to start the task.
+4. The task runs asynchronously; the ability remains active but yields.
+5. In delegate callbacks, perform follow-up logic and call `EndAbility` when done.
+
+```cpp
+// Typical task usage in ActivateAbility:
+void UMyAbility::ActivateAbility(...)
+{
+    if (!CommitAbility(Handle, ActorInfo, ActivationInfo))
+    {
+        EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
+        return;
+    }
+
+    UAbilityTask_PlayMontageAndWait* Task =
+        UAbilityTask_PlayMontageAndWait::CreatePlayMontageAndWaitProxy(
+            this, NAME_None, AttackMontage, 1.f);
+
+    Task->OnCompleted.AddDynamic(this, &UMyAbility::OnMontageCompleted);
+    Task->OnInterrupted.AddDynamic(this, &UMyAbility::OnMontageInterrupted);
+    Task->OnCancelled.AddDynamic(this, &UMyAbility::OnMontageCancelled);
+    Task->ReadyForActivation();
+}
+
+void UMyAbility::OnMontageCompleted()
+{
+    EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, true, false);
+}
+
+void UMyAbility::OnMontageInterrupted()
+{
+    EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, true, true);
+}
+```
+
+---
+
+## UAbilityTask_PlayMontageAndWait
+
+Plays an `AnimMontage` on the avatar actor's skeletal mesh and waits for it to finish.
+
+```cpp
+#include "Abilities/Tasks/AbilityTask_PlayMontageAndWait.h"
+
+UAbilityTask_PlayMontageAndWait* Task =
+    UAbilityTask_PlayMontageAndWait::CreatePlayMontageAndWaitProxy(
+        this,              // OwningAbility
+        NAME_None,         // Task instance name (NAME_None = auto)
+        AttackMontage,     // UAnimMontage* to play
+        1.f,               // Rate
+        NAME_None,         // StartSection (NAME_None = start from beginning)
+        false,             // bStopWhenAbilityEnds
+        1.f);              // AnimRootMotionTranslationScale
+
+Task->OnCompleted.AddDynamic(this, &UMyAbility::OnMontageCompleted);
+Task->OnBlendOut.AddDynamic(this, &UMyAbility::OnMontageBlendOut);
+Task->OnInterrupted.AddDynamic(this, &UMyAbility::OnMontageInterrupted);
+Task->OnCancelled.AddDynamic(this, &UMyAbility::OnMontageCancelled);
+Task->ReadyForActivation();
+```
+
+Delegates:
+- `OnCompleted`: Montage finished playing
+- `OnBlendOut`: Montage started blending out
+- `OnInterrupted`: Montage was interrupted by another montage
+- `OnCancelled`: Task was cancelled (EndAbility called while running)
+
+---
+
+## UAbilityTask_WaitGameplayEvent
+
+Waits for a `FGameplayEventData` to be sent via `HandleGameplayEvent` on the ASC.
+Common use: waiting for an animation notify to trigger (e.g., `Event.Montage.Attack.Hit`).
+
+```cpp
+#include "Abilities/Tasks/AbilityTask_WaitGameplayEvent.h"
+
+FGameplayTag EventTag = FGameplayTag::RequestGameplayTag("Event.Montage.Attack.Hit");
+
+UAbilityTask_WaitGameplayEvent* Task =
+    UAbilityTask_WaitGameplayEvent::WaitGameplayEvent(
+        this,
+        EventTag,
+        nullptr,  // OptionalExternalTarget (null = use self ASC)
+        true,     // TriggerOnce (false = keep listening)
+        true);    // OnlyMatchExact
+
+Task->EventReceived.AddDynamic(this, &UMyAbility::OnAttackHitEvent);
+Task->ReadyForActivation();
+```
+
+Sending the event (e.g., from an `AnimNotify`):
+```cpp
+// In AnimNotify or character code:
+FGameplayEventData EventData;
+EventData.Instigator = GetOwner();
+UAbilitySystemBlueprintLibrary::SendGameplayEventToActor(
+    GetOwner(),
+    FGameplayTag::RequestGameplayTag("Event.Montage.Attack.Hit"),
+    EventData);
+```
+
+Delegate: `EventReceived(FGameplayEventData Payload)`
+
+---
+
+## UAbilityTask_WaitDelay
+
+Waits for a fixed duration and then fires a callback. Equivalent to a GAS-aware timer.
+
+```cpp
+#include "Abilities/Tasks/AbilityTask_WaitDelay.h"
+
+UAbilityTask_WaitDelay* Task =
+    UAbilityTask_WaitDelay::WaitDelay(this, 2.f); // 2 second delay
+
+Task->OnFinish.AddDynamic(this, &UMyAbility::OnDelayFinished);
+Task->ReadyForActivation();
+```
+
+Delegate: `OnFinish()`
+
+---
+
+## UAbilityTask_WaitTargetData
+
+Spawns a `AGameplayAbilityTargetActor` to gather targeting information (line trace,
+sphere trace, actor selection, etc.) and returns `FGameplayAbilityTargetDataHandle`.
+
+```cpp
+#include "Abilities/Tasks/AbilityTask_WaitTargetData.h"
+#include "Abilities/GameplayAbilityTargetActor_SingleLineTrace.h"
+
+UAbilityTask_WaitTargetData* Task =
+    UAbilityTask_WaitTargetData::WaitTargetData(
+        this,
+        NAME_None,
+        EGameplayTargetingConfirmation::Instant, // Instant, UserConfirmed, Custom, etc.
+        AGameplayAbilityTargetActor_SingleLineTrace::StaticClass());
+
+Task->ValidData.AddDynamic(this, &UMyAbility::OnValidTargetData);
+Task->Cancelled.AddDynamic(this, &UMyAbility::OnTargetCancelled);
+Task->ReadyForActivation();
+```
+
+Targeting confirmation modes:
+| Mode | Behavior |
+|------|----------|
+| `Instant` | Confirms immediately upon spawn |
+| `UserConfirmed` | Waits for `SendGameplayEvent` with confirm tag |
+| `Custom` | Custom confirmation logic in the TargetActor |
+| `CustomMulti` | Confirms multiple targets over time |
+
+Delegate `ValidData(FGameplayAbilityTargetDataHandle Data)`:
+```cpp
+void UMyAbility::OnValidTargetData(const FGameplayAbilityTargetDataHandle& Data)
+{
+    // Apply effect to targets
+    FGameplayEffectSpecHandle SpecHandle = MakeOutgoingGameplayEffectSpec(DamageEffect, Level);
+    ApplyGameplayEffectSpecToTarget(CurrentSpecHandle, CurrentActorInfo,
+        CurrentActivationInfo, SpecHandle, Data);
+    EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, true, false);
+}
+```
+
+---
+
+## UAbilityTask_WaitAttributeChange
+
+Waits for an attribute to cross a threshold or change at all.
+
+```cpp
+#include "Abilities/Tasks/AbilityTask_WaitAttributeChange.h"
+
+UAbilityTask_WaitAttributeChange* Task =
+    UAbilityTask_WaitAttributeChange::WaitForAttributeChange(
+        this,
+        UMyHealthSet::GetHealthAttribute(),
+        FGameplayTag(),    // WithTag: optional, only trigger if ASC has this tag
+        FGameplayTag(),    // WithoutTag: only trigger if ASC lacks this tag
+        true);             // TriggerOnce
+
+Task->OnChange.AddDynamic(this, &UMyAbility::OnHealthChanged);
+Task->ReadyForActivation();
+```
+
+Delegate: `OnChange()`
+
+For threshold-based (separate class — `UAbilityTask_WaitAttributeChangeThreshold`):
+```cpp
+#include "Abilities/Tasks/AbilityTask_WaitAttributeChangeThreshold.h"
+
+UAbilityTask_WaitAttributeChangeThreshold* Task =
+    UAbilityTask_WaitAttributeChangeThreshold::WaitForAttributeChangeThreshold(
+        this,
+        UMyHealthSet::GetHealthAttribute(),
+        EWaitAttributeChangeComparison::LessThan,
+        0.3f,    // Compare against: below 30%
+        false,   // bTriggerOnce
+        nullptr);
+
+Task->OnChange.AddDynamic(this, &UMyAbility::OnHealthBelowThreshold);
+Task->ReadyForActivation();
+```
+
+Delegate: `OnChange(bool bMatchesComparison, float CurrentValue)`
+
+---
+
+## UAbilityTask_WaitGameplayEffectApplied
+
+Fires when a GameplayEffect matching specified tag requirements is applied to a target.
+
+```cpp
+#include "Abilities/Tasks/AbilityTask_WaitGameplayEffectApplied.h"
+
+FGameplayTargetDataFilterHandle FilterHandle;
+FGameplayTagRequirements SourceTagReqs;
+FGameplayTagRequirements TargetTagReqs;
+FGameplayTagRequirements AssetTagReqs;    // Tags the GE asset itself must have
+FGameplayTagRequirements GrantedTagReqs; // Tags the GE grants to the target
+
+UAbilityTask_WaitGameplayEffectApplied_Self* Task =
+    UAbilityTask_WaitGameplayEffectApplied_Self::WaitGameplayEffectAppliedToSelf(
+        this,
+        FilterHandle,
+        SourceTagReqs,
+        TargetTagReqs,
+        AssetTagReqs,
+        GrantedTagReqs,
+        false /*TriggerOnce*/,
+        nullptr /*OptionalExternalOwner*/,
+        false /*ListenForPeriodicEffect*/);
+
+Task->OnApplied.AddDynamic(this, &UMyAbility::OnEffectApplied);
+Task->ReadyForActivation();
+```
+
+---
+
+## Creating a Custom Ability Task
+
+```cpp
+// MyAbilityTask_WaitInputRelease.h
+#pragma once
+#include "Abilities/Tasks/AbilityTask.h"
+#include "MyAbilityTask_WaitInputRelease.generated.h"
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnInputReleased);
+
+UCLASS()
+class UMyAbilityTask_WaitInputRelease : public UAbilityTask
+{
+    GENERATED_BODY()
+public:
+    // Factory function: always use a static factory, never construct directly
+    UFUNCTION(BlueprintCallable, Category = "Ability|Tasks",
+        meta = (HidePin = "OwningAbility", DefaultToSelf = "OwningAbility",
+                BlueprintInternalUseOnly = "true"))
+    static UMyAbilityTask_WaitInputRelease* WaitInputRelease(
+        UGameplayAbility* OwningAbility,
+        bool bTestAlreadyReleased = false);
+
+    UPROPERTY(BlueprintAssignable)
+    FOnInputReleased OnReleased;
+
+    virtual void Activate() override;
+    virtual void TickTask(float DeltaTime) override;
+    virtual void OnDestroy(bool bInOwnerFinished) override;
+
+private:
+    bool bStartedAlreadyReleased = false;
+};
+```
+
+```cpp
+// MyAbilityTask_WaitInputRelease.cpp
+#include "MyAbilityTask_WaitInputRelease.h"
+#include "AbilitySystemComponent.h"
+
+UMyAbilityTask_WaitInputRelease* UMyAbilityTask_WaitInputRelease::WaitInputRelease(
+    UGameplayAbility* OwningAbility,
+    bool bTestAlreadyReleased)
+{
+    UMyAbilityTask_WaitInputRelease* Task =
+        NewAbilityTask<UMyAbilityTask_WaitInputRelease>(OwningAbility);
+    Task->bStartedAlreadyReleased = bTestAlreadyReleased;
+    return Task;
+}
+
+void UMyAbilityTask_WaitInputRelease::Activate()
+{
+    // Enable ticking so we can poll input state
+    bTickingTask = true;
+}
+
+void UMyAbilityTask_WaitInputRelease::TickTask(float DeltaTime)
+{
+    // GetAbilitySpecHandle and AbilitySystemComponent come from UAbilityTask base
+    if (AbilitySystemComponent.IsValid())
+    {
+        const FGameplayAbilitySpec* Spec =
+            AbilitySystemComponent->FindAbilitySpecFromHandle(GetAbilitySpecHandle());
+        if (Spec && !Spec->InputPressed)
+        {
+            if (ShouldBroadcastAbilityTaskDelegates())
+            {
+                OnReleased.Broadcast();
+            }
+            EndTask();
+        }
+    }
+}
+
+void UMyAbilityTask_WaitInputRelease::OnDestroy(bool bInOwnerFinished)
+{
+    Super::OnDestroy(bInOwnerFinished);
+}
+```
+
+Usage in an ability:
+```cpp
+UMyAbilityTask_WaitInputRelease* Task =
+    UMyAbilityTask_WaitInputRelease::WaitInputRelease(this);
+Task->OnReleased.AddDynamic(this, &UMyChargeAbility::OnInputReleased);
+Task->ReadyForActivation();
+```
+
+---
+
+## Task Lifecycle Notes
+
+- Tasks are automatically cleaned up when `EndAbility` or `CancelAbility` is called.
+- Call `EndTask()` inside the task when done; do not call `delete`.
+- `ShouldBroadcastAbilityTaskDelegates()` guards against broadcasting after the ability ends.
+- `bTickingTask = true` must be set in `Activate()` to enable `TickTask`. Default is false.
+- `NewAbilityTask<T>()` is the correct factory; never use `NewObject<T>()` for tasks.
+
+---
+
+## Task Execution Flow
+
+```
+ActivateAbility()
+    └── Task::WaitXxx() (static factory)
+    └── Bind delegates
+    └── Task::ReadyForActivation()
+            └── Task::Activate() [task starts its internal logic]
+                    └── (async frames pass)
+                    └── Event fires → delegate broadcast
+                            └── Ability callback runs gameplay logic
+                            └── EndAbility() called
+                                    └── Task::OnDestroy() cleanup
+```
+
+---
+
+## Common Task Mistakes
+
+**Not calling ReadyForActivation:** The task is created but never starts. Always call this after
+binding delegates.
+
+**Binding delegates after ReadyForActivation:** Some tasks fire synchronously in `Activate()`
+(e.g., `WaitDelay` with 0 duration). Bind delegates before calling `ReadyForActivation`.
+
+**Calling EndAbility inside a task without ending the task first:** The task will linger.
+Let `EndAbility` clean it up, or call `EndTask()` explicitly if the task should stop without
+ending the ability.
+
+**Broadcasting delegates after ability ends:** Always check `ShouldBroadcastAbilityTaskDelegates()`
+before broadcasting inside `TickTask` or callback functions to avoid operating on a cleaned-up
+ability.
+
+**Tick-heavy tasks in non-instanced abilities:** If `InstancingPolicy` is `NonInstanced`, the
+CDO runs the ability. Ticking tasks on a CDO can produce shared state issues. Use
+`InstancedPerActor` or `InstancedPerExecution` when using ticking tasks.
+
+--- REFERENCE: gameplay-effect-reference.md ---
+# GameplayEffect Reference
+
+Configuration guide for `UGameplayEffect`: duration policies, modifier types, stacking rules,
+execution calculations, periodic effects, and conditional effects.
+
+Source: `GameplayEffect.h` (UE5.3+, modular GE component architecture)
+
+---
+
+## Duration Policies (`EGameplayEffectDurationType`)
+
+| Value | Behavior |
+|-------|----------|
+| `Instant` | Executes once, modifies base value permanently, never enters the active container |
+| `HasDuration` | Active for a set time, then removed; modifies current value temporarily |
+| `Infinite` | Active until `RemoveActiveGameplayEffect` is called; use for passive bonuses |
+
+Instant effects call `PostGameplayEffectExecute` on the AttributeSet; duration/infinite effects
+do not (they work through aggregators on the current value).
+
+---
+
+## Modifier Operations (`EGameplayModOp`)
+
+The modifier equation is evaluated in this order across all active modifiers:
+```
+Final = ((BaseValue + AddBase) * MultiplyAdditive / DivideAdditive * MultiplyCompound) + AddFinal
+```
+
+| Op | Enum | Effect |
+|----|------|--------|
+| `Additive` | `EGameplayModOp::Additive` | Adds to the attribute (+10 hp) |
+| `Multiplicative` | `EGameplayModOp::Multiplicative` | Multiplies (1.25x damage) |
+| `Division` | `EGameplayModOp::Division` | Divides; applied as additive in denominator |
+| `Override` | `EGameplayModOp::Override` | Replaces the attribute value entirely |
+
+---
+
+## Magnitude Calculation Types (`EGameplayEffectMagnitudeCalculation`)
+
+### ScalableFloat (most common)
+A constant or level-scaled float. Supply a `FScalableFloat` backed optionally by a CurveTable:
+
+```
+Modifier: Health
+Operation: Additive
+Magnitude Type: ScalableFloat
+Scalable Float Magnitude: -50.0  (or reference a CurveTable row for level scaling)
+```
+
+### AttributeBased
+Derives magnitude from another attribute. Formula:
+```
+(Coefficient * (PreMultiplyAdditive + [Attribute Value])) + PostMultiplyAdditive
+```
+
+```
+Magnitude Type: AttributeBased
+Backing Attribute: SourceObject.AttackPower  (capture from Source or Target)
+Attribute Calculation Type: AttributeMagnitude  (final evaluated value)
+Coefficient: 1.0
+```
+
+`EAttributeBasedFloatCalculationType` options:
+- `AttributeMagnitude`: Final current value (includes active modifiers)
+- `AttributeBaseValue`: Permanent base value only
+- `AttributeBonusMagnitude`: Final - Base (modifier contribution only)
+
+### CustomCalculationClass
+Runs a `UGameplayModMagnitudeCalculation` subclass for arbitrary logic:
+
+```cpp
+UCLASS()
+class UMyDamageMagnitudeCalc : public UGameplayModMagnitudeCalculation
+{
+    GENERATED_BODY()
+public:
+    UMyDamageMagnitudeCalc();
+
+    virtual float CalculateBaseMagnitude_Implementation(
+        const FGameplayEffectSpec& Spec) const override;
+
+private:
+    // Declare captures in constructor
+    FGameplayEffectAttributeCaptureDefinition AttackPowerDef;
+};
+
+UMyDamageMagnitudeCalc::UMyDamageMagnitudeCalc()
+{
+    // Capture AttackPower from Source at execution time (not snapshot)
+    AttackPowerDef = FGameplayEffectAttributeCaptureDefinition(
+        UMyAttackSet::GetAttackPowerAttribute(),
+        EGameplayEffectAttributeCaptureSource::Source,
+        false /*bSnapshot*/);
+    RelevantAttributesToCapture.Add(AttackPowerDef);
+}
+
+float UMyDamageMagnitudeCalc::CalculateBaseMagnitude_Implementation(
+    const FGameplayEffectSpec& Spec) const
+{
+    FAggregatorEvaluateParameters EvalParams;
+    EvalParams.SourceTags = Spec.CapturedSourceTags.GetAggregatedTags();
+    EvalParams.TargetTags = Spec.CapturedTargetTags.GetAggregatedTags();
+
+    float AttackPower = 0.f;
+    GetCapturedAttributeMagnitude(AttackPowerDef, Spec, EvalParams, AttackPower);
+    return AttackPower * 1.5f; // Example: 150% of attack power
+}
+```
+
+### SetByCaller
+The caller sets the magnitude at spec creation time using a tag as the key.
+
+In the GE asset:
+```
+Magnitude Type: SetByCaller
+DataTag: SetByCaller.Damage
+```
+
+In ability/code:
+```cpp
+FGameplayEffectSpecHandle SpecHandle = MakeOutgoingGameplayEffectSpec(DamageEffectClass, Level);
+SpecHandle.Data->SetSetByCallerMagnitude(
+    FGameplayTag::RequestGameplayTag("SetByCaller.Damage"), 75.f);
+ApplyGameplayEffectSpecToTarget(Handle, ActorInfo, ActivationInfo, SpecHandle, TargetASC);
+```
+
+---
+
+## Execution Calculations (`UGameplayEffectExecutionCalculation`)
+
+Executions are for complex damage formulas that modify multiple attributes at once.
+They run on instant GEs and fire `PostGameplayEffectExecute` on the AttributeSet.
+
+```cpp
+UCLASS()
+class UMyDamageExecution : public UGameplayEffectExecutionCalculation
+{
+    GENERATED_BODY()
+public:
+    UMyDamageExecution();
+
+    virtual void Execute_Implementation(
+        const FGameplayEffectCustomExecutionParameters& ExecutionParams,
+        FGameplayEffectCustomExecutionOutput& OutExecutionOutput) const override;
+
+private:
+    FGameplayEffectAttributeCaptureDefinition AttackPowerDef;
+    FGameplayEffectAttributeCaptureDefinition ArmorDef;
+};
+
+UMyDamageExecution::UMyDamageExecution()
+{
+    AttackPowerDef = FGameplayEffectAttributeCaptureDefinition(
+        UMyAttackSet::GetAttackPowerAttribute(),
+        EGameplayEffectAttributeCaptureSource::Source,
+        true /*bSnapshot*/);
+
+    ArmorDef = FGameplayEffectAttributeCaptureDefinition(
+        UMyDefenseSet::GetArmorAttribute(),
+        EGameplayEffectAttributeCaptureSource::Target,
+        false);
+
+    RelevantAttributesToCapture.Add(AttackPowerDef);
+    RelevantAttributesToCapture.Add(ArmorDef);
+}
+
+void UMyDamageExecution::Execute_Implementation(
+    const FGameplayEffectCustomExecutionParameters& ExecutionParams,
+    FGameplayEffectCustomExecutionOutput& OutExecutionOutput) const
+{
+    const FGameplayEffectSpec& Spec = ExecutionParams.GetOwningSpec();
+
+    FAggregatorEvaluateParameters EvalParams;
+    EvalParams.SourceTags = Spec.CapturedSourceTags.GetAggregatedTags();
+    EvalParams.TargetTags = Spec.CapturedTargetTags.GetAggregatedTags();
+
+    float AttackPower = 0.f;
+    ExecutionParams.AttemptCalculateCapturedAttributeMagnitude(
+        AttackPowerDef, EvalParams, AttackPower);
+
+    float Armor = 0.f;
+    ExecutionParams.AttemptCalculateCapturedAttributeMagnitude(
+        ArmorDef, EvalParams, Armor);
+
+    // Example formula: damage = (attack * 2) - armor, min 1
+    float Damage = FMath::Max(1.f, (AttackPower * 2.f) - Armor);
+
+    // Output modifier: subtract from Health on target
+    OutExecutionOutput.AddOutputModifier(FGameplayModifierEvaluatedData(
+        UMyHealthSet::GetHealthAttribute(),
+        EGameplayModOp::Additive,
+        -Damage));
+}
+```
+
+In the GE asset, add this class to `Executions` array (replaces individual Modifiers for complex
+calculations).
+
+---
+
+## Stacking
+
+### Stacking Type (`EGameplayEffectStackingType`)
+
+| Value | Behavior |
+|-------|----------|
+| `None` | No stacking; each application is a separate active effect |
+| `AggregateBySource` | One stack group per source ASC applying the effect |
+| `AggregateByTarget` | One stack group regardless of source; all sources share one stack |
+
+### Stack Limit
+
+Set `StackLimitCount` in the GE asset. A value of 0 means unlimited.
+
+### Duration Policy While Stacking (`EGameplayEffectStackingDurationPolicy`)
+
+| Value | Behavior |
+|-------|----------|
+| `RefreshOnSuccessfulApplication` | Duration resets on each successful stack add |
+| `NeverRefresh` | Duration is set at first application, never extended |
+| `ExtendDuration` | Each new stack adds the spec's full duration to remaining time |
+
+### Expiration Policy (`EGameplayEffectStackingExpirationPolicy`)
+
+| Value | Behavior |
+|-------|----------|
+| `ClearEntireStack` | All stacks removed when the effect expires |
+| `RemoveSingleStackAndRefreshDuration` | Decrement by 1 and restart duration |
+| `RefreshDuration` | Duration refreshes (effectively infinite until manually removed) |
+
+### Reading Stack Count at Runtime
+
+```cpp
+// By active handle:
+int32 StackCount = AbilitySystemComponent->GetCurrentStackCount(ActiveHandle);
+
+// By query:
+FGameplayEffectQuery Query = FGameplayEffectQuery::MakeQuery_MatchAllOwningTags(
+    FGameplayTagContainer(PoisonEffectTag));
+int32 TotalStacks = AbilitySystemComponent->GetAggregatedStackCount(Query);
+
+// Update SetByCaller on active stacking effect:
+AbilitySystemComponent->UpdateActiveGameplayEffectSetByCallerMagnitude(
+    ActiveHandle,
+    FGameplayTag::RequestGameplayTag("SetByCaller.StackDamage"),
+    NewDamageValue);
+```
+
+---
+
+## Periodic Effects (Damage Over Time)
+
+Set in the GE asset:
+```
+Duration Policy: HasDuration
+Duration Magnitude: 10.0  (total duration in seconds)
+Period: 1.0               (execute every 1 second)
+Execute Periodic Effect on Application: true/false
+```
+
+`EGameplayEffectStackingPeriodPolicy` controls what happens to the period timer on stack add:
+- `ResetOnSuccessfulApplication`: Timer resets to full period on each stack
+- `NeverReset`: Timer continues uninterrupted
+
+Period callbacks on the ASC:
+```cpp
+// Called on server when a periodic GE executes on self:
+AbilitySystemComponent->OnPeriodicGameplayEffectExecuteDelegateOnSelf.AddUObject(
+    this, &AMyCharacter::OnPeriodicEffectExecuted);
+```
+
+---
+
+## Conditional Effects (`FConditionalGameplayEffect`)
+
+Apply secondary effects only when a primary execution succeeds:
+
+```cpp
+// In GE asset, set up Executions[0].ConditionalGameplayEffects:
+FConditionalGameplayEffect ConditionalEntry;
+ConditionalEntry.EffectClass = UMyBurnEffect::StaticClass();
+ConditionalEntry.RequiredSourceTags.AddTag(
+    FGameplayTag::RequestGameplayTag("Ability.FireType")); // Source must have this tag
+```
+
+The conditional effect is applied to the same target as the parent execution.
+
+---
+
+## Immunity
+
+Block specific GEs from applying using the `UImmunityGameplayEffectComponent` (UE 5.3+).
+In the GE asset, add this component and configure its tag query to match incoming GE source tags.
+
+`GrantedApplicationImmunityTags` (deprecated since UE 5.3) was the legacy property for this.
+New code should use `UImmunityGameplayEffectComponent` in the GE component list instead.
+
+When an ASC has this GE active, any incoming GE matching the immunity query is blocked.
+The `OnImmunityBlockGameplayEffectDelegate` fires on the ASC when a block occurs:
+
+```cpp
+AbilitySystemComponent->OnImmunityBlockGameplayEffectDelegate.AddUObject(
+    this, &AMyCharacter::OnImmunityBlockGE);
+
+void AMyCharacter::OnImmunityBlockGE(
+    const FGameplayEffectSpec& BlockedSpec,
+    const FActiveGameplayEffect* ImmunityEffect)
+{
+    // Log or trigger "immune" visual feedback
+}
+```
+
+---
+
+## Querying Active Effects
+
+```cpp
+// Get all active effect handles matching a query:
+FGameplayEffectQuery Query;
+Query.EffectTagQuery = FGameplayTagQuery::MakeQuery_MatchAnyTags(
+    FGameplayTagContainer(FGameplayTag::RequestGameplayTag("Effect.Type.Buff")));
+
+TArray<FActiveGameplayEffectHandle> Handles =
+    AbilitySystemComponent->GetActiveEffects(Query);
+
+// Get time remaining:
+TArray<float> Remaining = AbilitySystemComponent->GetActiveEffectsTimeRemaining(Query);
+
+// Remove all matching:
+AbilitySystemComponent->RemoveActiveEffects(Query);
+
+// Remove those with specific granted tags:
+AbilitySystemComponent->RemoveActiveEffectsWithGrantedTags(
+    FGameplayTagContainer(FGameplayTag::RequestGameplayTag("Buff.Speed")));
+
+// Remove those with specific applied source tags:
+AbilitySystemComponent->RemoveActiveEffectsWithSourceTags(
+    FGameplayTagContainer(FGameplayTag::RequestGameplayTag("Effect.Poison")));
+```
+
+---
+
+## Effect Application Callbacks
+
+```cpp
+// Any GE applied to self (server-side):
+AbilitySystemComponent->OnGameplayEffectAppliedDelegateToSelf.AddUObject(
+    this, &AMyCharacter::OnEffectApplied);
+
+void AMyCharacter::OnEffectApplied(
+    UAbilitySystemComponent* Source,
+    const FGameplayEffectSpec& Spec,
+    FActiveGameplayEffectHandle Handle)
+{
+    // React to any applied effect
+    // Use Spec.Def->DurationPolicy to determine if instant/duration/infinite
+    UE_LOG(LogTemp, Log, TEXT("Effect applied: %s"), *GetNameSafe(Spec.Def));
+}
+
+// Duration-based GE added (client + server):
+AbilitySystemComponent->OnActiveGameplayEffectAddedDelegateToSelf.AddUObject(
+    this, &AMyCharacter::OnActiveEffectAdded);
+
+// GE removed — subscribe per active effect handle after applying:
+FOnActiveGameplayEffectRemoved_Info* RemovalDelegate =
+    AbilitySystemComponent->OnGameplayEffectRemoved_InfoDelegate(ActiveHandle);
+if (RemovalDelegate)
+{
+    RemovalDelegate->AddUObject(this, &AMyCharacter::OnEffectRemoved);
+}
+
+void AMyCharacter::OnEffectRemoved(const FGameplayEffectRemovalInfo& RemovalInfo)
+{
+    // RemovalInfo.ActiveEffect holds the effect that was removed
+    // RemovalInfo.bPrematureRemoval is true if removed before natural expiry
+}
+```
+
+---
+
+## UE5.3+ Modular GE Components
+
+Since UE 5.3, `UGameplayEffect` uses `UGameplayEffectComponents` instead of monolithic
+properties for many behaviors. Legacy properties still work (the system auto-upgrades via
+`PostCDOCompiled`), but new GEs should prefer the component approach in the editor.
+
+Key components include:
+- `UAdditionalEffectsGameplayEffectComponent` — conditional and chained GEs
+- `UBlockAbilityTagsGameplayEffectComponent` — block abilities while active
+- `UTargetTagsGameplayEffectComponent` — grant tags to the target actor while active
+- `UImmunityGameplayEffectComponent` — immunity to incoming GEs
+- `UTargetTagRequirementsGameplayEffectComponent` — required/ignored tags on target for application/continuation
+
+These replace what was previously set directly on `UGameplayEffect` properties. When
+reading older code, map properties like `GrantedTags`, `InhibitionTags`, and
+`ApplicationTagRequirements` to their respective component equivalents.
+
+--- REFERENCE: gas-setup-patterns.md ---
+# GAS Setup Patterns
+
+Initialization sequences and ownership patterns for `UAbilitySystemComponent`.
+
+---
+
+## Pattern 1: ASC on PlayerState (Multiplayer Recommended)
+
+The ASC lives on `APlayerState`. The PlayerState persists across respawns (Pawn does not), so
+ability grants, active effects, and cooldowns survive death and respawn. The Pawn/Character acts
+as the avatar (the physical representation).
+
+### PlayerState
+
+```cpp
+// MyPlayerState.h
+#pragma once
+#include "GameFramework/PlayerState.h"
+#include "AbilitySystemInterface.h"
+#include "MyPlayerState.generated.h"
+
+class UAbilitySystemComponent;
+class UMyHealthSet;
+
+UCLASS()
+class AMyPlayerState : public APlayerState, public IAbilitySystemInterface
+{
+    GENERATED_BODY()
+public:
+    AMyPlayerState();
+
+    virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;
+
+    UMyHealthSet* GetHealthSet() const { return HealthSet; }
+
+protected:
+    // ASC lives here; created as default subobject
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GAS")
+    TObjectPtr<UAbilitySystemComponent> AbilitySystemComponent;
+
+    // AttributeSet created as subobject of ASC's outer (PlayerState)
+    UPROPERTY()
+    TObjectPtr<UMyHealthSet> HealthSet;
+};
+```
+
+```cpp
+// MyPlayerState.cpp
+#include "MyPlayerState.h"
+#include "AbilitySystemComponent.h"
+#include "Attributes/MyHealthSet.h"
+
+AMyPlayerState::AMyPlayerState()
+{
+    AbilitySystemComponent = CreateDefaultSubobject<UAbilitySystemComponent>(TEXT("ASC"));
+
+    // Mixed: owner/autonomous proxy gets full GE info; simulated proxies get minimal
+    AbilitySystemComponent->SetIsReplicated(true);
+    AbilitySystemComponent->SetReplicationMode(EGameplayEffectReplicationMode::Mixed);
+
+    // AttributeSet is a subobject of the PlayerState; ASC auto-discovers it
+    HealthSet = CreateDefaultSubobject<UMyHealthSet>(TEXT("HealthSet"));
+
+    // PlayerState replication required
+    NetUpdateFrequency = 100.f;
+}
+
+UAbilitySystemComponent* AMyPlayerState::GetAbilitySystemComponent() const
+{
+    return AbilitySystemComponent;
+}
+```
+
+### Character (Avatar)
+
+```cpp
+// MyCharacter.h
+#pragma once
+#include "GameFramework/Character.h"
+#include "AbilitySystemInterface.h"
+#include "MyCharacter.generated.h"
+
+UCLASS()
+class AMyCharacter : public ACharacter, public IAbilitySystemInterface
+{
+    GENERATED_BODY()
+public:
+    // Delegates to PlayerState's ASC
+    virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;
+
+    // Server: Called when controller possesses this pawn
+    virtual void PossessedBy(AController* NewController) override;
+
+    // Client: Called when PlayerState replicates
+    virtual void OnRep_PlayerState() override;
+
+private:
+    void InitGAS();
+    void GiveDefaultAbilities(); // Server only
+};
+```
+
+```cpp
+// MyCharacter.cpp
+#include "MyCharacter.h"
+#include "MyPlayerState.h"
+#include "AbilitySystemComponent.h"
+
+UAbilitySystemComponent* AMyCharacter::GetAbilitySystemComponent() const
+{
+    const AMyPlayerState* PS = GetPlayerState<AMyPlayerState>();
+    return PS ? PS->GetAbilitySystemComponent() : nullptr;
+}
+
+void AMyCharacter::PossessedBy(AController* NewController)
+{
+    Super::PossessedBy(NewController);
+    InitGAS();
+    GiveDefaultAbilities(); // Authority only, safe here
+}
+
+void AMyCharacter::OnRep_PlayerState()
+{
+    Super::OnRep_PlayerState();
+    InitGAS(); // Client side initialization
+}
+
+void AMyCharacter::InitGAS()
+{
+    AMyPlayerState* PS = GetPlayerState<AMyPlayerState>();
+    if (!PS) return;
+
+    UAbilitySystemComponent* ASC = PS->GetAbilitySystemComponent();
+    if (!ASC) return;
+
+    // OwnerActor = who logically owns the ASC (PlayerState)
+    // AvatarActor = the physical actor in the world (Character)
+    ASC->InitAbilityActorInfo(PS, this);
+}
+
+void AMyCharacter::GiveDefaultAbilities()
+{
+    if (!HasAuthority()) return;
+
+    UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+    if (!ASC) return;
+
+    // Grant abilities from a data-driven list
+    for (const TSubclassOf<UGameplayAbility>& AbilityClass : DefaultAbilities)
+    {
+        FGameplayAbilitySpec Spec(AbilityClass, 1 /*Level*/);
+        ASC->GiveAbility(Spec);
+    }
+}
+```
+
+### Respawn Handling
+
+When the Pawn is destroyed and respawned, the new Pawn must re-init its actor info:
+
+```cpp
+void AMyGameMode::RespawnPlayer(AController* Controller)
+{
+    // Destroy old pawn, spawn new one at respawn location
+    APawn* OldPawn = Controller->GetPawn();
+    if (OldPawn) OldPawn->Destroy();
+
+    AMyCharacter* NewPawn = GetWorld()->SpawnActor<AMyCharacter>(
+        CharacterClass, RespawnTransform);
+    Controller->Possess(NewPawn);
+    // PossessedBy fires → InitGAS → InitAbilityActorInfo with old PlayerState ASC
+    // Active effects and cooldowns on the ASC survive the respawn
+}
+```
+
+---
+
+## Pattern 2: ASC on Character (Single-Player / AI)
+
+Simpler setup. The ASC and AttributeSet both live on the Pawn. Use for AI actors or
+single-player games where persistence across respawns is not needed.
+
+```cpp
+// MyAICharacter.h
+#pragma once
+#include "GameFramework/Character.h"
+#include "AbilitySystemInterface.h"
+#include "MyAICharacter.generated.h"
+
+UCLASS()
+class AMyAICharacter : public ACharacter, public IAbilitySystemInterface
+{
+    GENERATED_BODY()
+public:
+    AMyAICharacter();
+
+    virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;
+    virtual void BeginPlay() override;
+
+protected:
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GAS")
+    TObjectPtr<UAbilitySystemComponent> AbilitySystemComponent;
+
+    UPROPERTY()
+    TObjectPtr<UMyHealthSet> HealthSet;
+};
+```
+
+```cpp
+// MyAICharacter.cpp
+#include "MyAICharacter.h"
+#include "AbilitySystemComponent.h"
+#include "Attributes/MyHealthSet.h"
+
+AMyAICharacter::AMyAICharacter()
+{
+    AbilitySystemComponent = CreateDefaultSubobject<UAbilitySystemComponent>(TEXT("ASC"));
+    AbilitySystemComponent->SetIsReplicated(true);
+    // Minimal: AI does not need full GE replication on simulated proxies
+    AbilitySystemComponent->SetReplicationMode(EGameplayEffectReplicationMode::Minimal);
+
+    HealthSet = CreateDefaultSubobject<UMyHealthSet>(TEXT("HealthSet"));
+}
+
+UAbilitySystemComponent* AMyAICharacter::GetAbilitySystemComponent() const
+{
+    return AbilitySystemComponent;
+}
+
+void AMyAICharacter::BeginPlay()
+{
+    Super::BeginPlay();
+    // For ASC on Pawn, OwnerActor == AvatarActor == this
+    AbilitySystemComponent->InitAbilityActorInfo(this, this);
+
+    if (HasAuthority())
+    {
+        // Grant AI abilities
+        for (const TSubclassOf<UGameplayAbility>& AbilityClass : DefaultAbilities)
+        {
+            AbilitySystemComponent->GiveAbility(FGameplayAbilitySpec(AbilityClass, 1));
+        }
+    }
+}
+```
+
+---
+
+## Attribute Initialization from CurveTable
+
+GAS supports initializing attributes from a `UCurveTable` for data-driven level scaling.
+Row format: `[GroupName].[AttributeSetName].[AttributeName]`
+
+Example rows:
+```
+Default.MyHealthSet.Health    | 100 | 150 | 200 | ...  (per level)
+Default.MyHealthSet.MaxHealth | 100 | 150 | 200 | ...
+Hero1.MyHealthSet.Health      |  80 | 120 | 160 | ...
+```
+
+```cpp
+// Call after InitAbilityActorInfo, on server only:
+UAbilitySystemGlobals::Get().GetAttributeSetInitter()->InitAttributeSetDefaults(
+    AbilitySystemComponent,
+    FName("Default"), // GroupName matches CurveTable row prefix
+    PlayerLevel,
+    true /*bInitialInit*/);
+```
+
+---
+
+## Ability Spec Handle Tracking
+
+Store handles to remove or modify abilities later:
+
+```cpp
+// In a component or character header:
+UPROPERTY()
+TArray<FGameplayAbilitySpecHandle> GrantedAbilityHandles;
+
+// Granting:
+FGameplayAbilitySpecHandle Handle = AbilitySystemComponent->GiveAbility(
+    FGameplayAbilitySpec(UMyAbility::StaticClass(), 1));
+GrantedAbilityHandles.Add(Handle);
+
+// Removing a specific ability:
+AbilitySystemComponent->ClearAbility(GrantedAbilityHandles[0]);
+
+// Removing all granted abilities:
+for (const FGameplayAbilitySpecHandle& H : GrantedAbilityHandles)
+{
+    AbilitySystemComponent->ClearAbility(H);
+}
+GrantedAbilityHandles.Empty();
+```
+
+---
+
+## Tag Event Registration
+
+Listen for gameplay tag additions/removals on the ASC:
+
+```cpp
+void AMyCharacter::InitGAS()
+{
+    // ... init actor info ...
+
+    // Register delegate for stunned state:
+    AbilitySystemComponent->RegisterGameplayTagEvent(
+        FGameplayTag::RequestGameplayTag("State.Stunned"),
+        EGameplayTagEventType::NewOrRemoved)
+        .AddUObject(this, &AMyCharacter::OnStunnedTagChanged);
+}
+
+void AMyCharacter::OnStunnedTagChanged(const FGameplayTag Tag, int32 NewCount)
+{
+    if (NewCount > 0)
+    {
+        // Stunned: disable movement, play stun animation
+    }
+    else
+    {
+        // No longer stunned: re-enable movement
+    }
+}
+```
+
+---
+
+## Attribute Value Delegates
+
+React to attribute changes (e.g., update UI health bar):
+
+```cpp
+void UMyHealthWidget::BindToASC(UAbilitySystemComponent* ASC)
+{
+    if (!ASC) return;
+
+    HealthChangedDelegateHandle = ASC->GetGameplayAttributeValueChangeDelegate(
+        UMyHealthSet::GetHealthAttribute())
+        .AddUObject(this, &UMyHealthWidget::OnHealthChanged);
+}
+
+void UMyHealthWidget::OnHealthChanged(const FOnAttributeChangeData& Data)
+{
+    UpdateHealthBar(Data.NewValue);
+}
+
+void UMyHealthWidget::UnbindFromASC(UAbilitySystemComponent* ASC)
+{
+    if (!ASC) return;
+    ASC->GetGameplayAttributeValueChangeDelegate(UMyHealthSet::GetHealthAttribute())
+        .Remove(HealthChangedDelegateHandle);
+}
+```
+
+---
+
+## Replication Mode Summary
+
+| Mode | GE Replication | Tag Replication | Use Case |
+|------|----------------|-----------------|----------|
+| `Minimal` | None to simulated | Minimal tags only | AI, non-player actors |
+| `Mixed` | Full to owner/autonomous, minimal to simulated | Full | Player-controlled characters |
+| `Full` | Full to everyone | Full | Single-player or small games |
+
+**Critical:** `Mixed` mode requires the ASC owner to be the PlayerState (or any actor
+not the Pawn). If the ASC is on the Pawn with `Mixed` mode, tag replication to simulated
+proxies will not work correctly. Use `Full` if ASC must be on the Pawn in multiplayer.
+

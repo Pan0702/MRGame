@@ -1,0 +1,1103 @@
+# SKILL: ue-materials-rendering
+
+---
+name: ue-materials-rendering
+description: "Use when the user is working with material, shader, MID, dynamic material, material instance, post-process, render target, parameter collection, decal, Nanite, Lumen, or rendering in Unreal Engine. See references/material-parameter-reference.md for parameter patterns and references/post-process-settings.md for post-process settings. For particle rendering, see ue-niagara-effects."
+metadata:
+  version: 1.0.0
+---
+
+# UE Materials and Rendering
+
+You are an expert in Unreal Engine's material and rendering systems. You provide accurate C++ patterns for dynamic materials, parameter collections, post-process, render targets, decals, and UE5 rendering features (Nanite, Lumen, Virtual Shadow Maps).
+
+---
+
+## Step 1: Read Project Context
+
+Read `.agents/ue-project-context.md` before giving advice. From it, extract:
+
+- **Engine version** — UE5.0–5.4 APIs differ (e.g., `SetNaniteOverride` added in 5.x; `CopyScalarAndVectorParameters` signature changed in 5.7)
+- **Target platforms** — Mobile requires forward rendering; many post-process features are desktop-only
+- **Rendering settings** — Nanite/Lumen enabled status affects which material features are safe
+- **Module names** — needed for correct `#include` paths and `Build.cs` dependencies
+
+If the context file is missing, ask for engine version and target platforms before proceeding.
+
+---
+
+## Step 2: Clarify the Rendering Need
+
+Ask which area the user needs:
+
+1. **Dynamic Material Instances (MID)** — runtime parameter changes on mesh components
+2. **Material Parameter Collections** — global parameters shared across all materials
+3. **Post-Process** — bloom, exposure, color grading, DOF, AO via volumes or components
+4. **Render Targets** — scene capture, minimap, security camera, canvas drawing
+5. **Decals** — deferred decals spawned at runtime, fade, sort order
+6. **Rendering Pipeline / UE5 Features** — Nanite, Lumen, Virtual Shadow Maps, custom depth/stencil
+
+Multiple areas can be combined.
+
+---
+
+## Core Patterns
+
+### 1. Dynamic Material Instances (MID)
+
+#### Creation
+
+**Pattern A — from UMaterialInterface (standalone, not tied to a component slot):**
+
+```cpp
+// Header
+UPROPERTY()
+TObjectPtr<UMaterialInstanceDynamic> MyMID;
+
+// Implementation — call once (BeginPlay or equivalent), cache the result
+UMaterialInterface* BaseMat = LoadObject<UMaterialInterface>(
+    nullptr, TEXT("/Game/Materials/M_MyBase.M_MyBase"));
+
+MyMID = UMaterialInstanceDynamic::Create(BaseMat, this);
+```
+
+**Pattern B — via component slot (preferred for meshes):**
+
+```cpp
+// UMeshComponent::CreateDynamicMaterialInstance creates a MID for the given
+// element index and assigns it to the slot automatically.
+// Signature: CreateDynamicMaterialInstance(int32 ElementIndex,
+//                UMaterialInterface* SourceMaterial = nullptr,
+//                FName OptionalName = NAME_None)
+
+UMaterialInstanceDynamic* MID = MeshComponent->CreateDynamicMaterialInstance(
+    0,            // element index
+    nullptr,      // nullptr = use the slot's current material as parent
+    TEXT("MyMID") // optional debug name
+);
+```
+
+Source: `MaterialInstanceDynamic.h`, `PrimitiveComponent.h`. Build.cs: `"Engine"`.
+
+#### Setting Parameters
+
+```cpp
+MyMID->SetScalarParameterValue(TEXT("Opacity"), 0.5f);
+MyMID->SetVectorParameterValue(TEXT("BaseColor"), FLinearColor(1.f, 0.2f, 0.1f, 1.f));
+MyMID->SetVectorParameterValue(TEXT("Offset"), FLinearColor(0.f, 0.f, 100.f, 0.f)); // XYZ via FLinearColor
+MyMID->SetTextureParameterValue(TEXT("DamageMask"), MyTexture);
+MyMID->SetTextureParameterValue(TEXT("SecurityFeed"), RenderTargetAsset); // RT as texture
+```
+
+Full setter signatures from `MaterialInstanceDynamic.h`:
+```cpp
+void SetScalarParameterValue(FName ParameterName, float Value);
+void SetVectorParameterValue(FName ParameterName, FLinearColor Value);  // Pass FLinearColor; no implicit conversion from FVector
+void SetTextureParameterValue(FName ParameterName, UTexture* Value);
+```
+
+#### High-Frequency Updates — Index-Based API
+
+When setting dozens of parameters per frame (rare but valid), use index caching:
+
+```cpp
+// In BeginPlay or initialization — call once per parameter name:
+int32 OpacityIndex = -1;
+MyMID->InitializeScalarParameterAndGetIndex(TEXT("Opacity"), 1.0f, OpacityIndex);
+
+// In Tick — use index, no name lookup:
+if (OpacityIndex >= 0)
+{
+    MyMID->SetScalarParameterByIndex(OpacityIndex, NewOpacity);
+}
+```
+
+Index is invalidated if the parent material changes. Do not share indices across different MID instances.
+
+#### MID Lifecycle and GC
+
+MIDs are `UObject`s — they are garbage collected when unreferenced. To keep a MID alive:
+
+```cpp
+// In your class header — must be UPROPERTY to prevent GC
+UPROPERTY()
+TObjectPtr<UMaterialInstanceDynamic> CachedMID;
+```
+
+Never store MIDs in raw pointers or local variables across frames.
+
+#### Additional MID Operations
+
+```cpp
+// Lerp between two instances' scalar/vector params
+MyMID->K2_InterpolateMaterialInstanceParams(InstanceA, InstanceB, Alpha);
+
+// Assign Nanite-compatible override material (UE5)
+MyMID->SetNaniteOverride(NaniteCompatibleMaterial);
+```
+
+---
+
+### 2. Material Parameter Collections
+
+`UMaterialParameterCollection` is an asset holding scalar and vector parameters accessible from any material via `CollectionParameter` expression. One GPU buffer update propagates to all referencing materials. Source: `MaterialParameterCollection.h`, `MaterialParameterCollectionInstance.h`.
+
+#### Setting Parameters at Runtime
+
+```cpp
+// MyCollection is a UPROPERTY(EditAnywhere) pointing to the MPC asset.
+UPROPERTY(EditAnywhere, Category="Rendering")
+TObjectPtr<UMaterialParameterCollection> GlobalRenderingCollection;
+
+// At runtime — get the per-world instance and set values:
+void AMyActor::UpdateGlobalWeather(float RainIntensity, FLinearColor FogColor)
+{
+    UMaterialParameterCollectionInstance* Instance =
+        GetWorld()->GetParameterCollectionInstance(GlobalRenderingCollection);
+
+    if (Instance)
+    {
+        Instance->SetScalarParameterValue(TEXT("RainIntensity"), RainIntensity);
+        Instance->SetVectorParameterValue(TEXT("FogColor"), FogColor);
+    }
+}
+```
+
+Both setters return `false` if the parameter name is not found. Names are case-sensitive. Limits: max 1024 scalars + 1024 vectors per collection; no texture parameters; global to the world instance.
+
+---
+
+### 3. Post-Process Volumes
+
+`APostProcessVolume` wraps `FPostProcessSettings` and controls how the camera is rendered when inside (or globally when `bUnbound = true`).
+
+From `PostProcessVolume.h`:
+```cpp
+struct FPostProcessSettings Settings; // The settings payload
+float Priority;      // Higher priority wins on overlap (undefined order when equal)
+float BlendRadius;   // World-space blend distance in cm (only when bUnbound = false)
+float BlendWeight;   // 0 = no effect, 1 = full effect
+uint32 bEnabled:1;
+uint32 bUnbound:1;   // true = applies globally regardless of camera position
+```
+
+#### Modifying a Post-Process Volume from C++
+
+```cpp
+// Assume PostProcessVolume is assigned or found:
+APostProcessVolume* PPV = /* find or spawn */;
+
+// Enable and configure
+PPV->bEnabled = true;
+PPV->bUnbound = true; // global effect
+PPV->BlendWeight = 1.0f;
+
+// Bloom
+PPV->Settings.bOverride_BloomIntensity = true;
+PPV->Settings.BloomIntensity = 0.5f;
+
+// Auto Exposure
+PPV->Settings.bOverride_AutoExposureMinBrightness = true;
+PPV->Settings.AutoExposureMinBrightness = 0.1f;
+PPV->Settings.bOverride_AutoExposureMaxBrightness = true;
+PPV->Settings.AutoExposureMaxBrightness = 2.0f;
+
+// Depth of Field (Cinematic DOF)
+PPV->Settings.bOverride_DepthOfFieldFstop = true;
+PPV->Settings.DepthOfFieldFstop = 2.8f;
+PPV->Settings.bOverride_DepthOfFieldFocalDistance = true;
+PPV->Settings.DepthOfFieldFocalDistance = 300.0f; // cm
+
+// Ambient Occlusion
+PPV->Settings.bOverride_AmbientOcclusionIntensity = true;
+PPV->Settings.AmbientOcclusionIntensity = 0.5f;
+
+// Vignette
+PPV->Settings.bOverride_VignetteIntensity = true;
+PPV->Settings.VignetteIntensity = 0.4f;
+
+// Color Grading
+PPV->Settings.bOverride_ColorSaturation = true;
+PPV->Settings.ColorSaturation = FVector4(1.2f, 1.0f, 0.8f, 1.0f); // per-channel RGBA
+PPV->Settings.bOverride_FilmSlope = true;
+PPV->Settings.FilmSlope = 0.88f; // 0–1 (default 0.88)
+```
+
+Every field in `FPostProcessSettings` has a corresponding `bOverride_*` bool that must be set to `true` for the value to take effect. See `references/post-process-settings.md` for a full field reference.
+
+#### Post-Process Materials (Blendables)
+
+Material Domain must be "Post Process". Add via:
+```cpp
+PPV->AddOrUpdateBlendable(PostProcessMaterial, 1.0f); // weight 0.0–1.0
+```
+
+#### UPostProcessComponent (Actor-Owned)
+
+```cpp
+// Constructor
+PostProcessComp = CreateDefaultSubobject<UPostProcessComponent>(TEXT("PostProcess"));
+PostProcessComp->bUnbound = true;
+PostProcessComp->Priority = 5.0f;
+
+// Runtime
+PostProcessComp->Settings.bOverride_BloomIntensity = true;
+PostProcessComp->Settings.BloomIntensity = 1.5f;
+```
+
+Includes: `"Components/PostProcessComponent.h"`, `"Engine/PostProcessVolume.h"`, `"Engine/Scene.h"`.
+
+---
+
+### 4. Render Targets
+
+#### Creating a Render Target in C++
+
+```cpp
+#include "Engine/TextureRenderTarget2D.h"
+#include "Kismet/KismetRenderingLibrary.h"
+
+// Option A — via UKismetRenderingLibrary (handles resource init automatically)
+UTextureRenderTarget2D* RT = UKismetRenderingLibrary::CreateRenderTarget2D(
+    this,          // WorldContextObject
+    512,           // Width
+    512,           // Height
+    RTF_RGBA16f,   // Format (see ETextureRenderTargetFormat)
+    FLinearColor::Black,
+    false          // bAutoGenerateMipMaps
+);
+
+// Option B — manual creation
+UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(this);
+RT->InitCustomFormat(512, 512, PF_FloatRGBA, /*bInForceLinearGamma=*/true);
+RT->UpdateResourceImmediate(/*bClearRenderTarget=*/true);
+```
+
+`ETextureRenderTargetFormat` values from `TextureRenderTarget2D.h`:
+| Format | Channels | Bits/Channel | Use Case |
+|--------|----------|-------------|----------|
+| `RTF_RGBA8` | RGBA | 8 fixed | LDR color, UI |
+| `RTF_RGBA8_SRGB` | RGBA | 8 fixed | sRGB color |
+| `RTF_RGBA16f` | RGBA | 16 float | HDR color (default) |
+| `RTF_RGBA32f` | RGBA | 32 float | High precision data |
+| `RTF_R16f` | R | 16 float | Single channel data |
+| `RTF_RGB10A2` | RGB+A | 10+2 bit | Display output |
+
+#### Scene Capture (Security Camera / Minimap)
+
+```cpp
+#include "Components/SceneCaptureComponent2D.h"
+
+// In actor constructor
+SceneCapture = CreateDefaultSubobject<USceneCaptureComponent2D>(TEXT("SceneCapture"));
+SceneCapture->SetupAttachment(RootComponent);
+SceneCapture->FOVAngle = 90.f;
+SceneCapture->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR; // or SCS_SceneColorHDR
+SceneCapture->bCaptureEveryFrame = true;  // continuous update
+
+// Assign a render target asset or a runtime-created one
+SceneCapture->TextureTarget = MyRenderTargetAsset;
+
+// Limit what's captured for performance
+SceneCapture->ShowFlags.SetAtmosphere(false);
+SceneCapture->ShowFlags.SetFog(false);
+```
+
+#### Drawing a Material to a Render Target
+
+```cpp
+// Renders a full-screen quad with Material applied to TextureTarget.
+// This is expensive (sets render target each call); use canvas API for batching.
+UKismetRenderingLibrary::DrawMaterialToRenderTarget(
+    this,         // WorldContextObject
+    RT,           // UTextureRenderTarget2D*
+    MyMaterial    // UMaterialInterface*
+);
+```
+
+#### Canvas Drawing (Batched)
+
+```cpp
+UCanvas* Canvas;
+FVector2D CanvasSize;
+FDrawToRenderTargetContext Context;
+
+UKismetRenderingLibrary::BeginDrawCanvasToRenderTarget(this, RT, Canvas, CanvasSize, Context);
+
+// Draw primitives to Canvas here...
+Canvas->K2_DrawMaterial(MyMaterial, FVector2D(0, 0), CanvasSize, FVector2D(0, 0), FVector2D(1, 1));
+
+UKismetRenderingLibrary::EndDrawCanvasToRenderTarget(this, Context);
+```
+
+**`UCanvasRenderTarget2D`** — subclass of `UTextureRenderTarget2D` with a built-in `OnCanvasRenderTargetUpdate` delegate. Use for automatic 2D canvas redraw (minimaps, runtime texture painting) instead of manual `BeginDrawCanvasToRenderTarget` calls.
+
+#### Reading Pixels (GPU Stall — Offline Only)
+
+```cpp
+// WARNING: stalls GPU pipeline. Editor tools / screenshot only, never per-frame.
+FColor Pixel = UKismetRenderingLibrary::ReadRenderTargetPixel(this, RT, X, Y);
+TArray<FColor> Pixels;
+UKismetRenderingLibrary::ReadRenderTarget(this, RT, Pixels);               // whole RT, 8-bit sRGB
+FLinearColor Raw = UKismetRenderingLibrary::ReadRenderTargetRawPixel(this, RT, X, Y);
+```
+
+---
+
+### 5. Decals
+
+`UDecalComponent` projects a material onto surfaces. Key API from `DecalComponent.h`:
+
+```cpp
+void SetDecalMaterial(UMaterialInterface* NewDecalMaterial);
+UMaterialInstanceDynamic* CreateDynamicMaterialInstance(); // MID on the decal
+void SetFadeOut(float StartDelay, float Duration, bool DestroyOwnerAfterFade = true);
+void SetFadeIn(float StartDelay, float Duration);
+void SetSortOrder(int32 Value);  // higher = draws on top
+void SetLifeSpan(float LifeSpan);
+FVector DecalSize; // local-space extent (not component scale)
+```
+
+#### Spawning Decals at Runtime
+
+```cpp
+// 0.0f lifespan = persistent; >0.0f = auto-destroy after N seconds
+UDecalComponent* Decal = UGameplayStatics::SpawnDecalAtLocation(
+    this, DecalMaterial, FVector(200.f), HitLocation, HitNormal.Rotation(), 0.0f);
+
+// Dynamic parameters on the decal
+UMaterialInstanceDynamic* DecalMID = Decal->CreateDynamicMaterialInstance();
+DecalMID->SetScalarParameterValue(TEXT("Opacity"), 0.8f);
+```
+
+#### DBuffer vs Non-DBuffer Decals
+
+- **DBuffer** (Translucent + DBuffer enabled): writes before lighting, affects diffuse/normals/roughness. Enable via `Project Settings > Rendering > DBuffer Decals`.
+- **Non-DBuffer**: rendered after lighting, emissive/opacity only; cheaper but limited.
+
+For level-placed decals, use `ADecalActor` (a wrapper around `UDecalComponent`). For runtime-spawned decals, prefer `UGameplayStatics::SpawnDecalAtLocation` or `SpawnDecalAttached`.
+
+---
+
+### 6. Nanite and Lumen (UE5)
+
+#### Nanite
+
+Nanite is UE5's virtualized geometry system. Material compatibility rules:
+
+| Feature | Nanite Compatible |
+|---------|------------------|
+| Opaque materials | Yes |
+| Two-sided materials | Yes |
+| Masked materials | Yes (with `r.Nanite.AllowMaskedMaterials=1`) |
+| Translucent materials | No — falls back to non-Nanite path |
+| World Position Offset (WPO) | Supported in UE 5.1+ (`bEvaluateWorldPositionOffset` on mesh) |
+| Pixel Depth Offset | No |
+| Custom vertex normals via shader | Limited |
+
+Check at runtime:
+```cpp
+// Check if a static mesh component is using Nanite (IsNaniteEnabled is on UStaticMesh, not on the component)
+bool bIsNanite = StaticMeshComponent->GetStaticMesh() && StaticMeshComponent->GetStaticMesh()->IsNaniteEnabled();
+```
+
+Override material for Nanite path:
+```cpp
+MyMID->SetNaniteOverride(NaniteCompatibleMaterial);
+```
+
+#### Lumen
+
+Lumen is UE5's dynamic GI and reflections system. Emissive surfaces can act as lights. Translucent surfaces are not traced by default. Control quality via post-process settings:
+
+```cpp
+PPV->Settings.bOverride_LumenReflectionQuality = true;
+PPV->Settings.LumenReflectionQuality = 1.0f;         // 0–4
+
+PPV->Settings.bOverride_LumenSceneDetail = true;
+PPV->Settings.LumenSceneDetail = 1.0f;               // surface cache resolution multiplier
+
+PPV->Settings.bOverride_LumenSceneLightingQuality = true;
+PPV->Settings.LumenSceneLightingQuality = 1.0f;
+```
+
+Performance: `r.Lumen.SurfaceCache.UpdateDownsampleFactor` controls cache update rate.
+
+#### Deferred vs Forward Rendering
+
+**Deferred vs Forward**: UE5 desktop uses deferred rendering by default — geometry writes to GBuffer, then lighting is computed per-pixel. Forward rendering (mobile, VR) processes lighting per-object, supports MSAA, but limits dynamic light count. Set via `Project Settings > Rendering > Forward Shading`.
+
+**Scalability**: Use `Scalability::SetQualityLevels()` (in `Scalability.h`) or console commands such as `sg.PostProcessQuality 0-3` to adjust rendering quality at runtime. Configure presets in `BaseScalability.ini`.
+
+#### Virtual Shadow Maps (VSM)
+
+- WPO materials: enable "Evaluate World Position Offset" in the material's Details panel (material editor setting, not a C++ property) for correct VSM shadows.
+- Masked materials: opacity masks respected correctly.
+- Decals do not cast VSM shadows.
+
+#### Custom Depth / Stencil (Outlines and Effects)
+
+```cpp
+MeshComponent->SetRenderCustomDepth(true);
+MeshComponent->SetCustomDepthStencilValue(1); // 0–255
+// Sample CustomDepth / CustomStencil nodes in a post-process material for outlines, X-ray, highlight effects.
+```
+
+Enable: `Project Settings > Rendering > Custom Depth-Stencil Pass > Enabled with Stencil`.
+
+---
+
+## Common Mistakes and Anti-Patterns
+
+**Creating MIDs every frame** — Each `CreateDynamicMaterialInstance` call allocates a new GPU resource. Create once in `BeginPlay`, cache, update in `Tick`:
+
+```cpp
+// BeginPlay
+CachedMID = MeshComponent->CreateDynamicMaterialInstance(0);
+
+// Tick
+if (CachedMID) { CachedMID->SetScalarParameterValue(TEXT("Time"), GetWorld()->TimeSeconds); }
+```
+
+**Not caching MID as UPROPERTY** — Raw `UMaterialInstanceDynamic*` is invisible to GC and collected on the next GC pass. Use `UPROPERTY() TObjectPtr<UMaterialInstanceDynamic> CachedMID;`.
+
+**Wrong parameter names** — Names are case-sensitive exact matches. `"basecolor"`, `"Base Color"`, and `"Base_Color"` all silently fail if the material uses `"BaseColor"`.
+
+**Render target resolution** — Match resolution to use: 256–512 for minimap/security camera, 512 max for mirrors; use planar reflections for large mirrors. Full-screen: use `bMainViewResolution` on `USceneCaptureComponent2D`.
+
+**Reading render target pixels per frame** — `ReadRenderTargetPixel` stalls the GPU pipeline. Never call per frame. Use `FRHIGPUTextureReadback` for async non-stalling reads.
+
+**MIDs on replicated actors** — MIDs are client-local. Do not replicate the MID pointer. Replicate the scalar/vector values and re-apply via `OnRep` functions on each client.
+
+**Post-process bOverride not set** — Every `FPostProcessSettings` field requires its paired `bOverride_*` bool set to `true`. Setting a value without the override is a silent no-op.
+
+**Nanite translucency fallback** — Translucent materials on Nanite meshes revert the full mesh to non-Nanite rendering. Split into separate opaque and translucent components.
+
+---
+
+## Required Build.cs Dependencies
+
+```csharp
+PublicDependencyModuleNames.AddRange(new string[]
+{
+    "Engine",           // Materials, render targets, UTextureRenderTarget2D
+    "RenderCore",       // Low-level render utilities
+    "RHI",              // RHI types (EPixelFormat, etc.)
+});
+
+// For UKismetRenderingLibrary:
+// Already available via "Engine" — no separate module needed.
+```
+
+---
+
+## Related Skills
+
+- `ue-cpp-foundations` — UObject management, UPROPERTY, TObjectPtr, garbage collection
+- `ue-actor-component-architecture` — setting up components (UDecalComponent, USceneCaptureComponent2D, UPostProcessComponent)
+- `ue-niagara-effects` — particle materials use MIDs; parameter passing into Niagara from C++
+- `ue-project-context` — engine version, target platforms, rendering feature flags
+
+--- REFERENCE: material-parameter-reference.md ---
+# Material Parameter Reference
+
+Common material parameter patterns, performance notes, and API quick-reference for C++ UE development.
+
+---
+
+## API Quick Reference
+
+### UMaterialInstanceDynamic (MaterialInstanceDynamic.h)
+
+| Method | Signature | Notes |
+|--------|-----------|-------|
+| `Create` | `static UMaterialInstanceDynamic* Create(UMaterialInterface* ParentMaterial, UObject* InOuter, FName Name = NAME_None)` | Preferred factory; always cache result |
+| `SetScalarParameterValue` | `void SetScalarParameterValue(FName ParameterName, float Value)` | Parameter names are case-sensitive |
+| `SetVectorParameterValue` | `void SetVectorParameterValue(FName ParameterName, FLinearColor Value)` | Pass FLinearColor explicitly; no implicit conversion from FVector |
+| `SetTextureParameterValue` | `void SetTextureParameterValue(FName ParameterName, UTexture* Value)` | Accepts any UTexture subclass including render targets |
+| `SetDoubleVectorParameterValue` | `void SetDoubleVectorParameterValue(FName ParameterName, FVector4 Value)` | For double-precision world position use |
+| `InitializeScalarParameterAndGetIndex` | `bool InitializeScalarParameterAndGetIndex(const FName& Name, float Value, int32& OutIndex)` | Call once; use index in tight loops |
+| `SetScalarParameterByIndex` | `bool SetScalarParameterByIndex(int32 ParameterIndex, float Value)` | Fast path; index must come from same MID |
+| `InitializeVectorParameterAndGetIndex` | `bool InitializeVectorParameterAndGetIndex(const FName& Name, const FLinearColor& Value, int32& OutIndex)` | Same pattern as scalar index API |
+| `SetVectorParameterByIndex` | `bool SetVectorParameterByIndex(int32 ParameterIndex, const FLinearColor& Value)` | Fast path for vectors |
+| `K2_GetScalarParameterValue` | `float K2_GetScalarParameterValue(FName ParameterName)` | Returns current scalar value |
+| `K2_GetVectorParameterValue` | `FLinearColor K2_GetVectorParameterValue(FName ParameterName)` | Returns current vector value |
+| `K2_GetTextureParameterValue` | `UTexture* K2_GetTextureParameterValue(FName ParameterName)` | Returns current texture value |
+| `ClearParameterValues` | `void ClearParameterValues()` | Removes all overrides; falls back to parent |
+| `CopyParameterOverrides` | `void CopyParameterOverrides(UMaterialInstance* MaterialInstance)` | Copies all overrides from another instance |
+| `CopyMaterialUniformParameters` | `void CopyMaterialUniformParameters(UMaterialInterface* Source)` | Faster than K2_Copy; skips static params |
+| `K2_InterpolateMaterialInstanceParams` | `void K2_InterpolateMaterialInstanceParams(UMaterialInstance* A, UMaterialInstance* B, float Alpha)` | Output = lerp(A, B, Alpha) |
+| `SetNaniteOverride` | `void SetNaniteOverride(UMaterialInterface* InMaterial)` | UE5 — assign Nanite-compatible material |
+
+### UMaterialParameterCollectionInstance (MaterialParameterCollectionInstance.h)
+
+| Method | Signature | Notes |
+|--------|-----------|-------|
+| `SetScalarParameterValue` | `bool SetScalarParameterValue(FName ParameterName, float ParameterValue)` | Returns false if name not found |
+| `SetVectorParameterValue` | `bool SetVectorParameterValue(FName ParameterName, const FLinearColor& ParameterValue)` | Pass FLinearColor explicitly; no implicit conversion from FVector |
+| `GetScalarParameterValue` | `bool GetScalarParameterValue(FName ParameterName, float& OutParameterValue) const` | |
+| `GetVectorParameterValue` | `bool GetVectorParameterValue(FName ParameterName, FLinearColor& OutParameterValue) const` | |
+| `ForceReturnToDefaultValues` | `void ForceReturnToDefaultValues()` | Resets all overrides to collection defaults |
+
+Obtain the instance via:
+```cpp
+UMaterialParameterCollectionInstance* Inst = GetWorld()->GetParameterCollectionInstance(CollectionAsset);
+```
+
+### UPrimitiveComponent — Material Slot API (PrimitiveComponent.h)
+
+| Method | Signature | Notes |
+|--------|-----------|-------|
+| `GetMaterial` | `UMaterialInterface* GetMaterial(int32 ElementIndex) const` | Returns current material for slot |
+| `SetMaterial` | `void SetMaterial(int32 ElementIndex, UMaterialInterface* Material)` | Replaces static material; does not create MID |
+| `SetMaterialByName` | `void SetMaterialByName(FName MaterialSlotName, UMaterialInterface* Material)` | Slot name lookup version |
+| `GetMaterialIndex` | `int32 GetMaterialIndex(FName MaterialSlotName) const` | Resolve slot name to index |
+| `GetMaterialSlotNames` | `TArray<FName> GetMaterialSlotNames() const` | All slot names on the component |
+| `CreateDynamicMaterialInstance` | `UMaterialInstanceDynamic* CreateDynamicMaterialInstance(int32 ElementIndex, UMaterialInterface* SourceMaterial = nullptr, FName OptionalName = NAME_None)` | Creates MID and assigns to slot |
+
+---
+
+## Parameter Type Mapping
+
+| Material Parameter Type | C++ Setter | C++ Type |
+|------------------------|-----------|----------|
+| Scalar Parameter | `SetScalarParameterValue` | `float` |
+| Vector Parameter | `SetVectorParameterValue` | `FLinearColor` (pass FLinearColor explicitly; no implicit conversion from FVector) |
+| Texture Parameter | `SetTextureParameterValue` | `UTexture*` |
+| Runtime Virtual Texture | `SetRuntimeVirtualTextureParameterValue` | `URuntimeVirtualTexture*` |
+| Sparse Volume Texture | `SetSparseVolumeTextureParameterValue` | `USparseVolumeTexture*` |
+| Texture Collection | `SetTextureCollectionParameterValue` | `UTextureCollection*` |
+
+Static parameters (Static Bool, Static Switch, Static Component Mask) cannot be changed at runtime on a MID. Create a `UMaterialInstanceConstant` in the editor for different static permutations and use MIDs on top for dynamic parameters.
+
+---
+
+## Performance Guidelines
+
+### MID Parameter Update Cost
+
+Parameter updates are low-cost individually. The overhead is:
+1. Name hash lookup (`FName` hashing — fast)
+2. Dirty flag on the uniform buffer
+3. GPU uniform buffer upload on the next render (batched, not per-parameter)
+
+For very high parameter counts (50+ parameters changed per frame per instance), use the index-based API to skip name lookup:
+
+```cpp
+// One-time initialization
+int32 AlphaIdx = -1;
+int32 ColorIdx = -1;
+MyMID->InitializeScalarParameterAndGetIndex(TEXT("Alpha"), 1.0f, AlphaIdx);
+MyMID->InitializeVectorParameterAndGetIndex(TEXT("TintColor"), FLinearColor::White, ColorIdx);
+
+// Per-frame update — no FName hash lookup
+MyMID->SetScalarParameterByIndex(AlphaIdx, NewAlpha);
+MyMID->SetVectorParameterByIndex(ColorIdx, NewColor);
+```
+
+### MPC vs MID — When to Use Which
+
+| Scenario | MPC | MID |
+|----------|-----|-----|
+| Global time-of-day color / intensity | Yes | No |
+| Weather parameters (rain, fog) | Yes | No |
+| Per-actor color / damage state | No | Yes |
+| Per-instance texture swap | No | Yes |
+| Drive 100+ materials at once | Yes | No (100 MID updates) |
+| Layered material parameter override | No | Yes |
+
+### Render Target Format Selection
+
+Choose the smallest format that meets precision needs:
+
+| Use Case | Recommended Format | Memory (512x512) |
+|----------|--------------------|-----------------|
+| LDR color (UI, minimap) | `RTF_RGBA8` | 1 MB |
+| HDR scene color | `RTF_RGBA16f` | 2 MB |
+| Depth data / single channel | `RTF_R16f` | 0.5 MB |
+| Float computation | `RTF_RGBA32f` | 4 MB |
+
+`RTF_RGBA32f` costs 4x more memory and bandwidth than `RTF_RGBA16f`. Avoid unless data requires full 32-bit precision.
+
+### Scene Capture Performance
+
+`USceneCaptureComponent2D` renders a full scene pass. Cost is proportional to:
+- Render target resolution
+- Capture source (`SCS_FinalColorLDR` is more expensive than `SCS_BaseColor`)
+- Geometry in the captured view
+- Post-process applied to capture
+
+Optimization options:
+```cpp
+// Disable capture every frame; call manually when needed
+SceneCapture->bCaptureEveryFrame = false;
+SceneCapture->CaptureScene(); // trigger manually
+
+// Exclude expensive show flags
+SceneCapture->ShowFlags.SetAtmosphere(false);
+SceneCapture->ShowFlags.SetFog(false);
+SceneCapture->ShowFlags.SetBloom(false);
+SceneCapture->ShowFlags.SetMotionBlur(false);
+SceneCapture->ShowFlags.SetContactShadows(false);
+
+// Hide specific actors from capture
+SceneCapture->HiddenActors.Add(PlayerActor);
+
+// Use a low-resolution render target for distant/offscreen views
+```
+
+---
+
+## Common Material Parameter Names by Domain
+
+These are conventions, not enforced by the engine. Match whatever names the material artist has used.
+
+### PBR Base Parameters
+
+| Parameter Name | Type | Typical Range | Purpose |
+|----------------|------|--------------|---------|
+| `BaseColor` | Vector | — | Albedo color |
+| `Roughness` | Scalar | 0.0–1.0 | Surface roughness |
+| `Metallic` | Scalar | 0.0 or 1.0 | Metallic surface flag |
+| `Emissive` | Vector | — | Emissive color (HDR) |
+| `EmissiveIntensity` | Scalar | 0–100+ | Emissive brightness multiplier |
+| `Opacity` | Scalar | 0.0–1.0 | Translucency opacity |
+| `Normal` | Texture | — | Normal map override |
+
+### Damage / Destruction State
+
+| Parameter Name | Type | Purpose |
+|----------------|------|---------|
+| `DamageAmount` | Scalar | 0 = pristine, 1 = fully damaged |
+| `DamageMask` | Texture | Grayscale damage region mask |
+| `BurnAmount` | Scalar | Char/burn intensity |
+
+### Environmental / Weather
+
+| Parameter Name | Type | Purpose |
+|----------------|------|---------|
+| `RainWetness` | Scalar (MPC) | Surface wetness from rain |
+| `SnowAmount` | Scalar (MPC) | Snow coverage amount |
+| `WindStrength` | Scalar (MPC) | Foliage wind intensity |
+| `TimeOfDay` | Scalar (MPC) | 0.0–24.0 hour |
+
+### UI / HUD Materials
+
+| Parameter Name | Type | Purpose |
+|----------------|------|---------|
+| `HealthPercent` | Scalar | 0.0–1.0 health fraction |
+| `FillAmount` | Scalar | Progress bar fill |
+| `TintColor` | Vector | Icon or panel tint |
+| `MaskTexture` | Texture | Custom shape mask |
+
+---
+
+## Debugging Parameter Issues
+
+### Parameter Name Verification
+
+Parameter names are stored as `FName` — case-sensitive exact match required. If `SetScalarParameterValue` has no visible effect:
+
+1. Open the material in the Material Editor; confirm the exact `ParameterName` field value.
+2. Check if the parameter is inside a Material Function — use `SetScalarParameterValueByInfo` with `FMaterialParameterInfo` for layer-based access.
+3. Verify the MID's parent is the correct material (not already a MID of another MID pointing to the wrong base).
+
+### MID Not Taking Effect on Mesh
+
+If `CreateDynamicMaterialInstance` returns a valid pointer but visual changes are not visible:
+
+- Confirm `UPROPERTY()` on the cached pointer — if missing, the MID may have been GC'd.
+- Confirm the element index matches the correct material slot (`GetMaterialSlotNames()` to list them).
+- On skeletal meshes, verify the LOD 0 slot is being targeted; some materials are per-LOD.
+
+### MPC Parameter Not Updating Shaders
+
+- Verify the collection asset reference in the component matches the collection asset the material references.
+- Parameter names in the collection are `FName` — case-sensitive.
+- Changes via `SetScalarParameterValue` on `UMaterialParameterCollectionInstance` queue a uniform buffer update; they are applied before the next frame render.
+
+--- REFERENCE: post-process-settings.md ---
+# Post-Process Settings Reference
+
+`FPostProcessSettings` fields accessible from C++, grouped by category. Every field requires its paired `bOverride_*` bool to be `true` to take effect when set on a `APostProcessVolume` or `UPostProcessComponent`.
+
+Source: `Engine/Source/Runtime/Engine/Classes/Engine/Scene.h`
+
+---
+
+## Usage Pattern
+
+```cpp
+// Always set the override bool alongside the value:
+PPV->Settings.bOverride_BloomIntensity = true;
+PPV->Settings.BloomIntensity = 1.5f;
+
+// Setting the value without the override has no effect.
+PPV->Settings.BloomIntensity = 1.5f; // silent no-op if bOverride_BloomIntensity is false
+```
+
+---
+
+## Bloom
+
+Controls the glow around bright light sources.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bOverride_BloomMethod` | bool | false | Enable method override |
+| `BloomMethod` | EBloomMethod | `BM_SOG` | `BM_SOG` (Gaussian Sum) or `BM_FFT` (Convolution) |
+| `bOverride_BloomIntensity` | bool | false | |
+| `BloomIntensity` | float | 0.675 | Overall bloom brightness multiplier. 0 = off |
+| `bOverride_BloomThreshold` | bool | false | |
+| `BloomThreshold` | float | -1.0 | Luminance threshold for bloom. -1 = all pixels |
+| `bOverride_BloomSizeScale` | bool | false | |
+| `BloomSizeScale` | float | 4.0 | Scale for all Gaussian bloom kernel sizes |
+
+**Visual effect:** Increasing `BloomIntensity` above 1.0 creates a dreamy glow around bright elements (windows, neon signs, fire). Setting `BloomThreshold` to 1.0 restricts bloom to pixels brighter than 1.0 linear, which is more physically accurate.
+
+---
+
+## Exposure (Auto Exposure / Eye Adaptation)
+
+Controls how the camera adapts to scene brightness.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bOverride_AutoExposureMethod` | bool | false | |
+| `AutoExposureMethod` | EAutoExposureMethod | `AEM_Histogram` | `AEM_Histogram` (high quality) or `AEM_Basic` (faster) |
+| `bOverride_AutoExposureMinBrightness` | bool | false | |
+| `AutoExposureMinBrightness` | float | 0.03 | Minimum scene luminance exposure adapts to (EV100 units) |
+| `bOverride_AutoExposureMaxBrightness` | bool | false | |
+| `AutoExposureMaxBrightness` | float | 8.0 | Maximum scene luminance exposure adapts to (EV100 units) |
+| `bOverride_AutoExposureBias` | bool | false | |
+| `AutoExposureBias` | float | 0.0 | Manual exposure offset in EV (exposure value). Positive = brighter |
+| `bOverride_AutoExposureSpeedUp` | bool | false | |
+| `AutoExposureSpeedUp` | float | 3.0 | Adaptation speed when moving to brighter scene (EV/sec) |
+| `bOverride_AutoExposureSpeedDown` | bool | false | |
+| `AutoExposureSpeedDown` | float | 1.0 | Adaptation speed when moving to darker scene (EV/sec) |
+| `bOverride_AutoExposureLowPercent` | bool | false | |
+| `AutoExposureLowPercent` | float | 80.0 | Histogram low percentile for metering (0–100) |
+| `bOverride_AutoExposureHighPercent` | bool | false | |
+| `AutoExposureHighPercent` | float | 98.3 | Histogram high percentile for metering (0–100) |
+
+**Fixed exposure (override eye adaptation):**
+```cpp
+// Lock exposure to a fixed EV100 value — disables adaptation
+PPV->Settings.bOverride_AutoExposureMethod = true;
+PPV->Settings.AutoExposureMethod = AEM_Manual;
+PPV->Settings.bOverride_AutoExposureBias = true;
+PPV->Settings.AutoExposureBias = 0.0f; // EV100 = 0 is "neutral" daylight
+```
+
+**Visual effect:** `AutoExposureBias` of +1 doubles perceived brightness; -1 halves it. Narrowing the Min/Max range prevents wild brightness swings in high-contrast scenes.
+
+---
+
+## Depth of Field (Cinematic DOF)
+
+Blurs out-of-focus objects to simulate camera aperture. Requires Cinematic DOF method.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bOverride_DepthOfFieldFstop` | bool | false | |
+| `DepthOfFieldFstop` | float | 4.0 | Aperture in f-stops. Lower = more blur (f/1.4 = very shallow DOF) |
+| `bOverride_DepthOfFieldMinFstop` | bool | false | |
+| `DepthOfFieldMinFstop` | float | 1.2 | Minimum aperture clamp |
+| `bOverride_DepthOfFieldBladeCount` | bool | false | |
+| `DepthOfFieldBladeCount` | int32 | 5 | Aperture blade count (affects bokeh shape) |
+| `bOverride_DepthOfFieldFocalDistance` | bool | false | |
+| `DepthOfFieldFocalDistance` | float | 1000.0 | In-focus distance from camera (cm) |
+| `bOverride_DepthOfFieldSensorWidth` | bool | false | |
+| `DepthOfFieldSensorWidth` | float | 24.576 | Sensor width in mm (affects DOF calculation) |
+| `bOverride_DepthOfFieldDepthBlurRadius` | bool | false | |
+| `DepthOfFieldDepthBlurRadius` | float | 0.0 | Gaussian blur radius at 1m distance (0 = off) |
+| `bOverride_DepthOfFieldDepthBlurAmount` | bool | false | |
+| `DepthOfFieldDepthBlurAmount` | float | 1.0 | Blur amount multiplier for DepthBlurRadius |
+| `bOverride_DepthOfFieldNearTransitionRegion` | bool | false | |
+| `DepthOfFieldNearTransitionRegion` | float | 300.0 | Distance in front of focal plane for blur transition (cm) |
+| `bOverride_DepthOfFieldFarTransitionRegion` | bool | false | |
+| `DepthOfFieldFarTransitionRegion` | float | 500.0 | Distance behind focal plane for blur transition (cm) |
+
+**Visual effect:** `DepthOfFieldFstop = 1.4` with `DepthOfFieldFocalDistance = 200` (2m) creates a very cinematic portrait-style shallow depth of field. `Fstop = 22` produces near-infinite focus.
+
+---
+
+## Color Grading
+
+Adjusts the final image colors. Applied in linear light before tonemapping.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `bOverride_ColorSaturation` | bool | |
+| `ColorSaturation` | FVector4 | Per-channel saturation (RGBA). Default = (1,1,1,1) |
+| `bOverride_ColorContrast` | bool | |
+| `ColorContrast` | FVector4 | Per-channel contrast. Default = (1,1,1,1) |
+| `bOverride_ColorGamma` | bool | |
+| `ColorGamma` | FVector4 | Gamma correction per channel. Default = (1,1,1,1) |
+| `bOverride_ColorGain` | bool | |
+| `ColorGain` | FVector4 | Multiplier per channel. Default = (1,1,1,1) |
+| `bOverride_ColorOffset` | bool | |
+| `ColorOffset` | FVector4 | Additive offset per channel. Default = (0,0,0,0) |
+| `bOverride_ColorSaturationShadows` | bool | Shadow-region saturation |
+| `ColorSaturationShadows` | FVector4 | Affects only shadow tones |
+| `bOverride_ColorSaturationMidtones` | bool | Midtone-region saturation |
+| `ColorSaturationMidtones` | FVector4 | Affects only midtones |
+| `bOverride_ColorSaturationHighlights` | bool | Highlight-region saturation |
+| `ColorSaturationHighlights` | FVector4 | Affects only highlights |
+
+```cpp
+// Desaturate shadows (classic film noir / horror look)
+PPV->Settings.bOverride_ColorSaturationShadows = true;
+PPV->Settings.ColorSaturationShadows = FVector4(0.5f, 0.5f, 0.5f, 1.0f);
+
+// Teal-orange grade — boost blue-greens in shadows, warm up highlights
+PPV->Settings.bOverride_ColorOffsetShadows = true;
+PPV->Settings.ColorOffsetShadows = FVector4(0.0f, 0.01f, 0.02f, 0.0f); // slight blue push in shadows
+PPV->Settings.bOverride_ColorGainHighlights = true;
+PPV->Settings.ColorGainHighlights = FVector4(1.05f, 0.98f, 0.9f, 1.0f);  // warm highlights
+```
+
+**Visual effect:** `ColorSaturation = FVector4(0,0,0,1)` produces full greyscale. The W (alpha) component of these vectors is a master scale applied equally to RGB.
+
+---
+
+## Vignette
+
+Darkens edges of the screen.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bOverride_VignetteIntensity` | bool | false | |
+| `VignetteIntensity` | float | 0.4 | 0 = no vignette, 1 = strong dark edges |
+
+---
+
+## Film Grain
+
+Adds photographic grain to the final image.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bOverride_FilmGrainIntensity` | bool | false | |
+| `FilmGrainIntensity` | float | 0.0 | Overall grain strength |
+| `bOverride_FilmGrainIntensityShadows` | bool | false | |
+| `FilmGrainIntensityShadows` | float | 1.0 | Grain intensity in shadow regions |
+| `bOverride_FilmGrainIntensityMidtones` | bool | false | |
+| `FilmGrainIntensityMidtones` | float | 1.0 | Grain intensity in midtone regions |
+| `bOverride_FilmGrainIntensityHighlights` | bool | false | |
+| `FilmGrainIntensityHighlights` | float | 1.0 | Grain intensity in highlight regions |
+| `bOverride_FilmGrainShadowsMax` | bool | false | |
+| `FilmGrainShadowsMax` | float | 0.09 | Maximum luminance where shadows grain applies |
+| `bOverride_FilmGrainHighlightsMin` | bool | false | |
+| `FilmGrainHighlightsMin` | float | 0.5 | Minimum luminance where highlights grain applies |
+
+---
+
+## Ambient Occlusion (SSAO)
+
+Screen-space approximation of ambient occlusion (shadowing in crevices and corners).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bOverride_AmbientOcclusionIntensity` | bool | false | |
+| `AmbientOcclusionIntensity` | float | 0.5 | 0 = off, 1 = full AO |
+| `bOverride_AmbientOcclusionRadius` | bool | false | |
+| `AmbientOcclusionRadius` | float | 200.0 | World-space sample radius in cm |
+| `bOverride_AmbientOcclusionRadiusInWS` | bool | false | |
+| `AmbientOcclusionRadiusInWS` | bool | false | If true, Radius is world-space cm; else view-space |
+| `bOverride_AmbientOcclusionBias` | bool | false | |
+| `AmbientOcclusionBias` | float | 3.0 | Bias to avoid self-occlusion on surfaces |
+| `bOverride_AmbientOcclusionPower` | bool | false | |
+| `AmbientOcclusionPower` | float | 2.0 | Power applied to AO result; higher = more contrast |
+| `bOverride_AmbientOcclusionQuality` | bool | false | |
+| `AmbientOcclusionQuality` | float | 50.0 | 0–100; number of samples |
+
+**Visual effect:** AO adds subtle shadowing where surfaces meet, grounding objects and adding depth. Increase `Radius` for large architectural scenes; decrease for small props.
+
+---
+
+## Lumen Global Illumination and Reflections (UE5)
+
+Lumen replaces SSAO, SSGI, and SSR for high-quality GI and reflections.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bOverride_LumenSceneDetail` | bool | false | |
+| `LumenSceneDetail` | float | 1.0 | Surface cache resolution scale. Higher = better quality, higher cost |
+| `bOverride_LumenSceneLightingQuality` | bool | false | |
+| `LumenSceneLightingQuality` | float | 1.0 | Lighting pass quality. Range 0–4 |
+| `bOverride_LumenSceneLightingUpdateSpeed` | bool | false | |
+| `LumenSceneLightingUpdateSpeed` | float | 1.0 | How quickly scene lighting updates propagate |
+| `bOverride_LumenFinalGatherQuality` | bool | false | |
+| `LumenFinalGatherQuality` | float | 1.0 | GI final gather quality. Range 0–4 |
+| `bOverride_LumenFinalGatherLightingUpdateSpeed` | bool | false | |
+| `LumenFinalGatherLightingUpdateSpeed` | float | 1.0 | Update speed for final gather lighting |
+| `bOverride_LumenMaxTraceDistance` | bool | false | |
+| `LumenMaxTraceDistance` | float | 20000.0 | Maximum ray trace distance in cm |
+| `bOverride_LumenReflectionQuality` | bool | false | |
+| `LumenReflectionQuality` | float | 1.0 | Reflection quality. Range 0–4 |
+| `bOverride_LumenRayLightingMode` | bool | false | |
+| `LumenRayLightingMode` | ELumenRayLightingModeOverride | Default | `Default`, `SurfaceCache`, `HitLighting` |
+
+**Visual effect:**
+- Increasing `LumenSceneDetail` to 2–4 improves interior scenes where cache misses cause splotchy GI.
+- `LumenReflectionQuality = 2+` with `HitLighting` mode gives accurate mirror-like reflections at higher cost.
+- `LumenMaxTraceDistance` controls the effective GI range — reduce for indoor-only scenes to save performance.
+
+---
+
+## Screen Space Global Illumination (SSGI, non-Lumen)
+
+Available when Lumen is disabled. Screen-space only.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bOverride_ScreenSpaceReflectionIntensity` | bool | false | |
+| `ScreenSpaceReflectionIntensity` | float | 100.0 | SSR strength (0 = off) |
+| `bOverride_ScreenSpaceReflectionQuality` | bool | false | |
+| `ScreenSpaceReflectionQuality` | float | 50.0 | SSR sample count (0–100) |
+| `bOverride_ScreenSpaceReflectionMaxRoughness` | bool | false | |
+| `ScreenSpaceReflectionMaxRoughness` | float | 0.6 | Max roughness for SSR (0–1) |
+
+---
+
+## Motion Blur
+
+Blurs moving objects proportional to velocity.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bOverride_MotionBlurAmount` | bool | false | |
+| `MotionBlurAmount` | float | 0.5 | Blur strength (0 = off) |
+| `bOverride_MotionBlurMax` | bool | false | |
+| `MotionBlurMax` | float | 5.0 | Maximum blur length as percentage of screen width |
+| `bOverride_MotionBlurTargetFPS` | bool | false | |
+| `MotionBlurTargetFPS` | int32 | 30 | Target FPS for motion blur normalization |
+| `bOverride_MotionBlurPerObjectSize` | bool | false | |
+| `MotionBlurPerObjectSize` | float | 0.5 | Threshold for per-object motion blur |
+
+---
+
+## Chromatic Aberration
+
+Simulates lens color fringing (RGB channel separation at screen edges).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bOverride_SceneFringeIntensity` | bool | false | |
+| `SceneFringeIntensity` | float | 0.0 | 0 = off, 5.0 = visible fringe |
+| `bOverride_ChromaticAberrationStartOffset` | bool | false | |
+| `ChromaticAberrationStartOffset` | float | 0.0 | Radial start position (0 = center, 1 = edge) |
+
+---
+
+## Camera Lens (Dirt Mask and Lens Flares)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `bOverride_LensFlareIntensity` | bool | false | |
+| `LensFlareIntensity` | float | 1.0 | Streak/flare strength around bright sources |
+| `bOverride_LensFlareBokehSize` | bool | false | |
+| `LensFlareBokehSize` | float | 3.0 | Bokeh lens flare size |
+| `bOverride_LensFlareThreshold` | bool | false | |
+| `LensFlareThreshold` | float | 8.0 | Luminance threshold for lens flares |
+| `bOverride_BloomDirtMaskIntensity` | bool | false | |
+| `BloomDirtMaskIntensity` | float | 0.0 | Camera lens dirt over bloom |
+| `bOverride_BloomDirtMask` | bool | false | |
+| `BloomDirtMask` | `UTexture*` | nullptr | Dirt mask texture |
+
+---
+
+## Post-Process Materials (Blendables)
+
+Post-process materials are added via the volume's blendable array:
+
+```cpp
+// Material Domain must be set to "Post Process" in material editor.
+PPV->AddOrUpdateBlendable(PostProcessMaterial, 1.0f);
+
+// Via Settings directly (typed):
+PPV->Settings.AddBlendable(PostProcessMaterial, 0.5f);
+
+// Weighted blend — weight 0 = invisible, 1 = full effect
+// Multiple blendables are composited in array order.
+```
+
+Blendable priorities within the post-process pipeline:
+1. Scene Color (before tone mapping) — use `Blendable Location: Before Tonemapping`
+2. After Tone Mapping — use `Blendable Location: After Tonemapping`
+3. SSR input — special location for SSR replacement
+
+---
+
+## Volume Priority and Blending
+
+Multiple overlapping volumes blend based on:
+
+1. **Priority** — higher value wins when fully inside. Undefined order on tie.
+2. **BlendWeight** — 0 to 1; partial effect weight.
+3. **BlendRadius** — world-space distance from volume boundary where blend transitions.
+4. **bUnbound** — if true, volume applies everywhere (lowest effective priority among unbounded volumes unless Priority is set high).
+
+```cpp
+// Two volumes overlapping: the one with Priority = 10 overrides Priority = 1
+// for all properties both have bOverride set.
+
+PPVBackground->Priority = 1;
+PPVDanger->Priority = 10;
+```
+
+Blend order from source documentation: the camera's final post-process settings are accumulated from lowest to highest priority, with each higher-priority volume blending over lower-priority settings according to BlendWeight.
+
+---
+
+## Common Presets (C++ Snippets)
+
+### Horror / Dark Atmosphere
+
+```cpp
+auto& S = PPV->Settings;
+
+S.bOverride_BloomIntensity = true;       S.BloomIntensity = 0.2f;
+S.bOverride_VignetteIntensity = true;    S.VignetteIntensity = 1.0f;
+S.bOverride_ColorSaturation = true;      S.ColorSaturation = FVector4(0.6f, 0.6f, 0.6f, 1.0f);
+S.bOverride_AutoExposureMinBrightness = true; S.AutoExposureMinBrightness = 0.01f;
+S.bOverride_AutoExposureMaxBrightness = true; S.AutoExposureMaxBrightness = 1.0f;
+S.bOverride_FilmGrainIntensity = true;   S.FilmGrainIntensity = 0.8f;
+```
+
+### High-Contrast Cinematic
+
+```cpp
+auto& S = PPV->Settings;
+
+S.bOverride_BloomIntensity = true;       S.BloomIntensity = 0.5f;
+S.bOverride_ColorContrast = true;        S.ColorContrast = FVector4(1.3f, 1.3f, 1.3f, 1.0f);
+S.bOverride_ColorSaturation = true;      S.ColorSaturation = FVector4(1.2f, 1.2f, 1.2f, 1.0f);
+S.bOverride_DepthOfFieldFstop = true;    S.DepthOfFieldFstop = 2.0f;
+S.bOverride_DepthOfFieldFocalDistance = true; S.DepthOfFieldFocalDistance = 500.0f;
+S.bOverride_MotionBlurAmount = true;     S.MotionBlurAmount = 0.4f;
+```
+
+### Sci-Fi / Tech UI Overlay
+
+```cpp
+auto& S = PPV->Settings;
+
+S.bOverride_BloomIntensity = true;      S.BloomIntensity = 2.0f;
+S.bOverride_SceneFringeIntensity = true; S.SceneFringeIntensity = 2.0f;
+S.bOverride_ColorSaturationHighlights = true;
+S.ColorSaturationHighlights = FVector4(0.7f, 1.2f, 1.4f, 1.0f); // teal highlights
+S.bOverride_VignetteIntensity = true;   S.VignetteIntensity = 0.6f;
+```
+
+### Disable All Post-Process (Performance / Mobile)
+
+```cpp
+// Set BlendWeight to 0 to suppress all post-process from a volume
+PPV->BlendWeight = 0.0f;
+
+// Or disable entirely
+PPV->bEnabled = false;
+```
+

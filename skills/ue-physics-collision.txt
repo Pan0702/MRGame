@@ -1,0 +1,1123 @@
+# SKILL: ue-physics-collision
+
+---
+name: ue-physics-collision
+description: "Use when implementing collision detection, trace queries, physics simulation, or physical interactions in Unreal Engine. Triggers on: 'collision', 'trace', 'LineTrace', 'line trace', 'overlap', 'physics', 'hit result', 'sweep', 'collision channel', 'physics body', 'Chaos', 'raytrace', 'OnHit', 'OnBeginOverlap'. See related skills for component architecture and AI navigation."
+metadata:
+  version: 1.0.0
+---
+
+# UE Physics & Collision
+
+You are an expert in Unreal Engine's physics and collision systems, including collision channels, trace queries, collision events, physics bodies, and the Chaos physics engine.
+
+---
+
+## Step 1: Read Project Context
+
+Read `.agents/ue-project-context.md` to confirm:
+- UE version (Chaos is the default physics backend from UE 5.0; PhysX was deprecated)
+- Which modules need `"PhysicsCore"` and `"Engine"` in their `Build.cs`
+- Whether the project uses skeletal meshes with physics assets, or primarily static mesh collision
+- Dedicated server targets (affects whether physics simulation should run server-side)
+
+---
+
+## Step 2: Identify the Need
+
+Ask which area applies if not stated:
+1. **Collision setup** — channels, profiles, responses on components
+2. **Trace queries** — line traces, sweeps, overlap queries for gameplay logic
+3. **Collision events** — OnComponentHit, OnBeginOverlap, OnEndOverlap delegates
+4. **Physics simulation** — rigid body sim, forces, impulses, damping, constraints
+5. **Physical materials** — friction, restitution, surface type detection
+
+---
+
+## Collision Channels & Profiles
+
+### ECollisionChannel — built-in channels
+
+```cpp
+ECC_WorldStatic, ECC_WorldDynamic, ECC_Pawn, ECC_PhysicsBody,
+ECC_Vehicle, ECC_Destructible               // object channels (what an object IS)
+ECC_Visibility, ECC_Camera                  // trace channels (used for queries)
+// Custom: ECC_GameTraceChannel1..ECC_GameTraceChannel18
+```
+
+**Responses**: `ECR_Ignore` / `ECR_Overlap` (events, no block) / `ECR_Block` (physical block + events).
+
+**Built-in profiles**: `BlockAll`, `BlockAllDynamic`, `OverlapAll`, `OverlapAllDynamic`, `Pawn`, `PhysicsActor`, `NoCollision`.
+
+### Setting Collision in C++
+
+```cpp
+MyMesh->SetCollisionProfileName(TEXT("BlockAll"));        // preferred — sets all at once
+MyMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+// ECollisionEnabled: NoCollision | QueryOnly | PhysicsOnly | QueryAndPhysics
+MyMesh->SetCollisionObjectType(ECC_PhysicsBody);
+MyMesh->SetCollisionResponseToAllChannels(ECR_Block);
+MyMesh->SetCollisionResponseToChannel(ECC_Pawn, ECR_Overlap);
+MyMesh->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+```
+
+### Object Type Channels vs Trace Channels
+
+**Object type channels** describe what an actor IS (Pawn, WorldDynamic, Vehicle). Every component has exactly one object type. **Trace channels** are used for queries — they define what a trace is LOOKING FOR (Visibility, Camera, Weapon). This distinction determines which query function to use: `ByObjectType` matches the target's object type channel; `ByChannel` uses the querier's trace channel and checks responses. Most gameplay traces use trace channels (`ECC_Visibility`, custom `Weapon`); overlap queries for "find all pawns" use object type (`ECC_Pawn`).
+
+### Custom Channels — DefaultEngine.ini
+
+```ini
+[/Script/Engine.CollisionProfile]
++DefaultChannelResponses=(Channel=ECC_GameTraceChannel1,DefaultResponse=ECR_Block,bTraceType=True,bStaticObject=False,Name="Weapon")
++DefaultChannelResponses=(Channel=ECC_GameTraceChannel2,DefaultResponse=ECR_Block,bTraceType=False,bStaticObject=False,Name="Interactable")
++Profiles=(Name="Interactable",CollisionEnabled=QueryAndPhysics,ObjectTypeName="Interactable",CustomResponses=((Channel="Weapon",Response=ECR_Ignore),(Channel="Visibility",Response=ECR_Block)))
+```
+
+`bTraceType=True` = trace channel; `bTraceType=False` = object type channel. They use separate query functions.
+
+See `references/collision-channel-setup.md` for full profile examples.
+
+---
+
+## Trace Queries
+
+### FCollisionQueryParams
+
+```cpp
+FCollisionQueryParams Params;
+Params.TraceTag                = TEXT("WeaponTrace"); // for profiling/debug
+Params.bTraceComplex           = false;  // false=simple hull (fast); true=per-poly (expensive)
+Params.bReturnPhysicalMaterial = true;   // populates Hit.PhysMaterial
+Params.bReturnFaceIndex        = false;  // expensive, only when needed
+Params.AddIgnoredActor(this);
+Params.AddIgnoredComponent(MyComp);
+```
+
+### World-Level Trace Functions (C++) — from `WorldCollision.h` via `UWorld`
+
+```cpp
+FHitResult Hit;
+// By trace channel
+GetWorld()->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params);
+GetWorld()->LineTraceMultiByChannel(Hits, Start, End, ECC_Visibility, Params);
+// By object type
+FCollisionObjectQueryParams ObjParams(ECC_PhysicsBody);
+ObjParams.AddObjectTypesToQuery(ECC_WorldDynamic);
+GetWorld()->LineTraceSingleByObjectType(Hit, Start, End, ObjParams, Params);
+// By profile
+GetWorld()->LineTraceSingleByProfile(Hit, Start, End, TEXT("BlockAll"), Params);
+```
+
+### Sweep Queries — FCollisionShape (from `CollisionShape.h`)
+
+```cpp
+FCollisionShape Sphere  = FCollisionShape::MakeSphere(30.f);
+FCollisionShape Box     = FCollisionShape::MakeBox(FVector(50.f, 50.f, 50.f));
+FCollisionShape Capsule = FCollisionShape::MakeCapsule(34.f, 88.f); // radius, half-height
+
+GetWorld()->SweepSingleByChannel(Hit, Start, End, FQuat::Identity, ECC_Pawn, Sphere, Params);
+GetWorld()->SweepMultiByChannel(Hits, Start, End, FQuat::Identity, ECC_Pawn, Sphere, Params);
+GetWorld()->SweepSingleByObjectType(Hit, Start, End, FQuat::Identity, ObjParams, Sphere, Params);
+GetWorld()->SweepSingleByProfile(Hit, Start, End, FQuat::Identity, TEXT("Pawn"), Sphere, Params);
+```
+
+### Overlap Queries
+
+```cpp
+TArray<FOverlapResult> Overlaps;
+GetWorld()->OverlapMultiByObjectType(Overlaps, Center, FQuat::Identity,
+    FCollisionObjectQueryParams(ECC_Pawn), FCollisionShape::MakeSphere(500.f), Params);
+for (const FOverlapResult& R : Overlaps) { AActor* A = R.GetActor(); }
+
+// By trace channel (uses channel responses, not object type matching):
+GetWorld()->OverlapMultiByChannel(
+    Overlaps, Center, FQuat::Identity, ECC_Pawn,
+    FCollisionShape::MakeSphere(Radius), QueryParams);
+```
+
+### FHitResult — Key Fields
+
+```cpp
+Hit.bBlockingHit;          // true if blocking
+Hit.ImpactPoint;           // world space contact point
+Hit.ImpactNormal;          // surface normal
+Hit.Distance;              // from Start to impact
+Hit.BoneName;              // skeletal mesh bone
+Hit.GetActor();
+Hit.GetComponent();
+// Physical material (requires bReturnPhysicalMaterial=true):
+if (UPhysicalMaterial* M = Hit.PhysMaterial.Get())
+    EPhysicalSurface S = UPhysicalMaterial::DetermineSurfaceType(M);
+```
+
+### Blueprint-Layer Traces (UKismetSystemLibrary)
+
+```cpp
+#include "Kismet/KismetSystemLibrary.h"
+TArray<AActor*> Ignore = { this };
+// LineTrace with debug draw (ETraceTypeQuery maps to ECollisionChannel)
+UKismetSystemLibrary::LineTraceSingle(this, Start, End,
+    ETraceTypeQuery::TraceTypeQuery1, false, Ignore, EDrawDebugTrace::ForDuration, Hit, true);
+// SphereTrace
+UKismetSystemLibrary::SphereTraceSingle(this, Start, End, 50.f,
+    ETraceTypeQuery::TraceTypeQuery1, false, Ignore, EDrawDebugTrace::ForOneFrame, Hit, true);
+// By profile
+UKismetSystemLibrary::LineTraceSingleByProfile(this, Start, End,
+    TEXT("BlockAll"), false, Ignore, EDrawDebugTrace::None, Hit, true);
+```
+
+### Async Traces
+
+```cpp
+FTraceHandle Handle = GetWorld()->AsyncLineTraceByChannel(
+    EAsyncTraceType::Single, Start, End, ECC_Visibility, Params);
+// Read next frame:
+FTraceDatum Datum;
+if (GetWorld()->QueryTraceData(Handle, Datum) && Datum.OutHits.Num() > 0)
+    FHitResult& Hit = Datum.OutHits[0];
+```
+
+### Debug Visualization
+
+```cpp
+#if ENABLE_DRAW_DEBUG
+DrawDebugLine(GetWorld(), Start, End, FColor::Red, false, 2.f);
+DrawDebugSphere(GetWorld(), HitResult.ImpactPoint, 10.f, 12, FColor::Green, false, 2.f);
+#endif
+```
+
+`DrawDebugLine` / `DrawDebugSphere` are from `DrawDebugHelpers.h`. Wrap in `ENABLE_DRAW_DEBUG` so they compile out in shipping builds. The bool param is `bPersistentLines`; the float param is `LifeTime` in seconds.
+
+See `references/trace-patterns.md` for full gameplay patterns (hitscan, melee sweep, AoE, ground detection, async sensors).
+
+---
+
+## Collision Events
+
+Delegate declarations from `PrimitiveComponent.h`:
+- `OnComponentHit` — `(HitComp, OtherActor, OtherComp, NormalImpulse, FHitResult)` — physics collision
+- `OnComponentBeginOverlap` — `(OverlappedComp, OtherActor, OtherComp, OtherBodyIndex, bFromSweep, SweepResult)`
+- `OnComponentEndOverlap` — `(OverlappedComp, OtherActor, OtherComp, OtherBodyIndex)`
+
+```cpp
+// Hit events (physics collision)
+MyMesh->SetNotifyRigidBodyCollision(true);  // "Simulation Generates Hit Events"
+MyMesh->OnComponentHit.AddDynamic(this, &AMyActor::OnHit);
+
+UFUNCTION()
+void AMyActor::OnHit(UPrimitiveComponent* HitComp, AActor* OtherActor,
+                      UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit) {}
+
+// Overlap events — SetGenerateOverlapEvents(true) REQUIRED on BOTH components
+MyMesh->SetGenerateOverlapEvents(true);
+MyMesh->OnComponentBeginOverlap.AddDynamic(this, &AMyActor::OnBeginOverlap);
+MyMesh->OnComponentEndOverlap.AddDynamic(this, &AMyActor::OnEndOverlap);
+
+UFUNCTION()
+void AMyActor::OnBeginOverlap(UPrimitiveComponent* OverlappedComp, AActor* OtherActor,
+    UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep, const FHitResult& SweepResult) {}
+
+UFUNCTION()
+void AMyActor::OnEndOverlap(UPrimitiveComponent* OverlappedComp, AActor* OtherActor,
+    UPrimitiveComponent* OtherComp, int32 OtherBodyIndex) {}
+```
+
+**Requirements:** Hit: `QueryAndPhysics`, `ECR_Block` on both, `SetNotifyRigidBodyCollision(true)`. Overlap: `ECR_Overlap` on both, `SetGenerateOverlapEvents(true)` on both.
+
+---
+
+## Physics Bodies
+
+```cpp
+// Enable simulation (PrimitiveComponent.h / BodyInstanceCore.h)
+MyMesh->SetSimulatePhysics(true);
+MyMesh->SetEnableGravity(true);
+MyMesh->SetMassOverrideInKg(NAME_None, 50.f, true); // 50 kg
+MyMesh->SetLinearDamping(0.1f);
+MyMesh->SetAngularDamping(0.05f);
+float Mass = MyMesh->GetMass();
+
+// Forces and impulses
+MyMesh->AddImpulse(FVector(0,0,1000), NAME_None, false);       // bVelChange=true ignores mass
+MyMesh->AddImpulseAtLocation(FVector(500,0,0), HitPoint);      // adds torque
+MyMesh->AddForce(FVector(0,0,9800), NAME_None, false);          // continuous (per tick)
+MyMesh->AddRadialImpulse(Center, 500.f, 2000.f, RIF_Linear, false);
+MyMesh->SetPhysicsLinearVelocity(FVector(0,0,300));             // use sparingly
+```
+
+**FBodyInstanceCore key flags** (set via UPROPERTY/editor): `bSimulatePhysics`, `bOverrideMass`, `bEnableGravity`, `bAutoWeld`, `bStartAwake`, `bGenerateWakeEvents`, `bUpdateKinematicFromSimulation`.
+
+**Collision complexity** (`BodySetupEnums.h`): `CTF_UseDefault`, `CTF_UseSimpleAndComplex`, `CTF_UseSimpleAsComplex`, `CTF_UseComplexAsSimple` (expensive, static only for physics).
+
+### Physics Constraints
+
+```cpp
+UPhysicsConstraintComponent* C = NewObject<UPhysicsConstraintComponent>(this);
+C->SetupAttachment(RootComponent);
+C->SetConstrainedComponents(MeshA, NAME_None, MeshB, NAME_None);
+C->SetAngularSwing1Limit(EAngularConstraintMotion::ACM_Limited, 45.f);
+C->SetAngularTwistLimit(EAngularConstraintMotion::ACM_Free, 0.f);
+C->SetLinearXLimit(ELinearConstraintMotion::LCM_Locked, 0.f);
+C->RegisterComponent();
+```
+
+**Named constraint presets** (set via `ConstraintProfile` or editor Preset dropdown):
+
+| Preset | Angular Limits | Linear Limits |
+|---|---|---|
+| Fixed | All locked | All locked |
+| Hinge | One axis free | All locked |
+| Prismatic | All locked | One axis free |
+| Ball-and-Socket | All free | All locked |
+
+---
+
+## Physical Materials (UPhysicalMaterial)
+
+From `PhysicalMaterials/PhysicalMaterial.h`:
+
+```cpp
+float Friction;       // kinetic (0 = frictionless)
+float StaticFriction; // before sliding starts
+float Restitution;    // 0 (no bounce) to 1 (elastic)
+float Density;        // g/cm^3 — used to compute mass from shape volume
+EPhysicalSurface SurfaceType; // SurfaceType_Default, SurfaceType1..SurfaceType62
+// FrictionCombineMode / RestitutionCombineMode: Average, Min, Multiply, Max
+
+// Runtime override
+MyMesh->SetPhysMaterialOverride(MyPhysMaterial);
+
+// Detect surface from trace (requires bReturnPhysicalMaterial=true)
+if (UPhysicalMaterial* M = Hit.PhysMaterial.Get())
+{
+    EPhysicalSurface S = UPhysicalMaterial::DetermineSurfaceType(M);
+    switch (S) { case SurfaceType1: /* Metal */ break; }
+}
+```
+
+---
+
+## Chaos Physics (UE5)
+
+UE5 uses **Chaos** by default (PhysX removed). Key architecture:
+- `FChaosScene` (`ChaosScene.h`) owns the solver: `StartFrame()`, `SetUpForFrame()`, `EndFrame()`.
+- Physics runs on a dedicated thread; game thread reads results at sync points.
+- **Substepping**: enabled per Project Settings > Physics (`MaxSubsteps`, `MaxSubstepDeltaTime`). Enable when small/fast objects tunnel through thin geometry — substepping divides the physics tick into smaller increments so collisions are not missed.
+- **Async physics**: runs simulation on a separate thread with one-frame latency. Enable via `UPhysicsSettings::bTickPhysicsAsync`. Use `UAsyncPhysicsInputComponent` on components that need physics-thread input callbacks.
+
+Key `UPhysicsSettingsCore` fields (`PhysicsSettingsCore.h`):
+```cpp
+float DefaultGravityZ;         // -980 cm/s^2 default
+float BounceThresholdVelocity; // min velocity to bounce
+float MaxAngularVelocity;      // rad/s cap
+float MaxDepenetrationVelocity;
+float ContactOffsetMultiplier; // contact shell size
+FChaosSolverConfiguration SolverOptions;
+```
+
+**EPhysicalSurface**: 62 configurable slots (`SurfaceType1..SurfaceType62`) mapped in Project Settings > Physics > Physical Surface.
+
+**Geometry Collections (Chaos Destructibles)**: use `UGeometryCollectionComponent`. Fracture thresholds driven by `FPhysicalMaterialStrength` (TensileStrength, CompressionStrength, ShearStrength) and `FPhysicalMaterialDamageModifier` (DamageThresholdMultiplier) on `UPhysicalMaterial`.
+
+---
+
+### Cloth Simulation
+
+```cpp
+// Cloth uses UClothingAssetBase attached to USkeletalMeshComponent
+// Enable in Mesh asset: Clothing → Add Clothing Data
+// C++ access:
+USkeletalMeshComponent* Mesh = GetMesh();
+if (UClothingSimulationInteractor* Cloth = Mesh->GetClothingSimulationInteractor())
+{
+    Cloth->PhysicsAssetUpdated();             // re-sync after physics asset change
+    Cloth->SetAnimDriveSpringStiffness(10.f); // blend anim ↔ cloth
+}
+```
+
+### Field System
+
+Field System actors apply forces, strain, and anchors to Chaos destruction and cloth:
+
+```cpp
+// Place AFieldSystemActor in level, add field nodes:
+// URadialFalloff — distance-based falloff
+// URadialVector — directional force from center
+// UUniformVector — constant directional force
+// UBoxFalloff — box-shaped field region
+
+// Trigger destruction at runtime:
+AFieldSystemActor* FieldActor = GetWorld()->SpawnActor<AFieldSystemActor>();
+URadialFalloff* Falloff = NewObject<URadialFalloff>(FieldActor);
+Falloff->SetRadialFalloff(1000000.f, 0.8f, 1.f, 0.f, 500.f, FVector::ZeroVector, EFieldFalloffType::Field_Falloff_Linear);
+UFieldSystemMetaDataFilter* Meta = NewObject<UFieldSystemMetaDataFilter>(FieldActor);
+Meta->SetMetaDataFilterType(EFieldFilterType::Field_Filter_All, EFieldObjectType::Field_Object_All, EFieldPositionType::Field_Position_CenterOfMass);
+FieldActor->GetFieldSystemComponent()->ApplyPhysicsField(true, EFieldPhysicsType::Field_ExternalClusterStrain, Meta, Falloff);
+```
+
+---
+
+## Common Mistakes & Anti-Patterns
+
+**Wrong collision responses**: Overlap events require `ECR_Overlap` AND `bGenerateOverlapEvents=true` on BOTH components.
+
+**Traces every Tick on many actors**: Use async traces or throttle to 5–10 Hz with a timer.
+
+**QueryOnly vs PhysicsOnly confusion**: `QueryOnly` = traces only, no physics forces. `PhysicsOnly` = forces only, traces skip it. Use `QueryAndPhysics` for both.
+
+**Complex collision in traces**: `bTraceComplex=true` is 4–10x more expensive. Default `false`; only enable for precise terrain interaction.
+
+**Missing `SetNotifyRigidBodyCollision`**: `OnComponentHit` will never fire without it — this flag ("Simulation Generates Hit Events") is separate from collision response.
+
+**Sweep vs overlap**: Sweep = shape moving along a path (movement, projectile). Overlap = shape at fixed point (AoE, proximity). Don't substitute one for the other.
+
+**Physics on dedicated servers**: Disable skeletal ragdolls with `bSimulateSkeletalMeshOnDedicatedServer=false` unless server accuracy is required.
+
+### Multiplayer & Replicated Actor Collision
+
+In multiplayer, physics simulation runs on the server. Collision events (`OnComponentHit`, `OnBeginOverlap`) fire on the server only by default — clients do not receive these events unless you replicate them explicitly via RPCs. Clients see physics-simulated actor positions via `FRepMovement` (the replicated transform + velocity struct behind `bReplicateMovement`). Setting `bReplicateMovement = true` on an actor syncs its transform and linear/angular velocity; the underlying physics state itself is not replicated. For client-predicted physics (e.g., projectiles), simulate locally on the client and reconcile with server authority on correction. Cosmetic-only physics — ragdolls, debris, environmental props — can simulate on clients independently without server involvement, since visual fidelity matters more than authority.
+
+---
+
+## Required Module Dependencies
+
+```csharp
+// Build.cs
+PublicDependencyModuleNames.AddRange(new string[] {
+    "Core", "CoreUObject",
+    "Engine",      // UPrimitiveComponent, FHitResult, UWorld trace API
+    "PhysicsCore", // UPhysicalMaterial, FCollisionShape, FBodyInstanceCore
+});
+```
+
+---
+
+## Related Skills
+
+- `ue-actor-component-architecture` — `UPrimitiveComponent` lifecycle, attachment, registration
+- `ue-ai-navigation` — trace-based sensing and navmesh overlap queries
+- `ue-gameplay-abilities` — targeting systems built on trace and overlap queries
+- `ue-cpp-foundations` — delegate binding syntax and UFUNCTION requirements
+
+--- REFERENCE: collision-channel-setup.md ---
+# Collision Channel Setup Reference
+
+Reference for configuring custom collision channels, object types, and collision profiles in Unreal Engine 5 projects using the Chaos physics backend.
+
+---
+
+## Channel Slots Available
+
+UE reserves the first 14 channels for built-in engine use. Projects have 18 custom slots:
+
+| Enum                   | INI Key           | Typical Use             |
+|------------------------|-------------------|-------------------------|
+| `ECC_GameTraceChannel1`  | `TraceTypeQuery1` | Custom trace channel 1  |
+| `ECC_GameTraceChannel2`  | `TraceTypeQuery2` | Custom trace channel 2  |
+| ...through...          | ...               | ...                     |
+| `ECC_GameTraceChannel18` | `TraceTypeQuery18`| Custom trace channel 18 |
+
+The same slots serve as object type channels when `bTraceType=False`.
+
+---
+
+## DefaultEngine.ini Configuration
+
+All custom channels and profiles go in `Config/DefaultEngine.ini` under `[/Script/Engine.CollisionProfile]`.
+
+### Declaring a Custom Trace Channel
+
+```ini
+[/Script/Engine.CollisionProfile]
++DefaultChannelResponses=(Channel=ECC_GameTraceChannel1,DefaultResponse=ECR_Ignore,bTraceType=True,bStaticObject=False,Name="Weapon")
++DefaultChannelResponses=(Channel=ECC_GameTraceChannel2,DefaultResponse=ECR_Ignore,bTraceType=True,bStaticObject=False,Name="Interaction")
+```
+
+- `bTraceType=True` — this is a trace channel (used in `LineTraceSingleByChannel`, `SweepSingleByChannel`)
+- `DefaultResponse` — response all components have unless overridden
+
+### Declaring a Custom Object Type Channel
+
+```ini
++DefaultChannelResponses=(Channel=ECC_GameTraceChannel3,DefaultResponse=ECR_Block,bTraceType=False,bStaticObject=False,Name="Interactable")
++DefaultChannelResponses=(Channel=ECC_GameTraceChannel4,DefaultResponse=ECR_Block,bTraceType=False,bStaticObject=True,Name="HazardZone")
+```
+
+- `bTraceType=False` — object channel (what an object IS, not what a trace uses)
+- `bStaticObject=True` — object is non-moving (WorldStatic category behavior)
+
+### Declaring Custom Profiles
+
+```ini
+; Weapon/projectile — blocks WorldStatic, WorldDynamic, Pawn; ignores triggers
++Profiles=(Name="Projectile",CollisionEnabled=QueryAndPhysics,ObjectTypeName="WorldDynamic",CustomResponses=(\
+    (Channel="WorldStatic",Response=ECR_Block),\
+    (Channel="WorldDynamic",Response=ECR_Block),\
+    (Channel="Pawn",Response=ECR_Block),\
+    (Channel="PhysicsBody",Response=ECR_Block),\
+    (Channel="Weapon",Response=ECR_Ignore),\
+    (Channel="Interaction",Response=ECR_Ignore)))
+
+; Trigger volume — overlaps pawns, ignores everything else
++Profiles=(Name="TriggerPawn",CollisionEnabled=QueryOnly,ObjectTypeName="WorldDynamic",CustomResponses=(\
+    (Channel="Pawn",Response=ECR_Overlap),\
+    (Channel="WorldStatic",Response=ECR_Ignore),\
+    (Channel="WorldDynamic",Response=ECR_Ignore),\
+    (Channel="PhysicsBody",Response=ECR_Ignore)))
+
+; Interactable object — visible to interaction traces, blocks world
++Profiles=(Name="Interactable",CollisionEnabled=QueryAndPhysics,ObjectTypeName="Interactable",CustomResponses=(\
+    (Channel="WorldStatic",Response=ECR_Block),\
+    (Channel="WorldDynamic",Response=ECR_Block),\
+    (Channel="Pawn",Response=ECR_Block),\
+    (Channel="Interaction",Response=ECR_Block),\
+    (Channel="Weapon",Response=ECR_Ignore),\
+    (Channel="Visibility",Response=ECR_Block)))
+```
+
+---
+
+## Common Profile Setups
+
+### Shooter Game — Standard Channels
+
+```ini
+; Weapon trace — hits everything physical, ignores other weapon traces
++DefaultChannelResponses=(Channel=ECC_GameTraceChannel1,DefaultResponse=ECR_Block,bTraceType=True,bStaticObject=False,Name="Weapon")
+
+; Interaction trace — used by player to find interactable objects
++DefaultChannelResponses=(Channel=ECC_GameTraceChannel2,DefaultResponse=ECR_Ignore,bTraceType=True,bStaticObject=False,Name="Interaction")
+
+; Interactable object type
++DefaultChannelResponses=(Channel=ECC_GameTraceChannel3,DefaultResponse=ECR_Block,bTraceType=False,bStaticObject=False,Name="Interactable")
+
+; Damage volume object type
++DefaultChannelResponses=(Channel=ECC_GameTraceChannel4,DefaultResponse=ECR_Ignore,bTraceType=False,bStaticObject=False,Name="DamageVolume")
+```
+
+### Corresponding Profiles
+
+```ini
+; Player character — responds to weapon hits, can interact
++Profiles=(Name="PlayerPawn",CollisionEnabled=QueryAndPhysics,ObjectTypeName="Pawn",CustomResponses=(\
+    (Channel="WorldStatic",Response=ECR_Block),\
+    (Channel="WorldDynamic",Response=ECR_Block),\
+    (Channel="Weapon",Response=ECR_Block),\
+    (Channel="Interaction",Response=ECR_Block),\
+    (Channel="Interactable",Response=ECR_Ignore),\
+    (Channel="DamageVolume",Response=ECR_Overlap)))
+
+; Pickup item — not hit by weapons, visible to interaction traces
++Profiles=(Name="Pickup",CollisionEnabled=QueryOnly,ObjectTypeName="Interactable",CustomResponses=(\
+    (Channel="Pawn",Response=ECR_Overlap),\
+    (Channel="WorldStatic",Response=ECR_Block),\
+    (Channel="Weapon",Response=ECR_Ignore),\
+    (Channel="Interaction",Response=ECR_Block),\
+    (Channel="Visibility",Response=ECR_Block)))
+
+; NPC enemy — blocks weapons and pawns
++Profiles=(Name="EnemyPawn",CollisionEnabled=QueryAndPhysics,ObjectTypeName="Pawn",CustomResponses=(\
+    (Channel="WorldStatic",Response=ECR_Block),\
+    (Channel="WorldDynamic",Response=ECR_Block),\
+    (Channel="Pawn",Response=ECR_Block),\
+    (Channel="Weapon",Response=ECR_Block),\
+    (Channel="Interaction",Response=ECR_Ignore),\
+    (Channel="Camera",Response=ECR_Ignore)))
+```
+
+---
+
+## Applying Profiles in C++
+
+```cpp
+// Apply a named profile — sets ObjectType, CollisionEnabled, and all channel responses at once
+MyMesh->SetCollisionProfileName(TEXT("PlayerPawn"));
+MyMesh->SetCollisionProfileName(TEXT("Projectile"));
+MyMesh->SetCollisionProfileName(TEXT("NoCollision"));
+
+// Get the current profile name
+FName ProfileName = MyMesh->GetCollisionProfileName();
+
+// Override individual channel responses after setting a profile
+MyMesh->SetCollisionResponseToChannel(ECC_Camera, ECR_Ignore);
+```
+
+---
+
+## Referencing Custom Channels in C++
+
+Custom trace channels map to `ETraceTypeQuery` for Blueprint functions and `ECollisionChannel` for C++ world queries.
+
+```cpp
+// Use the generated enum values — confirmed by checking Project Settings > Collision
+// ECC_GameTraceChannel1 = "Weapon" (in our setup)
+// ECC_GameTraceChannel2 = "Interaction"
+
+FHitResult Hit;
+FCollisionQueryParams Params;
+Params.AddIgnoredActor(this);
+
+// Weapon trace — using ECC directly
+GetWorld()->LineTraceSingleByChannel(Hit, Start, End, ECC_GameTraceChannel1, Params);
+
+// Interaction trace
+GetWorld()->LineTraceSingleByChannel(Hit, Start, End, ECC_GameTraceChannel2, Params);
+
+// Interaction trace by object type (finds Interactable objects)
+FCollisionObjectQueryParams ObjectParams;
+ObjectParams.AddObjectTypesToQuery(ECC_GameTraceChannel3); // Interactable type
+GetWorld()->LineTraceSingleByObjectType(Hit, Start, End, ObjectParams, Params);
+```
+
+---
+
+## ECollisionEnabled Quick Reference
+
+| Value              | Query (Traces) | Physics (Forces/Sweep) | Typical Use                     |
+|--------------------|---------------|------------------------|---------------------------------|
+| `NoCollision`      | No            | No                     | Ghost/invisible actors          |
+| `QueryOnly`        | Yes           | No                     | Trigger volumes, sensors        |
+| `PhysicsOnly`      | No            | Yes                    | Invisible physics blockers      |
+| `QueryAndPhysics`  | Yes           | Yes                    | Most gameplay objects           |
+| `ProbeOnly`        | Probe only    | No                     | Contact data only (no query hits, no physics forces) |
+
+---
+
+## Physics Settings (Project Settings > Physics)
+
+These values live in `Config/DefaultEngine.ini` under `[/Script/Engine.PhysicsSettings]` and map to `UPhysicsSettingsCore`:
+
+```ini
+[/Script/Engine.PhysicsSettings]
+DefaultGravityZ=-980.000000
+BounceThresholdVelocity=200.000000
+FrictionCombineMode=Average
+RestitutionCombineMode=Average
+MaxAngularVelocity=3600.000000
+MaxDepenetrationVelocity=0.000000
+ContactOffsetMultiplier=0.020000
+MinContactOffset=2.000000
+MaxContactOffset=8.000000
+bSimulateSkeletalMeshOnDedicatedServer=True
+DefaultShapeComplexity=CTF_UseDefault
+```
+
+`DefaultShapeComplexity` accepts: `CTF_UseDefault`, `CTF_UseSimpleAndComplex`, `CTF_UseSimpleAsComplex`, `CTF_UseComplexAsSimple`.
+
+---
+
+## Collision Setup Checklist
+
+When collision is not working as expected, verify in order:
+
+1. **Both components have collision enabled** — `GetCollisionEnabled() != NoCollision`
+2. **Response matrix is symmetric** — if A blocks B, B must block A for events
+3. **Profile vs manual responses** — `SetCollisionProfileName` resets all manual responses; set per-channel overrides after the profile call
+4. **Overlap events flag** — `bGenerateOverlapEvents` must be `true` on BOTH components for overlap events
+5. **Hit events flag** — `bNotifyRigidBodyCollision` must be `true` for `OnComponentHit` to fire
+6. **Physics enabled** — `bSimulatePhysics = true` required for physics-driven hits (`NormalImpulse` will be non-zero)
+7. **Channel type** — trace channels vs object type channels use different query functions; mixing them gives no results
+8. **Query layer** — `QueryOnly` components are invisible to physics-only queries and vice versa
+
+--- REFERENCE: trace-patterns.md ---
+# Trace Patterns Reference
+
+Common trace query patterns for gameplay mechanics in Unreal Engine 5. All patterns use the C++ world query API (`UWorld::LineTraceSingleByChannel` etc.) with `FCollisionQueryParams`. For Blueprint-callable wrappers with built-in debug drawing, see `UKismetSystemLibrary`.
+
+---
+
+## Pattern 1: Hitscan Weapon
+
+Single line trace from camera or muzzle, returning the first blocking hit. Reports impact point, surface normal, hit actor, and physical surface type for decal/sound selection.
+
+```cpp
+// MyWeaponComponent.h
+UFUNCTION()
+void FireHitscan(const FVector& MuzzleLocation, const FVector& AimDirection, float Range);
+
+// MyWeaponComponent.cpp
+void UMyWeaponComponent::FireHitscan(const FVector& MuzzleLocation,
+                                      const FVector& AimDirection,
+                                      float Range)
+{
+    const FVector TraceStart = MuzzleLocation;
+    const FVector TraceEnd   = MuzzleLocation + AimDirection * Range;
+
+    FCollisionQueryParams Params;
+    Params.TraceTag          = TEXT("WeaponTrace");
+    Params.bTraceComplex     = false;              // simple hull — sufficient for shooting
+    Params.bReturnPhysicalMaterial = true;         // needed for surface type
+    Params.AddIgnoredActor(GetOwner());            // don't hit self
+
+    FHitResult Hit;
+    const bool bHit = GetWorld()->LineTraceSingleByChannel(
+        Hit,
+        TraceStart,
+        TraceEnd,
+        ECC_GameTraceChannel1, // "Weapon" channel
+        Params
+    );
+
+    if (bHit)
+    {
+        // Impact data
+        const FVector  ImpactPoint  = Hit.ImpactPoint;
+        const FVector  ImpactNormal = Hit.ImpactNormal;
+        AActor*        HitActor     = Hit.GetActor();
+
+        // Surface type for decal / sound selection
+        EPhysicalSurface Surface = SurfaceType_Default;
+        if (UPhysicalMaterial* PhysMat = Hit.PhysMaterial.Get())
+        {
+            Surface = UPhysicalMaterial::DetermineSurfaceType(PhysMat);
+        }
+
+        // Apply damage
+        if (HitActor)
+        {
+            FPointDamageEvent DamageEvent(DamageAmount, Hit, AimDirection, DamageTypeClass);
+            HitActor->TakeDamage(DamageAmount, DamageEvent, GetOwner()->GetInstigatorController(), GetOwner());
+        }
+    }
+
+    // Debug draw (editor/development only)
+#if ENABLE_DRAW_DEBUG
+    DrawDebugLine(GetWorld(), TraceStart, bHit ? Hit.ImpactPoint : TraceEnd,
+                  FColor::Red, false, 1.f, 0, 1.f);
+    if (bHit) DrawDebugSphere(GetWorld(), Hit.ImpactPoint, 5.f, 8, FColor::Green, false, 1.f);
+#endif
+}
+```
+
+---
+
+## Pattern 2: Melee Attack — Sphere Sweep
+
+Sweeps a sphere along an arc for melee hit detection. Captures multiple targets in one call with `SweepMultiByChannel`. Avoids hitting the same actor twice.
+
+```cpp
+void UMeleeComponent::PerformMeleeSwing(const FVector& SwingStart,
+                                         const FVector& SwingEnd,
+                                         float AttackRadius)
+{
+    FCollisionShape Sphere = FCollisionShape::MakeSphere(AttackRadius);
+
+    FCollisionQueryParams Params;
+    Params.bTraceComplex = false;
+    Params.AddIgnoredActor(GetOwner());
+
+    TArray<FHitResult> Hits;
+    const bool bAnyHit = GetWorld()->SweepMultiByChannel(
+        Hits,
+        SwingStart,
+        SwingEnd,
+        FQuat::Identity,
+        ECC_Pawn,        // "Pawn" channel — hits characters and pawns
+        Sphere,
+        Params
+    );
+
+    // Deduplicate actors (sweep may return multiple hits per actor)
+    TSet<AActor*> DamagedActors;
+    for (const FHitResult& Hit : Hits)
+    {
+        AActor* HitActor = Hit.GetActor();
+        if (HitActor && !DamagedActors.Contains(HitActor))
+        {
+            DamagedActors.Add(HitActor);
+            HitActor->TakeDamage(MeleeDamage,
+                                  FDamageEvent(),
+                                  GetOwner()->GetInstigatorController(),
+                                  GetOwner());
+        }
+    }
+
+#if ENABLE_DRAW_DEBUG
+    DrawDebugSphere(GetWorld(), SwingEnd, AttackRadius, 12, FColor::Orange, false, 0.5f);
+#endif
+}
+```
+
+---
+
+## Pattern 3: Interaction / Use — Line Trace from Camera
+
+Player looks at an object and presses interact. Uses a trace channel dedicated to interaction so non-interactable geometry is filtered automatically by the Interactable object type's channel response.
+
+```cpp
+// In PlayerController or Character
+
+void AMyCharacter::TryInteract()
+{
+    APlayerController* PC = Cast<APlayerController>(GetController());
+    if (!PC) return;
+
+    FVector CameraLocation;
+    FRotator CameraRotation;
+    PC->GetPlayerViewPoint(CameraLocation, CameraRotation);
+
+    const FVector TraceStart = CameraLocation;
+    const FVector TraceEnd   = CameraLocation + CameraRotation.Vector() * InteractRange;
+
+    FCollisionQueryParams Params;
+    Params.AddIgnoredActor(this);
+
+    FHitResult Hit;
+    // Use object type query to find only Interactable objects
+    FCollisionObjectQueryParams ObjectParams;
+    ObjectParams.AddObjectTypesToQuery(ECC_GameTraceChannel3); // "Interactable" type
+
+    const bool bHit = GetWorld()->LineTraceSingleByObjectType(
+        Hit, TraceStart, TraceEnd, ObjectParams, Params
+    );
+
+    if (bHit)
+    {
+        if (AActor* HitActor = Hit.GetActor())
+        {
+            if (HitActor->GetClass()->ImplementsInterface(UInteractableInterface::StaticClass()))
+            {
+                IInteractableInterface::Execute_Interact(HitActor, this);
+            }
+        }
+    }
+}
+```
+
+---
+
+## Pattern 4: Ground Detection / IsGrounded
+
+Character or physics object checks whether it is on the ground. Uses a short downward line trace against WorldStatic and WorldDynamic. Common for jump/fall logic without relying on `CharacterMovementComponent`.
+
+```cpp
+bool UMyMovementComponent::IsGrounded() const
+{
+    const FVector Start = GetOwner()->GetActorLocation();
+    const FVector End   = Start + FVector::DownVector * (GroundCheckDistance + CapsuleHalfHeight);
+
+    FCollisionQueryParams Params;
+    Params.bTraceComplex = false;
+    Params.AddIgnoredActor(GetOwner());
+
+    FHitResult Hit;
+    const bool bHit = GetWorld()->LineTraceSingleByChannel(
+        Hit,
+        Start,
+        End,
+        ECC_Visibility,
+        Params
+    );
+
+    return bHit && Hit.bBlockingHit;
+}
+
+// Slope normal — for movement alignment or sliding
+FVector UMyMovementComponent::GetGroundNormal() const
+{
+    FHitResult Hit;
+    const FVector Start = GetOwner()->GetActorLocation();
+    const FVector End   = Start - FVector::UpVector * (GroundCheckDistance + CapsuleHalfHeight);
+
+    FCollisionQueryParams Params;
+    Params.bTraceComplex = false;
+    Params.AddIgnoredActor(GetOwner());
+
+    if (GetWorld()->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params))
+    {
+        return Hit.ImpactNormal;
+    }
+    return FVector::UpVector;
+}
+```
+
+---
+
+## Pattern 5: Explosion Area-of-Effect — Sphere Overlap
+
+Instant radial check at detonation point. Finds all Pawns and PhysicsBodies within radius. Applies damage with falloff.
+
+```cpp
+void AExplosiveActor::Detonate(const FVector& ExplosionCenter, float Radius, float MaxDamage)
+{
+    FCollisionShape Sphere = FCollisionShape::MakeSphere(Radius);
+
+    FCollisionObjectQueryParams ObjectParams;
+    ObjectParams.AddObjectTypesToQuery(ECC_Pawn);
+    ObjectParams.AddObjectTypesToQuery(ECC_PhysicsBody);
+    ObjectParams.AddObjectTypesToQuery(ECC_WorldDynamic);
+
+    FCollisionQueryParams Params;
+    Params.AddIgnoredActor(this);
+
+    TArray<FOverlapResult> Overlaps;
+    GetWorld()->OverlapMultiByObjectType(
+        Overlaps,
+        ExplosionCenter,
+        FQuat::Identity,
+        ObjectParams,
+        Sphere,
+        Params
+    );
+
+    TSet<AActor*> DamagedActors;
+    for (const FOverlapResult& Result : Overlaps)
+    {
+        AActor* Actor = Result.GetActor();
+        if (!Actor || DamagedActors.Contains(Actor)) continue;
+        DamagedActors.Add(Actor);
+
+        // Line of sight check — don't damage through walls
+        FHitResult LOSHit;
+        FCollisionQueryParams LOSParams;
+        LOSParams.AddIgnoredActor(this);
+        LOSParams.AddIgnoredActor(Actor);
+
+        const FVector ActorCenter = Actor->GetActorLocation();
+        const bool bBlocked = GetWorld()->LineTraceSingleByChannel(
+            LOSHit, ExplosionCenter, ActorCenter, ECC_Visibility, LOSParams
+        );
+        if (bBlocked) continue; // wall between explosion and target
+
+        // Damage falloff (linear)
+        const float Distance  = FVector::Dist(ExplosionCenter, ActorCenter);
+        const float Falloff   = FMath::Clamp(1.f - (Distance / Radius), 0.f, 1.f);
+        const float Damage    = MaxDamage * Falloff;
+
+        FRadialDamageEvent DmgEvent;
+        DmgEvent.Params    = FRadialDamageParams(MaxDamage, 0.f, Radius, Radius, 1.f);
+        DmgEvent.Origin    = ExplosionCenter;
+        // FOverlapResult has no ToHitResult() — build FHitResult manually
+        FHitResult ComponentHit(Result.GetActor(), Result.GetComponent(), ActorCenter, FVector::ZeroVector);
+        DmgEvent.ComponentHits.Add(ComponentHit);
+
+        Actor->TakeDamage(Damage, DmgEvent, GetInstigatorController(), this);
+
+        // Radial impulse on physics bodies
+        if (UPrimitiveComponent* PrimComp = Result.GetComponent())
+        {
+            if (PrimComp->IsSimulatingPhysics())
+            {
+                PrimComp->AddRadialImpulse(ExplosionCenter, Radius, ImpulseStrength,
+                                            RIF_Linear, false);
+            }
+        }
+    }
+
+#if ENABLE_DRAW_DEBUG
+    DrawDebugSphere(GetWorld(), ExplosionCenter, Radius, 16, FColor::Orange, false, 2.f);
+#endif
+}
+```
+
+---
+
+## Pattern 6: Camera Line-of-Sight Check
+
+Test whether a target actor is visible from the camera position, blocked by world geometry. Common for AI perception fallback or UI visibility indicators.
+
+```cpp
+bool AMyAIController::HasLineOfSightTo(AActor* Target) const
+{
+    if (!Target) return false;
+
+    APawn* ControlledPawn = GetPawn();
+    if (!ControlledPawn) return false;
+
+    const FVector EyeLocation = ControlledPawn->GetPawnViewLocation();
+    const FVector TargetLocation = Target->GetActorLocation();
+
+    FCollisionQueryParams Params;
+    Params.bTraceComplex  = false;
+    Params.AddIgnoredActor(ControlledPawn);
+    Params.AddIgnoredActor(Target);
+
+    FHitResult Hit;
+    const bool bBlocked = GetWorld()->LineTraceSingleByChannel(
+        Hit,
+        EyeLocation,
+        TargetLocation,
+        ECC_Visibility,
+        Params
+    );
+
+    return !bBlocked; // no blocking hit means clear line of sight
+}
+```
+
+---
+
+## Pattern 7: Capsule Sweep for Character Movement Check
+
+Before moving a character or vehicle to a new position, sweep a capsule to detect blocking geometry. Returns the first blocking hit to adjust the path.
+
+```cpp
+bool UMyMovementComponent::CanMoveToLocation(const FVector& TargetLocation) const
+{
+    const FVector CurrentLocation = GetOwner()->GetActorLocation();
+
+    // Capsule matching the character's collision: radius 34, half-height 88 (standard UE character)
+    FCollisionShape Capsule = FCollisionShape::MakeCapsule(34.f, 88.f);
+
+    FCollisionQueryParams Params;
+    Params.bTraceComplex  = false;
+    Params.AddIgnoredActor(GetOwner());
+
+    FHitResult Hit;
+    const bool bHit = GetWorld()->SweepSingleByChannel(
+        Hit,
+        CurrentLocation,
+        TargetLocation,
+        FQuat::Identity,
+        ECC_Pawn,
+        Capsule,
+        Params
+    );
+
+    if (bHit)
+    {
+        // Hit.Distance tells us how far we can actually move
+        // Hit.ImpactNormal tells us the blocking surface orientation
+        return false;
+    }
+
+    return true;
+}
+```
+
+---
+
+## Pattern 8: Async Trace for High-Frequency Sensors
+
+For sensors that fire every frame on many actors (AI perception, grass interaction, liquid detection), synchronous traces stall the game thread. Use async traces queued this frame and read next frame.
+
+```cpp
+// .h
+FTraceHandle PendingTraceHandle;
+bool         bHasPendingTrace = false;
+
+// .cpp — in Tick or timer callback
+
+void UMySensorComponent::TickComponent(float DeltaTime, ELevelTick TickType,
+                                        FActorComponentTickFunction* TickFunc)
+{
+    Super::TickComponent(DeltaTime, TickType, TickFunc);
+
+    // Read result from last frame's trace
+    if (bHasPendingTrace)
+    {
+        FTraceDatum Datum;
+        if (GetWorld()->QueryTraceData(PendingTraceHandle, Datum))
+        {
+            bHasPendingTrace = false;
+            if (Datum.OutHits.Num() > 0 && Datum.OutHits[0].bBlockingHit)
+            {
+                OnSensorHit(Datum.OutHits[0]);
+            }
+        }
+    }
+
+    // Queue this frame's trace (result readable next frame)
+    if (!bHasPendingTrace)
+    {
+        FCollisionQueryParams Params;
+        Params.AddIgnoredActor(GetOwner());
+
+        const FVector Start = GetComponentLocation();
+        const FVector End   = Start + GetForwardVector() * SensorRange;
+
+        PendingTraceHandle = GetWorld()->AsyncLineTraceByChannel(
+            EAsyncTraceType::Single,
+            Start,
+            End,
+            ECC_Visibility,
+            Params
+        );
+        bHasPendingTrace = true;
+    }
+}
+```
+
+---
+
+## FCollisionQueryParams Quick Reference
+
+```cpp
+FCollisionQueryParams Params(
+    TEXT("TraceName"),    // tag for profiling / debug drawing
+    false,                // bTraceComplex — true for per-poly, false for simple hull
+    GetOwner()            // actor to ignore (optional convenience constructor arg)
+);
+
+Params.bReturnPhysicalMaterial = true;  // populate Hit.PhysMaterial (slight cost)
+Params.bReturnFaceIndex        = false; // populate Hit.FaceIndex (expensive, rarely needed)
+Params.bFindInitialOverlaps    = true;  // report overlapping hits at Start position
+Params.MobilityType = EQueryMobilityType::Any; // Any, Static, Dynamic
+
+// Ignore specific actors or components
+Params.AddIgnoredActor(SomeActor);
+Params.AddIgnoredActors(ArrayOfActors);
+Params.AddIgnoredComponent(SomeComponent);
+```
+
+---
+
+## FCollisionShape Quick Reference
+
+All shapes from `CollisionShape.h`:
+
+```cpp
+// Line — default, no volume (same as calling LineTrace functions directly)
+FCollisionShape Line; // default constructor
+
+// Sphere
+FCollisionShape Sphere = FCollisionShape::MakeSphere(50.f); // radius in cm
+
+// Box (axis-aligned, rotated by the Rotation parameter in sweep calls)
+FCollisionShape Box = FCollisionShape::MakeBox(FVector(50.f, 30.f, 80.f)); // half-extents
+
+// Capsule — HalfHeight includes the sphere radius at each end
+FCollisionShape Capsule = FCollisionShape::MakeCapsule(34.f, 88.f);
+// Capsule shaft half-length = HalfHeight - Radius = 88 - 34 = 54 cm
+
+// Shape introspection
+bool bSphere  = Sphere.IsSphere();
+float Radius  = Sphere.GetSphereRadius();
+float CHH     = Capsule.GetCapsuleHalfHeight();         // full half-height
+float CAxisHL = Capsule.GetCapsuleAxisHalfLength();     // shaft only (HalfHeight - Radius)
+FVector Ext   = Box.GetBox();                           // returns half-extents as FVector
+```
+
+---
+
+## EDrawDebugTrace Reference (UKismetSystemLibrary)
+
+```cpp
+EDrawDebugTrace::None         // No debug drawing
+EDrawDebugTrace::ForOneFrame  // Draw for one frame only
+EDrawDebugTrace::ForDuration  // Draw for specified duration (DrawTime parameter)
+EDrawDebugTrace::Persistent   // Draw until explicitly cleared
+```
+
+---
+
+## Trace Performance Guidelines
+
+| Technique | CPU cost | Use case |
+|-----------|----------|----------|
+| `LineTraceSingleByChannel` | Low | Shooting, interaction, simple AOS |
+| `LineTraceMultiByChannel` | Medium | Penetration, multi-target beams |
+| `SweepSingleByChannel` | Medium | Movement, precise melee |
+| `SweepMultiByChannel` | Medium–High | Melee arc, projectile sweeping |
+| `OverlapMultiByObjectType` | Medium | AoE, proximity detection |
+| Complex collision (`bTraceComplex=true`) | High (4–10x) | Only when triangle accuracy needed |
+| Async trace | Low (deferred) | Sensors, AI, effects polling >5 actors per frame |
+
+**General rules:**
+- Never run complex collision traces every tick for more than a handful of actors.
+- Prefer `SweepSingle` over `SweepMulti` when only the first hit matters.
+- Use `OverlapMultiByObjectType` for AoE — it is cheaper than multi-sweep for static positions.
+- Group traces using `AsyncLineTraceByChannel` for sensors and background detection.
+- Throttle non-critical traces with timers (5–10 Hz is sufficient for most AI awareness checks).
+

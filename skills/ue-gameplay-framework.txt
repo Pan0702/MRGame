@@ -1,0 +1,686 @@
+# SKILL: ue-gameplay-framework
+
+---
+name: ue-gameplay-framework
+description: "Use this skill when working with Unreal Engine's gameplay framework classes: GameMode, GameState, PlayerController, PlayerState, Pawn, Character, or GameInstance. Also use when the user mentions 'gameplay framework', 'game rules', 'player management', 'match flow', or 'player spawning'. See references/framework-class-map.md for the full authority/presence matrix. For networking/replication, see ue-networking-replication. For input setup, see ue-input-system."
+metadata:
+  version: 1.0.0
+---
+
+# UE Gameplay Framework
+
+You are an expert in Unreal Engine's gameplay framework architecture.
+
+## Context Check
+
+Read `.agents/ue-project-context.md` before proceeding. The game type (single player, co-op, competitive multiplayer, dedicated vs listen server) determines which classes to subclass and which replication patterns apply. Resolve: single-player or multiplayer? Dedicated or listen server? What are you implementing?
+
+---
+
+## Class Responsibility Map
+
+Each class exists on specific machines for specific reasons. Getting this wrong is the primary source of multiplayer bugs.
+
+### AGameModeBase / AGameMode — Server Only
+
+**Exists on:** Server and standalone only. Never instantiated on clients.
+
+**Why server-only:** GameMode is the authoritative referee. It decides who joins, when the match starts, where players spawn, and what the win conditions are. Client execution would allow cheating via local state manipulation.
+
+**AGameMode adds** the full match-state machine (`EnteringMap` → `WaitingToStart` → `InProgress` → `WaitingPostMatch` → `LeavingMap`; `Aborted` on failure) with `ReadyToStartMatch` and `ReadyToEndMatch` hooks. Use `AGameModeBase` for lobby/simple games, `AGameMode` for match flow.
+
+**Key API from source (GameModeBase.h):**
+```cpp
+// Class assignments — set in constructor
+TSubclassOf<APawn>             DefaultPawnClass;
+TSubclassOf<AGameStateBase>    GameStateClass;
+TSubclassOf<APlayerController> PlayerControllerClass;
+TSubclassOf<APlayerState>      PlayerStateClass;
+TSubclassOf<AHUD>              HUDClass;
+uint32                         bUseSeamlessTravel : 1;
+
+// Server startup and player join lifecycle (server only)
+virtual void InitGame(const FString& MapName, const FString& Options, FString& ErrorMessage);
+virtual void PreLogin(const FString& Options, const FString& Address,
+    const FUniqueNetIdRepl& UniqueId, FString& ErrorMessage);
+virtual APlayerController* Login(UPlayer* NewPlayer, ENetRole InRemoteRole,
+    const FString& Portal, const FString& Options,
+    const FUniqueNetIdRepl& UniqueId, FString& ErrorMessage);
+virtual void PostLogin(APlayerController* NewPlayer);   // first safe point for RPCs (DispatchPostLogin deprecated 5.6 — override PostLogin directly)
+virtual void Logout(AController* Exiting);
+virtual void HandleStartingNewPlayer(APlayerController* NewPlayer);
+
+// Spawn pipeline
+virtual AActor* FindPlayerStart(AController* Player, const FString& IncomingName = TEXT(""));
+virtual void    RestartPlayer(AController* NewPlayer);
+virtual APawn*  SpawnDefaultPawnFor(AController* NewPlayer, AActor* StartSpot);
+
+// Travel
+virtual void ProcessServerTravel(const FString& URL, bool bAbsolute = false);
+virtual void GetSeamlessTravelActorList(bool bToTransition, TArray<AActor*>& ActorList);
+```
+
+---
+
+### AGameStateBase / AGameState — Server + All Clients
+
+**Exists on:** Everywhere. Fully replicated.
+
+**Why everywhere:** Clients cannot read GameMode (it does not exist on them). Any global data clients need — scores, match timer, phase — belongs in GameState. `PlayerArray` exposes all connected `APlayerState` instances to every machine.
+
+**Key API from source (GameStateBase.h):**
+```cpp
+// All PlayerStates, always replicated
+UPROPERTY(Transient, BlueprintReadOnly)
+TArray<TObjectPtr<APlayerState>> PlayerArray;
+
+// The GameMode class (not instance) replicated to clients
+UPROPERTY(Transient, BlueprintReadOnly, ReplicatedUsing=OnRep_GameModeClass)
+TSubclassOf<AGameModeBase> GameModeClass;
+
+// Server-authoritative clock, automatically synced
+virtual double GetServerWorldTimeSeconds() const;
+virtual bool   HasBegunPlay() const;
+virtual bool   HasMatchStarted() const;
+virtual bool   HasMatchEnded() const;
+```
+
+**Custom replicated match data:**
+```cpp
+UCLASS()
+class AMyGameState : public AGameStateBase
+{
+    GENERATED_BODY()
+public:
+    UPROPERTY(Replicated, BlueprintReadOnly) int32 TeamAScore;
+    UPROPERTY(Replicated, BlueprintReadOnly) int32 TeamBScore;
+    UPROPERTY(ReplicatedUsing=OnRep_MatchTimer) float MatchTimeRemaining;
+
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+};
+
+void AMyGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME(AMyGameState, TeamAScore);
+    DOREPLIFETIME(AMyGameState, TeamBScore);
+    DOREPLIFETIME(AMyGameState, MatchTimeRemaining);
+}
+```
+
+---
+
+### APlayerController — Server (all) + Owning Client (own only)
+
+**Exists on:** Server holds one per connected player. Each client holds only its own. Remote clients do not see other players' PlayerControllers.
+
+**Why this split:** The PlayerController bridges one human to the server. Both ends run it for client-side prediction and server validation. A client has no reason to know another player's input state.
+
+**Key API from source (PlayerController.h):**
+```cpp
+TObjectPtr<APlayerCameraManager> PlayerCameraManager;  // camera, local only
+TObjectPtr<APawn>                AcknowledgedPawn;      // server-confirmed possession
+TObjectPtr<AHUD>                 MyHUD;                 // local only
+
+uint32 bShowMouseCursor : 1;
+uint32 bEnableStreamingSource : 1;  // drives World Partition loading for this viewport
+
+void SetInputMode(const FInputModeDataBase& InData); // FInputModeGameOnly, UIOnly, GameAndUI
+virtual void PlayerTick(float DeltaTime);            // only ticked locally
+virtual void SetupInputComponent() override;
+```
+
+**`SetupInputComponent` on PlayerController** is for non-pawn input: spectator actions, UI shortcuts, or global keybinds that persist across possession changes. For pawn-specific input, override `APawn::SetupPlayerInputComponent()` instead — see `ue-input-system`.
+
+**Enhanced Input setup:**
+```cpp
+void AMyPlayerController::BeginPlay()
+{
+    Super::BeginPlay();
+    if (IsLocalController())
+    {
+        if (auto* Sub = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(GetLocalPlayer()))
+            Sub->AddMappingContext(DefaultMappingContext, 0);
+        SetInputMode(FInputModeGameOnly());
+    }
+}
+```
+
+**RPC patterns:**
+```cpp
+UFUNCTION(Server, Reliable, WithValidation) void ServerRequestRespawn();   // client → server
+UFUNCTION(Client, Reliable)                void ClientNotifyMatchStart();  // server → client
+```
+
+**Possess/UnPossess (server-authority required):**
+```cpp
+// Take control of a new pawn — must run on server
+PlayerController->Possess(NewPawn);
+// Release the currently possessed pawn
+PlayerController->UnPossess();
+```
+
+**Listen-server dual-role:** On a listen server, the host's PlayerController is both `ROLE_Authority` and locally controlled. Guard dual-role logic with `IsLocalController()` checks. This is a common source of bugs where code assumes authority implies non-local (i.e., code written for dedicated servers runs incorrectly on a listen server host).
+
+**ClientTravel — connect this client to a different server:**
+```cpp
+PlayerController->ClientTravel(TEXT("127.0.0.1:7777"), TRAVEL_Absolute);
+```
+
+**ServerTravel — move all players to a new map (called from GameMode, server only):**
+```cpp
+GetWorld()->ServerTravel(TEXT("/Game/Maps/NewMap?listen"));
+```
+
+---
+
+### AController — Shared Base
+
+`AController` is the base class for both `APlayerController` and `AAIController`. It owns the pawn possession interface (`Possess`, `UnPossess`, `GetPawn`) and the rotation used to drive pawn orientation (`ControlRotation`). Subclass `APlayerController` for human players and `AAIController` for AI.
+
+---
+
+### APlayerState — Server + All Clients (Always Relevant)
+
+**Exists on:** Server and all clients. Marked always-relevant so it replicates to everyone regardless of distance.
+
+**Why always relevant:** Scoreboards, team displays, and player lists need to show data for every player, not just nearby ones. PlayerState survives pawn death — when a pawn is destroyed and respawned, the PlayerController keeps its PlayerState, preserving accumulated stats.
+
+```cpp
+UCLASS()
+class AMyPlayerState : public APlayerState
+{
+    GENERATED_BODY()
+public:
+    UPROPERTY(Replicated, BlueprintReadOnly) int32 Kills;
+    UPROPERTY(Replicated, BlueprintReadOnly) int32 Deaths;
+    UPROPERTY(ReplicatedUsing=OnRep_Team)   uint8 TeamIndex;
+};
+
+// Access patterns
+APlayerState* PS = MyPawn->GetPlayerState();
+APlayerState* PS = MyPC->PlayerState;
+for (APlayerState* PS : GetGameState<AGameStateBase>()->PlayerArray) { /* all players */ }
+```
+
+---
+
+### APawn — Server + All Clients (Replicated)
+
+**Exists on:** Server (authority) and all clients (simulated or autonomous proxy). Minimal base — no mesh, no collision component, no movement component.
+
+**Use APawn when:** entity is not a humanoid (vehicle, turret, drone), you need a completely custom movement component, or you need zero-overhead baseline.
+
+```cpp
+// Minimal subclass pattern
+virtual void SetupPlayerInputComponent(UInputComponent* PlayerInputComponent) override;
+virtual void PossessedBy(AController* NewController) override;
+virtual void UnPossessed() override;
+```
+
+`ADefaultPawn` is the engine's built-in pawn with floating movement (no gravity) and a sphere collision root. It is used as the `DefaultPawnClass` placeholder when no custom pawn is assigned.
+
+---
+
+### ACharacter — Server + All Clients (Replicated with Prediction)
+
+**Exists on:** Server (authority) and all clients. The locally controlled instance runs client-side prediction; simulated proxies interpolate from server updates.
+
+**Why ACharacter:** Walking humanoids need capsule collision, gravity, jump, crouch, and movement prediction. ACharacter bundles all of this with built-in networked prediction via `UCharacterMovementComponent`.
+
+**Component layout from source (Character.h):**
+```cpp
+// Private, access via getters
+TObjectPtr<UCapsuleComponent>          CapsuleComponent;    // GetCapsuleComponent() — root
+TObjectPtr<USkeletalMeshComponent>     Mesh;                // GetMesh()
+TObjectPtr<UCharacterMovementComponent> CharacterMovement;  // GetCharacterMovement()
+TObjectPtr<UArrowComponent>            ArrowComponent;      // GetArrowComponent() — editor-only direction indicator
+```
+
+**Constructor configuration:**
+```cpp
+AMyCharacter::AMyCharacter()
+{
+    GetCapsuleComponent()->SetCapsuleHalfHeight(96.f);
+    GetCapsuleComponent()->SetCapsuleRadius(42.f);
+    GetMesh()->SetRelativeLocation(FVector(0.f, 0.f, -97.f));
+    GetMesh()->SetRelativeRotation(FRotator(0.f, -90.f, 0.f));
+
+    GetCharacterMovement()->MaxWalkSpeed = 600.f;
+    GetCharacterMovement()->JumpZVelocity = 700.f;
+    GetCharacterMovement()->GravityScale = 1.75f;
+    GetCharacterMovement()->AirControl = 0.35f;
+    GetCharacterMovement()->NavAgentProps.bCanCrouch = true;
+}
+```
+
+**Key ACharacter API from source:**
+```cpp
+// Jump — from Character.h
+virtual void Jump();          // set bPressedJump, triggers on next tick
+virtual void StopJumping();   // clear bPressedJump
+bool CanJump() const;
+
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Replicated) float JumpMaxHoldTime; // variable height
+UPROPERTY(EditAnywhere, BlueprintReadWrite, Replicated) int32 JumpMaxCount;    // double jump
+
+virtual void LaunchCharacter(FVector LaunchVelocity, bool bXYOverride, bool bZOverride);
+
+// Crouch
+void Crouch(bool bClientSimulation = false);   // requests crouch via CharacterMovementComponent
+void UnCrouch(bool bClientSimulation = false);
+UPROPERTY(BlueprintReadOnly, ReplicatedUsing=OnRep_IsCrouched) uint8 bIsCrouched : 1;
+
+// Movement mode
+// MOVE_Walking, MOVE_Falling, MOVE_Swimming, MOVE_Flying, MOVE_Custom
+GetCharacterMovement()->SetMovementMode(MOVE_Flying);
+```
+
+**Custom movement modes:** Set `MOVE_Custom` then override `PhysCustom(float deltaTime, int32 Iterations)` in your `UCharacterMovementComponent` subclass. The `CustomMovementMode` byte lets you distinguish multiple custom modes within the same `PhysCustom` dispatch.
+
+```cpp
+// Custom movement mode: override in CMC subclass
+void UMyCharacterMovement::PhysCustom(float DeltaTime, int32 Iterations)
+{
+    if (CustomMovementMode == (uint8)ECustomMovement::Flying)
+    {
+        // Custom flying physics here
+        Velocity.Z += GetGravityZ() * DeltaTime;
+    }
+    Super::PhysCustom(DeltaTime, Iterations);
+}
+// Activate: CharMoveComp->SetMovementMode(MOVE_Custom, (uint8)ECustomMovement::Flying);
+```
+
+**Movement replication:** Client sends `ServerMovePacked`, server validates and replies via `ClientMoveResponsePacked`. This is automatic — do not call these RPCs manually.
+
+---
+
+### UGameInstance — Process Lifetime Singleton
+
+**Exists on:** One per process. Survives ALL level loads.
+
+**Why:** On level travel, every actor (including GameMode, GameState, PlayerController, PlayerState) is destroyed. GameInstance is never destroyed. It holds session handles, save game references, analytics state, and any data that must span the entire application lifetime.
+
+```cpp
+// Lifecycle overrides
+virtual void Init() override;      // called once at startup; subsystem init, save-game loading
+virtual void OnStart() override;   // called when the instance is ready, after Init
+virtual void Shutdown() override;  // called on application exit
+
+// Access from actor or component
+UMyGameInstance* GI = GetWorld()->GetGameInstance<UMyGameInstance>();
+
+// Subsystems (also survive level travel)
+UMySubsystem* Sub = GetGameInstance()->GetSubsystem<UMySubsystem>();
+```
+
+### Session Management (Online Subsystem)
+
+```cpp
+// Access the Online Subsystem session interface from GameInstance
+IOnlineSubsystem* OSS = IOnlineSubsystem::Get();
+IOnlineSessionPtr Sessions = OSS ? OSS->GetSessionInterface() : nullptr;
+if (!Sessions.IsValid()) return;
+
+// Create session (host)
+FOnlineSessionSettings Settings;
+Settings.bIsLANMatch = false;
+Settings.NumPublicConnections = 4;
+Settings.bShouldAdvertise = true;
+Sessions->OnCreateSessionCompleteDelegates.AddUObject(
+    this, &UMyGameInstance::OnCreateSessionComplete);
+Sessions->CreateSession(0, NAME_GameSession, Settings);
+
+// Find sessions (client)
+TSharedRef<FOnlineSessionSearch> Search = MakeShared<FOnlineSessionSearch>();
+Sessions->OnFindSessionsCompleteDelegates.AddUObject(
+    this, &UMyGameInstance::OnFindSessionsComplete);
+Sessions->FindSessions(0, Search);
+
+// Join a found session
+Sessions->OnJoinSessionCompleteDelegates.AddUObject(
+    this, &UMyGameInstance::OnJoinSessionComplete);
+Sessions->JoinSession(0, NAME_GameSession, Search->SearchResults[0]);
+```
+
+The Online Subsystem abstracts platform-specific backends (Steam, EOS, Null for testing). Add `"OnlineSubsystem"` and `"OnlineSubsystemUtils"` to your Build.cs dependencies. After joining, retrieve the connect string with `GetResolvedConnectString` and call `ClientTravel`.
+
+---
+
+## GameMode: Registration and Spawn Pipeline
+
+```cpp
+AMyGameMode::AMyGameMode()
+{
+    DefaultPawnClass      = AMyCharacter::StaticClass();
+    PlayerControllerClass = AMyPlayerController::StaticClass();
+    GameStateClass        = AMyGameState::StaticClass();
+    PlayerStateClass      = AMyPlayerState::StaticClass();
+    HUDClass              = AMyHUD::StaticClass();
+    bUseSeamlessTravel    = true;
+}
+```
+
+**Join sequence (server only):**
+```
+InitGame()            → called before any player joins; use for map-specific rules init
+PreLogin()            → reject here (server full, banned)
+Login()               → create PlayerController, assign UniqueId
+PostLogin()           → first safe point for server→client RPCs; assign teams here
+HandleStartingNewPlayer() → triggers RestartPlayer()
+RestartPlayer()       → FindPlayerStart() → SpawnDefaultPawnFor() → Possess()
+```
+
+**Match state (AGameMode only):**
+```cpp
+bool AMyGameMode::ReadyToStartMatch_Implementation()
+{
+    return GetNumPlayers() >= MinPlayersToStart;
+}
+bool AMyGameMode::ReadyToEndMatch_Implementation()
+{
+    return GetGameState<AMyGameState>()->TeamAScore >= ScoreLimit;
+}
+```
+
+---
+
+## Travel Patterns
+
+| Pattern | Clients disconnect? | GameMode/GameState survive? | Use when |
+|---|---|---|---|
+| Non-seamless (`ServerTravel`) | Yes, reconnect | No, recreated | Map change with clean slate |
+| Seamless (`bUseSeamlessTravel=true`) | No | No, recreated | Lobby→game, round change |
+
+**Seamless travel survival:**
+- Always: `UGameInstance`, `APlayerController`, `APlayerState`
+- Never: `AGameMode`, `AGameState`, level actors
+- Optional: actors you add in `GetSeamlessTravelActorList()`
+
+---
+
+## Common Mistakes
+
+**GameMode on client (null crash):**
+```cpp
+// WRONG
+GetWorld()->GetAuthGameMode<AMyGameMode>()->EndMatch(); // nullptr on client
+// RIGHT
+if (HasAuthority()) { if (auto* GM = GetWorld()->GetAuthGameMode<AMyGameMode>()) GM->EndMatch(); }
+```
+
+**Wrong class for data:**
+```
+Score visible to all clients  → APlayerState, NOT APlayerController
+Match timer on clients        → AGameState replicated property, NOT AGameMode
+Data surviving level travel   → UGameInstance, NOT AGameState
+Input binding                 → PlayerController or Pawn::SetupPlayerInputComponent, NOT ACharacter body
+```
+
+**AcknowledgedPawn vs GetPawn:**
+`GetPawn()` on a PlayerController may return a pawn before the server confirms possession. Use `AcknowledgedPawn` when you need the server-confirmed pawn.
+
+**Dedicated server guard:**
+```cpp
+if (GetNetMode() != NM_DedicatedServer)
+{
+    // HUD, camera, audio — never run these on dedicated server
+}
+```
+
+**PIE multi-player:** In PIE with multiple players, each has its own PlayerController but all share the same GameMode instance. Test multiplayer logic with PIE > Number of Players set to 2 or more.
+
+---
+
+## Related Skills
+
+- `ue-actor-component-architecture` — actor lifecycle, component tick, attachment
+- `ue-networking-replication` — DOREPLIFETIME conditions, RPC patterns, push model
+- `ue-input-system` — Enhanced Input mapping contexts and input actions
+
+--- REFERENCE: framework-class-map.md ---
+# Gameplay Framework Class Map
+
+Reference table showing where each class lives, who owns it, what it stores, and
+the exact lifecycle hook order. Cross-reference with SKILL.md for code examples.
+
+---
+
+## Authority and Presence Matrix
+
+| Class | Dedicated Server | Listen Server (Host) | Listen Server (Remote Client) | Standalone |
+|---|---|---|---|---|
+| AGameModeBase / AGameMode | YES (authority) | YES (authority) | NO — null | YES (authority) |
+| AGameStateBase / AGameState | YES | YES | YES (replicated) | YES |
+| APlayerController (local player) | N/A | YES (server+client role) | YES (own only) | YES |
+| APlayerController (remote player) | YES (all players) | YES (all players) | NO — not present | N/A |
+| APlayerState (all players) | YES (all) | YES (all) | YES (all, replicated) | YES |
+| APawn / ACharacter (possessed by local) | YES (auth) | YES (auth+local) | YES (local proxy) | YES |
+| APawn / ACharacter (possessed by remote) | YES (auth) | YES (auth) | YES (simulated proxy) | N/A |
+| UGameInstance | YES | YES | YES | YES |
+| AHUD | NO | YES (host player only) | YES (own only) | YES |
+| APlayerCameraManager | NO | YES (host player only) | YES (own only) | YES |
+
+**Key:** "YES (auth)" = exists with `ROLE_Authority`. "YES (simulated proxy)" = exists with `ROLE_SimulatedProxy`, position interpolated from server updates.
+
+---
+
+## Class Ownership Chain
+
+```
+UGameInstance  [persists across all level loads]
+  |
+  +-- UWorld
+        |
+        +-- AGameMode           [server only]
+        |     |
+        |     +-- AGameState    [server + all clients]
+        |           |
+        |           +-- PlayerArray[]  --> APlayerState per player
+        |
+        +-- APlayerController   [server: all; client: own only]
+              |
+              +-- APlayerState  [server + all clients]
+              |
+              +-- AHUD          [local client only]
+              |
+              +-- APlayerCameraManager  [local client only]
+              |
+              +-- (possesses) --> APawn / ACharacter
+                                    |
+                                    +-- UCharacterMovementComponent
+                                    +-- UCapsuleComponent  (root)
+                                    +-- USkeletalMeshComponent
+```
+
+---
+
+## Responsibility Summary
+
+| Class | Primary Responsibility | Do NOT put here |
+|---|---|---|
+| AGameModeBase | Game rules, join approval, player spawn points, match initialization | Any data clients need to read |
+| AGameMode | AGameModeBase + match state machine (WaitingToStart, InProgress, etc.) | Per-player data |
+| AGameStateBase | Global replicated state: server clock, player array, has match started | Server-only logic |
+| AGameState | AGameStateBase + match elapsed time | Client-only UI state |
+| APlayerController | Input, camera, HUD management, possess/unpossess, client↔server RPC bridge | Cross-session data (may be replaced during seamless travel if PC class changes) |
+| APlayerState | Replicated per-player data: name, score, team, ping | Input processing, UI |
+| APawn | Minimal possessable actor, custom movement | Anything requiring capsule/mesh/built-in movement |
+| ACharacter | Humanoid movement with capsule, skeletal mesh, and CMC prediction | Game rules, scoring |
+| UGameInstance | Cross-level persistence: sessions, save game refs, analytics | Per-match state |
+| AHUD | Local-only 2D overlay rendering | Any replicated data |
+
+---
+
+## Player Join Sequence (Server Side)
+
+```
+1. PreLogin(Options, Address, UniqueId, ErrorMessage)
+      Set ErrorMessage != "" to reject.
+
+2. Login(NewPlayer, RemoteRole, Portal, Options, UniqueId, ErrorMessage)
+      Creates APlayerController via SpawnPlayerController().
+      Creates APlayerState, assigns UniqueId and name.
+      Returns new PC (or null on failure).
+
+3. PostLogin(NewPlayer)
+      First point where server-to-client RPCs are safe.
+      GameState->PlayerArray is populated.
+      Override to assign teams, send initial data.
+
+4. HandleStartingNewPlayer(NewPlayer)
+      Calls RestartPlayer() if not spectator.
+
+5. RestartPlayer(NewPlayer)
+      Calls FindPlayerStart() -> ChoosePlayerStart()
+      Calls SpawnDefaultPawnFor()
+      Calls NewPlayer->Possess(Pawn)
+```
+
+---
+
+## Player Logout Sequence
+
+```
+1. Logout(Exiting)            -- GameMode notified (server only)
+2. GameState->RemovePlayerState(PS)  -- PlayerArray updated
+3. PlayerController destroyed
+4. PlayerState destroyed (after ReplicationTimeout or immediately if non-seamless)
+```
+
+---
+
+## Seamless Travel Actor Survival
+
+When `bUseSeamlessTravel = true`, the travel happens in two legs:
+- **Leg 1:** Current map → Transition map
+- **Leg 2:** Transition map → Destination map
+
+`GetSeamlessTravelActorList` is called for BOTH legs.
+
+| Object | Survives Seamless Travel | Notes |
+|---|---|---|
+| UGameInstance | YES | Never dies |
+| APlayerController | YES (transferred) | Engine handles this automatically |
+| APlayerState | YES (transferred with PC) | Engine handles this automatically |
+| AGameMode | NO | New one spawned in destination map |
+| AGameState | NO | New one spawned in destination map |
+| APawn / ACharacter | NO (by default) | Destroyed; new one spawned by RestartPlayer |
+| Custom actors | Optional | Add in GetSeamlessTravelActorList() |
+
+---
+
+## Movement Mode Reference (UCharacterMovementComponent)
+
+| EMovementMode | Description | Typical Use |
+|---|---|---|
+| MOVE_None | No movement processed | Ragdoll, dead state |
+| MOVE_Walking | On ground, uses NavMesh | Default walking/running |
+| MOVE_NavWalking | On NavMesh surface (AI) | AI characters on nav mesh |
+| MOVE_Falling | In air, gravity applied | After jump, falling off ledge |
+| MOVE_Swimming | In fluid volume | Water traversal |
+| MOVE_Flying | No gravity, full air control | Spectator, flying character |
+| MOVE_Custom | User-defined (CustomMovementMode byte) | Wall running, zero-G, grapple |
+
+---
+
+## Key Properties Quick Reference
+
+### AGameModeBase Classes
+
+```cpp
+TSubclassOf<APawn>              DefaultPawnClass;
+TSubclassOf<AGameStateBase>     GameStateClass;
+TSubclassOf<APlayerController>  PlayerControllerClass;
+TSubclassOf<APlayerState>       PlayerStateClass;
+TSubclassOf<AHUD>               HUDClass;
+TSubclassOf<ASpectatorPawn>     SpectatorClass;
+TSubclassOf<AGameSession>       GameSessionClass;
+uint32                          bUseSeamlessTravel : 1;
+uint32                          bStartPlayersAsSpectators : 1;
+uint32                          bPauseable : 1;
+```
+
+### AGameStateBase Replicated Properties
+
+```cpp
+TSubclassOf<AGameModeBase>   GameModeClass;       // ReplicatedUsing=OnRep_GameModeClass
+TSubclassOf<ASpectatorPawn>  SpectatorClass;      // ReplicatedUsing=OnRep_SpectatorClass
+TArray<APlayerState*>        PlayerArray;         // Always relevant
+bool                         bReplicatedHasBegunPlay; // ReplicatedUsing=OnRep_ReplicatedHasBegunPlay
+double                       ReplicatedWorldTimeSecondsDouble; // server clock sync
+```
+
+### APlayerController Notable Members
+
+```cpp
+TObjectPtr<APawn>                 AcknowledgedPawn;        // server-confirmed possession
+TObjectPtr<APlayerCameraManager>  PlayerCameraManager;
+TObjectPtr<AHUD>                  MyHUD;
+TObjectPtr<UPlayerInput>          PlayerInput;             // only valid locally
+uint32                            bShowMouseCursor : 1;
+uint32                            bEnableClickEvents : 1;
+uint32                            bEnableStreamingSource : 1;
+uint16                            SeamlessTravelCount;
+```
+
+### ACharacter Notable Members
+
+```cpp
+// Components (access via getters)
+USkeletalMeshComponent*        GetMesh()
+UCharacterMovementComponent*   GetCharacterMovement()
+UCapsuleComponent*             GetCapsuleComponent()
+
+// Replicated state
+uint8   bIsCrouched : 1;       // ReplicatedUsing=OnRep_IsCrouched
+uint8   bProxyIsJumpForceApplied : 1;
+float   JumpMaxHoldTime;       // Replicated — variable jump height
+int32   JumpMaxCount;          // Replicated — multi-jump count
+int32   JumpCurrentCount;      // current jump count this airtime
+uint8   ReplicatedMovementMode; // Replicated — movement mode for simulated proxies
+```
+
+---
+
+## NetMode Cheat Sheet
+
+```cpp
+GetNetMode() == NM_Standalone      // single player, no network
+GetNetMode() == NM_DedicatedServer // server process, no local player
+GetNetMode() == NM_ListenServer    // server + local player (host)
+GetNetMode() == NM_Client          // remote client
+
+HasAuthority()  // true on server (NM_Standalone, NM_DedicatedServer, NM_ListenServer)
+IsLocalController()  // true if this PlayerController belongs to the local machine's player
+IsLocallyControlled()  // true on Pawn if its controller is a local player
+```
+
+---
+
+## Class Selection Decision Tree
+
+```
+Need to store game-wide rules or control who can join?
+  --> AGameMode (server-only, authoritative)
+
+Need global data visible to ALL clients (scores, match timer)?
+  --> AGameState (replicated everywhere)
+
+Need per-player data visible to ALL clients (kills, team, name)?
+  --> APlayerState (always relevant, replicated everywhere)
+
+Need to handle input, camera, or UI for ONE player?
+  --> APlayerController (exists on server + owning client only)
+
+Need a player body that walks/jumps/crouches with built-in prediction?
+  --> ACharacter (with UCharacterMovementComponent)
+
+Need a custom vehicle, drone, or non-humanoid body?
+  --> APawn (with a custom UPawnMovementComponent or manual physics)
+
+Need data that survives level transitions?
+  --> UGameInstance (singleton per process, never destroyed)
+```
+

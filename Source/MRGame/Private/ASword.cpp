@@ -5,6 +5,10 @@
 #include "Components/ArrowComponent.h"
 #include "Components/BoxComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "MotionControllerComponent.h"
+#include "GameFramework/PlayerController.h"
+#include "Kismet/GameplayStatics.h"
+
 // Sets default values
 ASword::ASword()
 {
@@ -26,12 +30,6 @@ ASword::ASword()
 	//debug機能
 	SwordColl->SetHiddenInGame(false);
 	SwordColl->OnComponentBeginOverlap.AddDynamic(this, &ASword::OnHitBoxBeginOverlap);
-	// //剣の根本
-	// BladeBase = CreateDefaultSubobject<USceneComponent>(TEXT("BladeBase"));
-	// BladeBase->SetupAttachment(BladeMesh);
-	// //剣の先端
-	// BladeTip = CreateDefaultSubobject<USceneComponent>(TEXT("BladeTip"));
-	// BladeTip->SetupAttachment(BladeMesh);
 }
 
 void ASword::Tick(float DeltaTime)
@@ -44,5 +42,25 @@ void ASword::OnHitBoxBeginOverlap(UPrimitiveComponent* OVerlappedComp, AActor* O
                                   UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep,
                                   const FHitResult& SweepResult)
 {
-	UE_LOG(LogTemp, Log, TEXT("CallHitBox"));
+	APlayerController* PC = UGameplayStatics::GetPlayerController(this, 0);
+	if (!PC) return;
+
+	// 剣がアタッチされている MotionController から利き手判定
+	bool bLeftHand = false;
+	if (USceneComponent* Parent = GetRootComponent() ? GetRootComponent()->GetAttachParent() : nullptr)
+	{
+		if (const UMotionControllerComponent* MC = Cast<UMotionControllerComponent>(Parent))
+		{
+			bLeftHand = (MC->MotionSource == FName("Left"));
+		}
+	}
+
+	PC->PlayDynamicForceFeedback(
+		HapticIntensity,
+		HapticDuration,
+		/*bAffectsLeftLarge=*/  bLeftHand,
+		/*bAffectsLeftSmall=*/  bLeftHand,
+		/*bAffectsRightLarge=*/ !bLeftHand,
+		/*bAffectsRightSmall=*/ !bLeftHand,
+		EDynamicForceFeedbackAction::Start);
 }

@@ -9,11 +9,31 @@
 /**
  * 
  */
+class AEnemySpawner;
 UCLASS()
 class MRGAME_API AGM_DemoScene : public AGameModeBase
 {
 	GENERATED_BODY()
 
 public:
+	AGM_DemoScene();
+	virtual void BeginPlay() override;
+	void CreateEnemies() const;
+	void DestoroyEnemies();
+	
+protected:
+	
+	
+	UPROPERTY(EditAnywhere,Category="EnemyNum | MaxNum")
+	int32 MaxNum;
+	
+	UPROPERTY(EditAnywhere,Category="EnemyNum | GroupNum")
+	int32 GroupNum;
+	
+	UPROPERTY()
+	TObjectPtr<AEnemySpawner> Spawner;
+	
+	int32 CurrentNum = 0;
+	
 
 };

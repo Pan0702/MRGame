@@ -9,7 +9,7 @@ public class MRGame : ModuleRules
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 	
 		PublicDependencyModuleNames.AddRange(new string[] {
-			"Core", "CoreUObject", "Engine", "InputCore" ,"HeadMountedDisplay","XRBase","NavigationSystem","EnhancedInput","AIModule"
+			"Core", "CoreUObject", "Engine", "InputCore" ,"HeadMountedDisplay","XRBase","NavigationSystem","EnhancedInput","AIModule","MetaXRHaptics"
         });
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });

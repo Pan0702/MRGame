@@ -8,7 +8,9 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Animation/AnimInstance.h"      
 #include "Components/CapsuleComponent.h"
-#include "Engine/SkeletalMesh.h"          
+#include "Engine/SkeletalMesh.h"       
+#include "GM_DemoScene.h"
+#include "Kismet/GameplayStatics.h"
 #include "UObject/ConstructorHelpers.h"   
 
 // Sets default values
@@ -36,6 +38,7 @@ AEnemy::AEnemy()
 void AEnemy::BeginPlay()
 {
 	Super::BeginPlay();
+	CachedGM = Cast<AGM_DemoScene>(UGameplayStatics::GetGameMode(this));
 	GetCharacterMovement()->MaxWalkSpeed = MoveSpeed;
 }
 
@@ -58,6 +61,7 @@ void AEnemy::OnHitCapsuleBeginOverlap(UPrimitiveComponent* OverlappedComp, AActo
 {
 	if (Cast<ASword>(OtherActor))
 	{
+		CachedGM->DestoroyEnemies();
 		Destroy();
 		return;
 	}

@@ -11,13 +11,12 @@ class UStaticMeshComponent;
 class UBoxComponent;
 class UPrimitiveComponent;
 
-
 UCLASS()
 class MRGAME_API ASword : public AActor
 {
 	GENERATED_BODY()
 	
-public:	
+public:
 	// Sets default values for this actor's properties
 	ASword();
 
@@ -42,7 +41,14 @@ public:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Sword")
 	TObjectPtr<UBoxComponent> SwordColl;
-	
+
+	UPROPERTY(EditAnywhere, Category = "Sword|Haptics")
+	float HapticIntensity = 1.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Sword|Haptics")
+	float HapticDuration = 0.15f;
+
+
 	// UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Sword")
 	// TObjectPtr<USceneComponent> BladeTip;
 	//

@@ -31,7 +31,7 @@ protected:
 	int32 GroupNum;
 	
 	UPROPERTY()
-	TObjectPtr<AEnemySpawner> Spawner;
+	TArray<TObjectPtr<AEnemySpawner>> Spawner;
 	
 	int32 CurrentNum = 0;
 	

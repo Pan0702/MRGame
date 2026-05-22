@@ -23,6 +23,7 @@ AEnemy* AEnemySpawner::SpawnOne()
 	//敵がなにもセットされてないならNullをかえす。
 	if (EnemyClass.Num() == 0)
 	{
+		UE_LOG(LogActor,Error,TEXT("empty"));
 		return nullptr;
 	}
 
@@ -32,6 +33,7 @@ AEnemy* AEnemySpawner::SpawnOne()
 	//nullCheck
 	if (!PickedClass)
 	{
+		UE_LOG(LogActor,Error,TEXT("cannot pickUp"));
 		return nullptr;
 	}
 

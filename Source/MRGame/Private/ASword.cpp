@@ -13,7 +13,7 @@
 ASword::ASword()
 {
 	// Set this actor to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
-	PrimaryActorTick.bCanEverTick = false;
+	PrimaryActorTick.bCanEverTick = true;
 	//柄
 	Root = CreateDefaultSubobject<UArrowComponent>(TEXT("Root"));
 	SetRootComponent(Root);
@@ -27,14 +27,21 @@ ASword::ASword()
 	SwordColl->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
 	SwordColl->SetCollisionProfileName(TEXT("OverlapAll"));
 	SwordColl->SetGenerateOverlapEvents(true);
-	//debug機能
-	SwordColl->SetHiddenInGame(false);
+	//debug機能 trueにすると見えなくなる
+	SwordColl->SetHiddenInGame(true);
 	SwordColl->OnComponentBeginOverlap.AddDynamic(this, &ASword::OnHitBoxBeginOverlap);
+}
+
+void ASword::BeginPlay()
+{
+	Super::BeginPlay();
+	PrevTipLocation = SwordColl->GetComponentLocation();
 }
 
 void ASword::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
+	UpdateSwing(DeltaTime);
 }
 
 
@@ -58,9 +65,43 @@ void ASword::OnHitBoxBeginOverlap(UPrimitiveComponent* OVerlappedComp, AActor* O
 	PC->PlayDynamicForceFeedback(
 		HapticIntensity,
 		HapticDuration,
-		/*bAffectsLeftLarge=*/  bLeftHand,
-		/*bAffectsLeftSmall=*/  bLeftHand,
+		/*bAffectsLeftLarge=*/ bLeftHand,
+		/*bAffectsLeftSmall=*/ bLeftHand,
 		/*bAffectsRightLarge=*/ !bLeftHand,
 		/*bAffectsRightSmall=*/ !bLeftHand,
 		EDynamicForceFeedbackAction::Start);
+}
+
+void ASword::UpdateSwing(float DeltaTime)
+{
+	static float maxspeed = 100.f;
+	if (DeltaTime <= KINDA_SMALL_NUMBER) return;
+
+	const FVector CurrentTip = SwordColl->GetComponentLocation();
+	const float Speed = FVector::Dist(CurrentTip, PrevTipLocation) / DeltaTime;
+	PrevTipLocation = CurrentTip;
+
+	if (bIsSwing && Speed <= SwingSpeedOffThreshold)
+	{
+		bIsSwing = false;
+	}
+	else if (!bIsSwing && Speed >= SwingSpeedOffThreshold)
+	{
+		bIsSwing = true;
+	}
+	SetSwordCollActive(bIsSwing);
+	if (bDebugDrawSwing)
+	{
+		const FColor C = bIsSwing ? FColor::Red : FColor::White;
+		DrawDebugSphere(GetWorld(), CurrentTip, 5.f, 12, C, false, -1.f, 0, 0.5f);
+	}
+	if (maxspeed < Speed)
+		maxspeed = Speed;
+	UE_LOG(LogTemp, Warning, TEXT("Sword Speed: %.1f cm/sSwinging: %s MaxSpeed : %.1f"),Speed, bIsSwing ? TEXT("YES") : TEXT("NO"), maxspeed);
+	
+}
+
+void ASword::SetSwordCollActive(bool bActive)
+{
+	SwordColl->SetGenerateOverlapEvents(bActive);
 }

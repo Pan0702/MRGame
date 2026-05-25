@@ -20,6 +20,7 @@ public:
 	// Sets default values for this actor's properties
 	ASword();
 
+	virtual void BeginPlay() override;
 protected:
 	// Called when the game starts or when spawned
 	virtual void Tick(float DeltaTime) override;
@@ -29,6 +30,9 @@ public:
 	UFUNCTION()
 	void OnHitBoxBeginOverlap(UPrimitiveComponent* OVerlappedComp,AActor* OtherActor,
 		UPrimitiveComponent* OtherComp,int32 OtherBodyIndex,bool bFromSweep, const FHitResult& SweepResult);
+	
+	UFUNCTION(BlueprintPure, Category = "Sword|Swing")
+	bool IsSwinging() const { return bIsSwing; }
 	
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Sword")
 	TObjectPtr<UArrowComponent> Root;
@@ -49,12 +53,18 @@ public:
 	float HapticDuration = 0.15f;
 
 
-	// UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Sword")
-	// TObjectPtr<USceneComponent> BladeTip;
-	//
-	// UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Sword")
-	// TObjectPtr<USceneComponent> BladeBase;
+	UPROPERTY(EditAnywhere,Category="Sword|Swing")
+	float SwingSpeedOnThreshold = 250.0f;
+	UPROPERTY(EditAnywhere,Category="Sword|Swing")
+	float SwingSpeedOffThreshold = 100.0f;
+	//Debug用
+	UPROPERTY(EditAnywhere,Category="Sword|Swing")
+	bool bDebugDrawSwing = false;
 
 private:
-	void ApplySwordMesh();
+	FVector PrevTipLocation = FVector::ZeroVector;
+	bool bIsSwing = false;
+
+	void UpdateSwing(float DeltaTime);
+	void SetSwordCollActive(bool bActive);
 };

@@ -29,7 +29,7 @@ void AGM_DemoScene::BeginPlay()
 		UE_LOG(LogTemp, Error, TEXT("Spawner is empty"));
 		return;
 	}
-	for (int i = 0; i < 3; i++)
+	for (int i = 0; i < 6; i++)
 	{
 		CreateEnemies();
 	}

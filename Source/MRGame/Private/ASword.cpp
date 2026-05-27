@@ -2,6 +2,7 @@
 
 
 #include "ASword.h"
+#include "CombatDirectorSubsystem.h"
 #include "Components/ArrowComponent.h"
 #include "Components/BoxComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -77,6 +78,7 @@ void ASword::UpdateSwing(float DeltaTime)
 	static float maxspeed = 100.f;
 	if (DeltaTime <= KINDA_SMALL_NUMBER) return;
 
+	const bool bWasSwinging = bIsSwing;
 	const FVector CurrentTip = SwordColl->GetComponentLocation();
 	const float Speed = FVector::Dist(CurrentTip, PrevTipLocation) / DeltaTime;
 	PrevTipLocation = CurrentTip;
@@ -88,6 +90,20 @@ void ASword::UpdateSwing(float DeltaTime)
 	else if (!bIsSwing && Speed >= SwingSpeedOffThreshold)
 	{
 		bIsSwing = true;
+	}
+	if (bWasSwinging != bIsSwing)
+	{
+		if (UCombatDirectorSubsystem* Director = GetWorld()->GetSubsystem<UCombatDirectorSubsystem>())
+		{
+			if (bIsSwing)
+			{
+				Director->BeginPlayerAttack();
+			}
+			else
+			{
+				Director->EndPlayerAttack();
+			}
+		}
 	}
 	SetSwordCollActive(bIsSwing);
 	if (bDebugDrawSwing)

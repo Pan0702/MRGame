@@ -19,6 +19,7 @@ Plugins/*/Intermediate/
 
 # MetaXR Plugins
 Plugins/MetaXR/
+Plugins/OculusXR/
 Plugins/MetaXRHaptics/
 
 # -----------------------------------------------------------------------------

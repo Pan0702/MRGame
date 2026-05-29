@@ -15,7 +15,7 @@ AEnemySpawner::AEnemySpawner()
 	PrimaryActorTick.bCanEverTick = false;
 	SpawnVolume = CreateDefaultSubobject<UBoxComponent>(TEXT("SpawnVolume"));
 	SetRootComponent(SpawnVolume);
-	SpawnVolume->SetBoxExtent(FVector(300.f, 300.f,100.f)); 
+	SpawnVolume->SetBoxExtent(FVector(100.f, 100.f,100.f)); 
 	SpawnVolume->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 }
 

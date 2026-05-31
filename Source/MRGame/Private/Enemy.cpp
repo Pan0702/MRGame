@@ -73,18 +73,22 @@ void AEnemy::OnHitCapsuleBeginOverlap(UPrimitiveComponent* OverlappedComp, AActo
                                       UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep,
                                       const FHitResult& SweepResult)
 {
-	//攻撃待ちしてる敵なら早期リターン
-	
 	//当たったものが剣か？
 	if (ASword* Sword = Cast<ASword>(OtherActor))
 	{
 		//剣が振ってる場外だったら当たりにして敵を消す
-		UCombatDirectorSubsystem* Director = GetWorld()->GetSubsystem<UCombatDirectorSubsystem>();
-		if (Sword->IsSwinging() && Director && Director->CanDamageEnemy(this))
+		if (Sword->IsSwinging() && !bIsDying)
 		{
+			bIsDying = true;
+
+			if (DeathSound)
+			{
+				UGameplayStatics::PlaySoundAtLocation(this, DeathSound, GetActorLocation());
+			}
+
 			if (CachedGM)
 			{
-				CachedGM->DestoroyEnemies();
+				CachedGM->NotifyEnemyKilled();
 			}
 			Destroy();
 		}

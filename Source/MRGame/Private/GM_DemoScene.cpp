@@ -4,6 +4,8 @@
 #include "GM_DemoScene.h"
 #include "EnemySpawner.h"
 #include "Kismet/GameplayStatics.h"
+#include "OculusXRPassthroughLayerComponent.h"
+#include "OculusXRPassthroughSubsystem.h"
 
 AGM_DemoScene::AGM_DemoScene()
 {
@@ -12,6 +14,8 @@ AGM_DemoScene::AGM_DemoScene()
 void AGM_DemoScene::BeginPlay()
 {
 	Super::BeginPlay();
+
+	InitializePassthrough();
 
 	TArray<AActor*> AllActors;
 	UGameplayStatics::GetAllActorsOfClass(this, AEnemySpawner::StaticClass(), AllActors);
@@ -29,25 +33,97 @@ void AGM_DemoScene::BeginPlay()
 		UE_LOG(LogTemp, Error, TEXT("Spawner is empty"));
 		return;
 	}
-	for (int i = 0; i < 6; i++)
-	{
-		CreateEnemies();
-	}
+	StartLoop();
 }
 
-void AGM_DemoScene::CreateEnemies() const
+bool AGM_DemoScene::CreateEnemies()
 {
-	UE_LOG(LogTemp, Warning, TEXT("CurrentNum:%d"), CurrentNum);
-	if (CurrentNum < MaxNum)
+	if (!bLoopActive || Spawner.Num() == 0 || AliveCount >= DesiredAliveCount)
 	{
-		int32 num = FMath::RandRange(0, Spawner.Num() - 1);
-		Spawner[num]->SpawnOne();
-		UE_LOG(LogTemp, Error, TEXT("CallSuccess"));
+		return false;
 	}
+
+	const int32 Index = FMath::RandRange(0, Spawner.Num() - 1);
+	if (Spawner[Index] && Spawner[Index]->SpawnOne())
+	{
+		++AliveCount;
+		UE_LOG(LogTemp, Log, TEXT("Enemy spawned. AliveCount:%d DesiredAliveCount:%d"), AliveCount, DesiredAliveCount);
+		return true;
+	}
+
+	return false;
+}
+
+void AGM_DemoScene::NotifyEnemyKilled()
+{
+	if (!bLoopActive)
+	{
+		return;
+	}
+
+	AliveCount = FMath::Max(0, AliveCount - 1);
+	++TotalKills;
+
+	MaintainDesiredAliveCount();
 }
 
 void AGM_DemoScene::DestoroyEnemies()
 {
-	CurrentNum++;
-	CreateEnemies();
+	NotifyEnemyKilled();
+}
+
+void AGM_DemoScene::InitializePassthrough()
+{
+	if (!bInitializePassthrough)
+	{
+		return;
+	}
+
+	UOculusXRPassthroughSubsystem* PassthroughSubsystem = UOculusXRPassthroughSubsystem::GetPassthroughSubsystem(GetWorld());
+	if (!PassthroughSubsystem)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Passthrough subsystem is not available"));
+		return;
+	}
+
+	FOculusXRPersistentPassthroughParameters Parameters;
+	Parameters.bVisible = true;
+	Parameters.Priority = -1;
+	Parameters.Shape = NewObject<UOculusXRStereoLayerShapeReconstructed>(this);
+	if (Parameters.Shape)
+	{
+		Parameters.Shape->LayerOrder = PassthroughLayerOrder_Underlay;
+		Parameters.Shape->TextureOpacityFactor = 1.0f;
+		Parameters.Shape->bEnableEdgeColor = false;
+		Parameters.Shape->bEnableColorMap = false;
+		Parameters.ApplyShape();
+	}
+
+	const FOculusXRPassthrough_LayerResumed_Single LayerResumed;
+	PassthroughSubsystem->InitializePersistentPassthrough(Parameters, LayerResumed);
+}
+
+void AGM_DemoScene::StartLoop()
+{
+	AliveCount = 0;
+	TotalKills = 0;
+	bLoopActive = true;
+
+	MaintainDesiredAliveCount();
+}
+
+void AGM_DemoScene::MaintainDesiredAliveCount()
+{
+	if (!bLoopActive)
+	{
+		return;
+	}
+
+	const int32 MissingCount = FMath::Max(0, DesiredAliveCount - AliveCount);
+	const int32 MaxAttempts = MissingCount * FMath::Max(1, Spawner.Num());
+
+	for (int32 Attempt = 0; Attempt < MaxAttempts && AliveCount < DesiredAliveCount; ++Attempt)
+	{
+		CreateEnemies();
+	}
 }

@@ -4,6 +4,8 @@
 
 #include "Components/BoxComponent.h"
 #include "Enemy.h"
+#include "GameFramework/Pawn.h"
+#include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetMathLibrary.h"
 
 
@@ -38,15 +40,36 @@ AEnemy* AEnemySpawner::SpawnOne()
 		return nullptr;
 	}
 
-	//ランダム座標を計算
-	const FVector SpawnLocation = SpawnVolume->GetComponentLocation();
-	const FVector Extent = SpawnVolume->GetScaledBoxExtent();
-	const FVector SpawnLoc = UKismetMathLibrary::RandomPointInBoundingBox(SpawnLocation, Extent);
+	FVector SpawnLoc = SpawnVolume->GetComponentLocation();
+	FRotator SpawnRot = FRotator::ZeroRotator;
+	if (const APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0))
+	{
+		FVector Forward = PlayerPawn->GetActorForwardVector();
+		Forward.Z = 0.0f;
+		Forward = Forward.GetSafeNormal();
+
+		const FVector Right = FVector::CrossProduct(FVector::UpVector, Forward).GetSafeNormal();
+		const float SideOffset = FMath::RandRange(-SpawnHorizontalSpread, SpawnHorizontalSpread);
+
+		SpawnLoc = PlayerPawn->GetActorLocation()
+			+ Forward * SpawnDistanceFromPlayer
+			+ Right * SideOffset
+			+ FVector(0.0f, 0.0f, SpawnHeightOffset);
+
+		const FVector ToPlayer = (PlayerPawn->GetActorLocation() - SpawnLoc).GetSafeNormal2D();
+		SpawnRot = ToPlayer.Rotation();
+	}
+	else
+	{
+		const FVector SpawnLocation = SpawnVolume->GetComponentLocation();
+		const FVector Extent = SpawnVolume->GetScaledBoxExtent();
+		SpawnLoc = UKismetMathLibrary::RandomPointInBoundingBox(SpawnLocation, Extent);
+	}
 
 	//生成して返す
 	return GetWorld()->SpawnActor<AEnemy>(
 		PickedClass,
 		SpawnLoc,
-		FRotator::ZeroRotator
+		SpawnRot
 	);
 }

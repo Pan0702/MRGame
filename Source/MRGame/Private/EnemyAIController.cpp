@@ -3,6 +3,7 @@
 
 #include "EnemyAIController.h"
 
+#include "GameFramework/Pawn.h"
 #include "Kismet/GameplayStatics.h"
 
 AEnemyAIController::AEnemyAIController()
@@ -15,10 +16,6 @@ void AEnemyAIController::OnPossess(APawn* InPawn)
 	Super::OnPossess(InPawn);
 	
 	TargetPawn = UGameplayStatics::GetPlayerPawn(this ,0);
-	if (IsValid(TargetPawn))
-	{
-		MoveToActor(TargetPawn,AcceptanceRadius);
-	}
 }
 
 void AEnemyAIController::Tick(float DeltaTime)
@@ -28,13 +25,34 @@ void AEnemyAIController::Tick(float DeltaTime)
 	{
 		//Playerが取得できていない場合再度取得を試みる
 		TargetPawn = UGameplayStatics::GetPlayerPawn(this ,0);
-		UE_LOG(LogTemp, Warning, TEXT("TargetPawn is not valid"));
 	}
-	
-	TimeSinceLastRepath += DeltaTime;
-	if (TimeSinceLastRepath >= RepathInterval)
+
+	APawn* ControlledPawn = GetPawn();
+	if (!IsValid(ControlledPawn) || !IsValid(TargetPawn))
 	{
-		MoveToActor(TargetPawn,AcceptanceRadius);
-		TimeSinceLastRepath = 0.0f;
+		return;
+	}
+
+	FVector ToTarget = TargetPawn->GetActorLocation() - ControlledPawn->GetActorLocation();
+	ToTarget.Z = 0.0f;
+
+	const float Distance = ToTarget.Size();
+	if (Distance <= KINDA_SMALL_NUMBER)
+	{
+		return;
+	}
+
+	const FVector MoveDirection = ToTarget / Distance;
+	const FRotator DesiredRotation = MoveDirection.Rotation();
+	const FRotator NewRotation = FMath::RInterpTo(
+		ControlledPawn->GetActorRotation(),
+		DesiredRotation,
+		DeltaTime,
+		RotationInterpSpeed);
+	ControlledPawn->SetActorRotation(FRotator(0.0f, NewRotation.Yaw, 0.0f));
+
+	if (Distance > StopDistance)
+	{
+		ControlledPawn->AddMovementInput(MoveDirection);
 	}
 }

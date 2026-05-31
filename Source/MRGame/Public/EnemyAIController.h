@@ -21,15 +21,12 @@ protected:
 	virtual void OnPossess(APawn* InPawn) override;
 	virtual void Tick(float DeltaTime) override;
 
-	UPROPERTY(EditDefaultsOnly, Category = "AI")
-	float RepathInterval = 0.5f;
+	UPROPERTY(EditAnywhere, Category = "AI|Steering")
+	float StopDistance = 120.0f;
 
-	UPROPERTY(EditDefaultsOnly, Category = "AI")
-	float AcceptanceRadius = 100.0f;
+	UPROPERTY(EditAnywhere, Category = "AI|Steering")
+	float RotationInterpSpeed = 8.0f;
 
 	UPROPERTY()
 	TObjectPtr<APawn> TargetPawn;
-
-private:
-	float TimeSinceLastRepath = 0.0f;
 };

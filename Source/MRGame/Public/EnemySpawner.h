@@ -24,4 +24,13 @@ protected:
 	
 	UPROPERTY(EditAnywhere,Category="SpawnCharactor")
 	TArray<TSubclassOf<AEnemy>> EnemyClass;
+
+	UPROPERTY(EditAnywhere, Category = "Spawn")
+	float SpawnDistanceFromPlayer = 450.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Spawn")
+	float SpawnHorizontalSpread = 120.0f;
+
+	UPROPERTY(EditAnywhere, Category = "Spawn")
+	float SpawnHeightOffset = 0.0f;
 };

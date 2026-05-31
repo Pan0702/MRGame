@@ -18,22 +18,34 @@ class MRGAME_API AGM_DemoScene : public AGameModeBase
 public:
 	AGM_DemoScene();
 	virtual void BeginPlay() override;
-	void CreateEnemies() const;
+	bool CreateEnemies();
+	void NotifyEnemyKilled();
 	void DestoroyEnemies();
+
+	UFUNCTION(BlueprintPure, Category = "EnemyNum")
+	int32 GetTotalKills() const { return TotalKills; }
 	
 protected:
 	
 	
-	UPROPERTY(EditAnywhere,Category="EnemyNum | MaxNum")
-	int32 MaxNum;
+	UPROPERTY(EditAnywhere, Category = "EnemyNum")
+	int32 DesiredAliveCount = 4;
 	
-	UPROPERTY(EditAnywhere,Category="EnemyNum | GroupNum")
-	int32 GroupNum;
+	UPROPERTY(EditAnywhere, Category = "EnemyNum")
+	int32 TotalKills = 0;
+
+	UPROPERTY(EditAnywhere, Category = "MR|Passthrough")
+	bool bInitializePassthrough = true;
 	
 	UPROPERTY()
 	TArray<TObjectPtr<AEnemySpawner>> Spawner;
 	
-	int32 CurrentNum = 0;
+	int32 AliveCount = 0;
+	bool bLoopActive = false;
 	
+private:
+	void InitializePassthrough();
+	void StartLoop();
+	void MaintainDesiredAliveCount();
 
 };

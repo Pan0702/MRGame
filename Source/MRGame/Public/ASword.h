@@ -64,6 +64,7 @@ public:
 private:
 	FVector PrevTipLocation = FVector::ZeroVector;
 	bool bIsSwing = false;
+	float DebugMaxSwingSpeed = 0.0f;
 
 	void UpdateSwing(float DeltaTime);
 	void SetSwordCollActive(bool bActive);

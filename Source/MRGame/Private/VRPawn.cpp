@@ -6,6 +6,7 @@
 #include "MotionControllerComponent.h"
 #include "HeadMountedDisplayFunctionLibrary.h"
 #include "ASword.h"
+#include "DrawDebugHelpers.h"
 #include "UObject/ConstructorHelpers.h"
 
 // Sets default values
@@ -54,11 +55,17 @@ void AVRPawn::BeginPlay()
 
 		if (EquippedSword)
 		{
-			//右手にAttach
-			if (!EquippedSword->AttachToComponent(RightController,
+			UMotionControllerComponent* SwordAttachController = GetSwordAttachController();
+			if (!SwordAttachController)
+			{
+				UE_LOG(LogTemp, Error, TEXT("AVRPawn:Sword attach controller is not valid"));
+				return;
+			}
+
+			if (!EquippedSword->AttachToComponent(SwordAttachController,
 			                                      FAttachmentTransformRules::SnapToTargetNotIncludingScale))
 			{
-				UE_LOG(LogTemp, Error, TEXT("AVRPawn:RightController is not attach"));
+				UE_LOG(LogTemp, Error, TEXT("AVRPawn:Sword is not attached"));
 			}
 		}
 	}
@@ -72,6 +79,11 @@ void AVRPawn::BeginPlay()
 void AVRPawn::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
+
+	if (!bDebugDrawControllers)
+	{
+		return;
+	}
 
 	if (LeftController)
 	{
@@ -100,4 +112,9 @@ void AVRPawn::Tick(float DeltaTime)
 void AVRPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 {
 	Super::SetupPlayerInputComponent(PlayerInputComponent);
+}
+
+UMotionControllerComponent* AVRPawn::GetSwordAttachController() const
+{
+	return bEquipSwordInLeftHand ? LeftController : RightController;
 }

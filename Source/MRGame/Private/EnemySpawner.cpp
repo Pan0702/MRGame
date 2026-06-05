@@ -7,6 +7,7 @@
 #include "GameFramework/Pawn.h"
 #include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetMathLibrary.h"
+#include "MRSpatialRecognitionSubsystem.h"
 
 
 
@@ -44,19 +45,45 @@ AEnemy* AEnemySpawner::SpawnOne()
 	FRotator SpawnRot = FRotator::ZeroRotator;
 	if (const APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0))
 	{
+		const FVector PlayerLocation = PlayerPawn->GetActorLocation();
 		FVector Forward = PlayerPawn->GetActorForwardVector();
 		Forward.Z = 0.0f;
 		Forward = Forward.GetSafeNormal();
 
-		const FVector Right = FVector::CrossProduct(FVector::UpVector, Forward).GetSafeNormal();
-		const float SideOffset = FMath::RandRange(-SpawnHorizontalSpread, SpawnHorizontalSpread);
+		bool bResolvedByDepth = false;
 
-		SpawnLoc = PlayerPawn->GetActorLocation()
-			+ Forward * SpawnDistanceFromPlayer
-			+ Right * SideOffset
-			+ FVector(0.0f, 0.0f, SpawnHeightOffset);
+		// Depth(MRUK Environment Raycaster)で「壁の手前かつプレイヤーとの間に障害物が無い」点を探す。
+		// 部屋スキャン不要。CalibrateFrontWall済みでなければ Subsystem 側がフォールバック点を返す。
+		if (UWorld* World = GetWorld())
+		{
+			if (UMRSpatialRecognitionSubsystem* Spatial = World->GetSubsystem<UMRSpatialRecognitionSubsystem>())
+			{
+				FVector ClearLoc = FVector::ZeroVector;
+				bool bUsedFallback = false;
+				// 遮蔽の無いクリアな点が見つかった時だけ採用する。
+				// false（bUsedFallback=true、壁未測定や全候補が塞がれていた等）の場合は
+				// 下の従来ロジック（プレイヤー正面固定）に落とす。
+				if (Spatial->FindClearSpawnPoint(PlayerLocation, Forward, ClearLoc, bUsedFallback))
+				{
+					SpawnLoc = ClearLoc + FVector(0.0f, 0.0f, SpawnHeightOffset);
+					bResolvedByDepth = true;
+				}
+			}
+		}
 
-		const FVector ToPlayer = (PlayerPawn->GetActorLocation() - SpawnLoc).GetSafeNormal2D();
+		// Depthで決められなかった場合は従来どおりプレイヤー正面に固定距離で湧かす。
+		if (!bResolvedByDepth)
+		{
+			const FVector Right = FVector::CrossProduct(FVector::UpVector, Forward).GetSafeNormal();
+			const float SideOffset = FMath::RandRange(-SpawnHorizontalSpread, SpawnHorizontalSpread);
+
+			SpawnLoc = PlayerLocation
+				+ Forward * SpawnDistanceFromPlayer
+				+ Right * SideOffset
+				+ FVector(0.0f, 0.0f, SpawnHeightOffset);
+		}
+
+		const FVector ToPlayer = (PlayerLocation - SpawnLoc).GetSafeNormal2D();
 		SpawnRot = ToPlayer.Rotation();
 	}
 	else

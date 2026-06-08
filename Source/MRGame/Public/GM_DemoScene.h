@@ -56,8 +56,8 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "MR|Occlusion")
 	bool bEnableOcclusion = true;
 
-	// 起動毎にアプリ内で部屋スキャン（スペース設定）を起動するか。
-	// true: 起動時に必ずスキャン画面を出す。false: 保存済みの部屋データをロードして使う。
+	// 起動時にアプリ内で部屋スキャン（スペース設定）を起動するか。
+	// true: 起動毎にスキャン画面を出す。false: 保存済みの部屋データをロードして使う。
 	UPROPERTY(EditAnywhere, Category = "MR|Occlusion")
 	bool bScanRoomOnStart = true;
 

@@ -246,7 +246,8 @@ void AGM_DemoScene::InitializeOcclusion()
 			if (bScanRoomOnStart)
 			{
 				// 起動毎にアプリ内から部屋スキャン（スペース設定）を起動する。
-				// スキャン完了後、MRUKのOnSceneLoaded経由で BuildOcclusionMeshes が自動的に走る。
+				// スキャン完了後、OnCaptureComplete→LoadSceneFromDevice→OnSceneLoaded 経由で
+				// BuildOcclusionMeshes が自動的に走る。
 				Spatial->LaunchRoomScan();
 				UE_LOG(LogTemp, Log, TEXT("Occlusion: launched in-app room scan"));
 			}

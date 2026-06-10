@@ -118,4 +118,15 @@ private:
 	// 敵(Character)が落下せず床を歩けるようにするため。
 	void SpawnGroundCollision();
 
+	// 部屋ロードが一定時間で完了しない場合に、フォールバックでループを開始する。
+	void StartLoopFallbackIfNeeded();
+
+	// 部屋ロード完了待ちの最大秒数。これを過ぎたら部屋メッシュ無しでループ開始（敵は出る）。
+	// Subsystem側のRoomsポーリング(最大20秒)より長くして、部屋ロードを優先的に待つ。
+	UPROPERTY(EditAnywhere, Category = "MR|Occlusion")
+	float SceneLoadTimeout = 25.0f;
+
+	// ロード完了待ちのフォールバックタイマー。
+	FTimerHandle SceneLoadFallbackTimerHandle;
+
 };

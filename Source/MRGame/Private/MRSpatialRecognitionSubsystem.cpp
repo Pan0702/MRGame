@@ -4,6 +4,7 @@
 
 #include "MRUtilityKit.h"
 #include "MRUtilityKitAnchor.h"
+#include "MRUtilityKitBPLibrary.h"
 #include "MRUtilityKitRoom.h"
 #include "MRUtilityKitSubsystem.h"
 #include "Engine/Engine.h"
@@ -19,7 +20,6 @@ void UMRSpatialRecognitionSubsystem::Deinitialize()
 {
 	if (CachedMRUKSubsystem && bDelegatesBound)
 	{
-		CachedMRUKSubsystem->OnSceneLoaded.RemoveDynamic(this, &UMRSpatialRecognitionSubsystem::HandleSceneLoaded);
 		CachedMRUKSubsystem->OnRoomCreated.RemoveDynamic(this, &UMRSpatialRecognitionSubsystem::HandleRoomChanged);
 		CachedMRUKSubsystem->OnRoomUpdated.RemoveDynamic(this, &UMRSpatialRecognitionSubsystem::HandleRoomChanged);
 		CachedMRUKSubsystem->OnRoomRemoved.RemoveDynamic(this, &UMRSpatialRecognitionSubsystem::HandleRoomChanged);
@@ -47,6 +47,9 @@ bool UMRSpatialRecognitionSubsystem::LoadSceneFromDevice()
 		return false;
 	}
 
+	// Room変更 + OnSceneLoaded を購読する。
+	// Async版のSuccess/Failureが発火しない場合の保険として OnSceneLoaded も直接拾う
+	// （HandleSceneLoaded 側で二重発火をガードする）。
 	if (!bDelegatesBound)
 	{
 		MRUKSubsystem->OnSceneLoaded.AddUniqueDynamic(this, &UMRSpatialRecognitionSubsystem::HandleSceneLoaded);
@@ -56,16 +59,108 @@ bool UMRSpatialRecognitionSubsystem::LoadSceneFromDevice()
 		bDelegatesBound = true;
 	}
 
+	// 新しいロード試行ごとに処理済みフラグをリセット。
+	bSceneLoadHandled = false;
+
+	// 既にロード済みなら即成功扱い。
 	if (MRUKSubsystem->SceneLoadStatus == EMRUKInitStatus::Complete)
 	{
-		RefreshRecognizedAnchors();
-		OnSceneLoaded.Broadcast(true);
+		HandleSceneLoaded(true);
 		return true;
 	}
 
 	++LoadAttemptCount;
-	MRUKSubsystem->LoadSceneFromDevice(EMRUKSceneModel::V1);
+
+	// 同期版 LoadSceneFromDevice は BeginPlay 直後に呼ぶと OpenXR セッション確立前に
+	// StartDiscovery が走り error -2 になる。非同期版(UMRUKLoadFromDevice)は
+	// UBlueprintAsyncActionBase 経由で準備完了を待ってから discovery を始めるため -2 を回避できる。
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		HandleSceneLoaded(false);
+		return false;
+	}
+
+	UMRUKLoadFromDevice* AsyncLoad = UMRUKLoadFromDevice::LoadSceneFromDeviceAsync(World, EMRUKSceneModel::V1);
+	if (!AsyncLoad)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("LoadSceneFromDeviceAsync returned null; falling back to sync load"));
+		MRUKSubsystem->LoadSceneFromDevice(EMRUKSceneModel::V1);
+		return true;
+	}
+
+	// GC回収を防ぐためメンバで保持（保持しないとSuccess/Failureが発火しないことがある）。
+	ActiveAsyncLoad = AsyncLoad;
+	AsyncLoad->Success.AddDynamic(this, &UMRSpatialRecognitionSubsystem::HandleAsyncLoadSucceeded);
+	AsyncLoad->Failure.AddDynamic(this, &UMRSpatialRecognitionSubsystem::HandleAsyncLoadFailed);
+	UE_LOG(LogTemp, Log, TEXT("LoadSceneFromDevice: started async load (attempt %d)"), LoadAttemptCount);
+
+	// 保険: Async の Success/Failure が発火しない場合に備え、MRUKSubsystem->Rooms が
+	// 埋まるのをタイマーでポーリングする。埋まったら HandleSceneLoaded(true) を呼ぶ。
+	RoomsPollAttempts = 0;
+	if (UWorld* PollWorld = GetWorld())
+	{
+		PollWorld->GetTimerManager().ClearTimer(RoomsPollTimerHandle);
+		PollWorld->GetTimerManager().SetTimer(
+			RoomsPollTimerHandle, this, &UMRSpatialRecognitionSubsystem::PollForRooms, 0.5f, true);
+	}
 	return true;
+}
+
+void UMRSpatialRecognitionSubsystem::PollForRooms()
+{
+	// 既に処理済みなら停止。
+	if (bSceneLoadHandled)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().ClearTimer(RoomsPollTimerHandle);
+		}
+		return;
+	}
+
+	++RoomsPollAttempts;
+
+	UMRUKSubsystem* MRUKSubsystem = GetMRUKSubsystem();
+	const bool bHasRoom = MRUKSubsystem && MRUKSubsystem->Rooms.Num() > 0;
+	const bool bComplete = MRUKSubsystem && MRUKSubsystem->SceneLoadStatus == EMRUKInitStatus::Complete;
+
+	if (bHasRoom || bComplete)
+	{
+		UE_LOG(LogTemp, Log, TEXT("PollForRooms: rooms ready (Rooms=%d, status=%d) after %d polls"),
+		       MRUKSubsystem ? MRUKSubsystem->Rooms.Num() : 0,
+		       MRUKSubsystem ? static_cast<int32>(MRUKSubsystem->SceneLoadStatus) : -1,
+		       RoomsPollAttempts);
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().ClearTimer(RoomsPollTimerHandle);
+		}
+		HandleSceneLoaded(true);
+		return;
+	}
+
+	if (RoomsPollAttempts >= MaxRoomsPollAttempts)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("PollForRooms: gave up after %d polls, no rooms"), RoomsPollAttempts);
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().ClearTimer(RoomsPollTimerHandle);
+		}
+	}
+}
+
+void UMRSpatialRecognitionSubsystem::HandleAsyncLoadSucceeded()
+{
+	UE_LOG(LogTemp, Log, TEXT("Async scene load succeeded"));
+	ActiveAsyncLoad = nullptr;
+	HandleSceneLoaded(true);
+}
+
+void UMRSpatialRecognitionSubsystem::HandleAsyncLoadFailed()
+{
+	UE_LOG(LogTemp, Warning, TEXT("Async scene load failed"));
+	ActiveAsyncLoad = nullptr;
+	HandleSceneLoaded(false);
 }
 
 bool UMRSpatialRecognitionSubsystem::LaunchRoomScan()
@@ -500,8 +595,16 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 
 void UMRSpatialRecognitionSubsystem::HandleSceneLoaded(bool bSuccess)
 {
+	// Async版のSuccess/Failureと、保険のOnSceneLoaded直接購読が二重に来ることがある。
+	// 一度「成功」を処理したら以降は無視する（失敗はリトライのため通す）。
+	if (bSuccess && bSceneLoadHandled)
+	{
+		return;
+	}
+
 	if (bSuccess)
 	{
+		bSceneLoadHandled = true;
 		RefreshRecognizedAnchors();
 
 		// 部屋がロードできたら、その形に沿った透明オクルージョンメッシュを生成する。

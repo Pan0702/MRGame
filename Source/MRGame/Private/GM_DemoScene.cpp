@@ -11,6 +11,7 @@
 #include "OculusXRPassthroughLayerComponent.h"
 #include "OculusXRPassthroughSubsystem.h"
 #include "OculusXRPersistentPassthroughInstance.h"
+#include "TimerManager.h"
 
 AGM_DemoScene::AGM_DemoScene()
 {
@@ -41,10 +42,34 @@ void AGM_DemoScene::BeginPlay()
 
 	// InitializeOcclusion 内で部屋スキャン/ロードを起動する（完了で上の HandleSceneReady が呼ばれる）。
 	InitializeOcclusion();
+
+	// 保険: 部屋ロードが SceneLoadTimeout 秒で完了しない／完了通知が来ない場合でも、
+	// 強制的にループを開始して敵を出す（部屋メッシュ無しのフォールバック湧き）。
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().SetTimer(
+			SceneLoadFallbackTimerHandle,
+			this,
+			&AGM_DemoScene::StartLoopFallbackIfNeeded,
+			FMath::Max(0.5f, SceneLoadTimeout),
+			false);
+	}
 }
 
 void AGM_DemoScene::HandleSceneReady(bool bSuccess)
 {
+	// 既にループ開始済み（フォールバックタイマー等で）なら二重に始めない。
+	if (bLoopActive)
+	{
+		return;
+	}
+
+	// フォールバックタイマーは不要になったので止める。
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SceneLoadFallbackTimerHandle);
+	}
+
 	if (!bSuccess)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("HandleSceneReady: scene load failed; starting loop without room mesh (fallback spawn)"));
@@ -60,6 +85,20 @@ void AGM_DemoScene::HandleSceneReady(bool bSuccess)
 	{
 		SpawnGroundCollision();
 	}
+	StartLoop();
+}
+
+void AGM_DemoScene::StartLoopFallbackIfNeeded()
+{
+	// 既にループが始まっていれば何もしない（部屋ロードが間に合った）。
+	if (bLoopActive)
+	{
+		return;
+	}
+
+	UE_LOG(LogTemp, Warning,
+	       TEXT("StartLoopFallbackIfNeeded: scene load did not complete within %.1fs; starting fallback loop"),
+	       SceneLoadTimeout);
 	StartLoop();
 }
 

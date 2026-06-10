@@ -197,6 +197,15 @@ private:
 	UFUNCTION()
 	void HandleCaptureComplete(bool bSuccess);
 
+	// 非同期ロード(UMRUKLoadFromDevice)の Success/Failure デリゲート(引数なし)に対応するハンドラ。
+	UFUNCTION()
+	void HandleAsyncLoadSucceeded();
+	UFUNCTION()
+	void HandleAsyncLoadFailed();
+
+	// MRUKSubsystem->Rooms が埋まるのをタイマーでポーリングする（デリゲートが発火しない保険）。
+	void PollForRooms();
+
 	UMRUKSubsystem* GetMRUKSubsystem() const;
 
 	bool EnsureScenePermissionOrRequest();
@@ -218,10 +227,21 @@ private:
 	UPROPERTY()
 	TObjectPtr<UAndroidPermissionCallbackProxy> ScenePermissionProxy;
 
+	// 非同期ロードオブジェクトをGC回収から守るため保持する（保持しないとデリゲートが発火しないことがある）。
+	UPROPERTY()
+	TObjectPtr<class UMRUKLoadFromDevice> ActiveAsyncLoad;
+
 	FTimerHandle DeferredLoadTimerHandle;
 	int32 LoadAttemptCount = 0;
 	int32 MaxLoadAttempts = 5;
 	bool bDelegatesBound = false;
+	// HandleSceneLoaded が一度処理されたか（Async版Success/Failureと直接購読の二重発火を防ぐ）。
+	bool bSceneLoadHandled = false;
+
+	// Rooms ポーリング用タイマーと試行回数。
+	FTimerHandle RoomsPollTimerHandle;
+	int32 RoomsPollAttempts = 0;
+	int32 MaxRoomsPollAttempts = 40; // 0.5s間隔 × 40 = 20秒まで待つ。
 
 	/** 起動時に測った正面の壁の点（CalibrateFrontWall でキャッシュ）。 */
 	FVector CachedWallPoint = FVector::ZeroVector;

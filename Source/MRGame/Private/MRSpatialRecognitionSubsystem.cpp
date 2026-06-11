@@ -93,6 +93,10 @@ bool UMRSpatialRecognitionSubsystem::LoadSceneFromDevice()
 	ActiveAsyncLoad = AsyncLoad;
 	AsyncLoad->Success.AddDynamic(this, &UMRSpatialRecognitionSubsystem::HandleAsyncLoadSucceeded);
 	AsyncLoad->Failure.AddDynamic(this, &UMRSpatialRecognitionSubsystem::HandleAsyncLoadFailed);
+	// 重要: LoadSceneFromDeviceAsync はオブジェクト生成のみで、実処理は Activate() が行う。
+	// Blueprintノードとして使うとエンジンが自動で呼ぶが、C++から使う場合は明示的に呼ぶ必要がある。
+	// （これを呼ばないと MRUK の StartDiscovery 自体が一度も実行されず、無音で部屋ゼロになる。）
+	AsyncLoad->Activate();
 	UE_LOG(LogTemp, Log, TEXT("LoadSceneFromDevice: started async load (attempt %d)"), LoadAttemptCount);
 
 	// 保険: Async の Success/Failure が発火しない場合に備え、MRUKSubsystem->Rooms が
@@ -146,6 +150,16 @@ void UMRSpatialRecognitionSubsystem::PollForRooms()
 		{
 			World->GetTimerManager().ClearTimer(RoomsPollTimerHandle);
 		}
+
+		// discoveryが完了イベントを返さないままMRUKがBusyで固まると、以後の
+		// LoadSceneFromDevice が全て弾かれて再試行不能になる。状態をリセットして
+		// HandleSceneLoaded(false) 経由のリトライ（MaxLoadAttemptsまで）に繋げる。
+		if (MRUKSubsystem && MRUKSubsystem->SceneLoadStatus == EMRUKInitStatus::Busy)
+		{
+			MRUKSubsystem->ClearScene();
+		}
+		ActiveAsyncLoad = nullptr;
+		HandleSceneLoaded(false);
 	}
 }
 
@@ -194,21 +208,23 @@ bool UMRSpatialRecognitionSubsystem::LaunchRoomScan()
 	// アプリ内からスペース設定（部屋スキャン）画面を起動する。
 	const bool bLaunched = MRUKSubsystem->LaunchSceneCapture();
 	UE_LOG(LogTemp, Log, TEXT("LaunchRoomScan: scene capture launched=%s"), bLaunched ? TEXT("true") : TEXT("false"));
+	if (!bLaunched)
+	{
+		// 起動直後でXRセッションが整っていない等でスキャン画面が開けないことがある。
+		// その場合は保存済みの部屋データのロードに切り替える（部屋ロードが完全に止まるのを防ぐ）。
+		LoadSceneFromDeviceDeferred(1.0f);
+	}
 	return bLaunched;
 }
 
 void UMRSpatialRecognitionSubsystem::HandleCaptureComplete(bool bSuccess)
 {
 	UE_LOG(LogTemp, Log, TEXT("HandleCaptureComplete: success=%s"), bSuccess ? TEXT("true") : TEXT("false"));
-	if (!bSuccess)
-	{
-		// スキャンがキャンセル/失敗。保存済みデータがあればそれでロードを試みる。
-		LoadSceneFromDevice();
-		return;
-	}
 
-	// スキャンで部屋データが更新された。デバイスから読み込む（完了で OnSceneLoaded→HandleSceneLoaded が走る）。
-	LoadSceneFromDevice();
+	// スキャン画面から復帰した直後はXRセッションがまだFOCUSEDに戻っていない
+	// （実測でdiscovery発行がフォーカス回復より44ms早く、ランタイムに黙殺された）。
+	// セッションのフォーカス回復を待ってからdiscoveryを開始する。
+	LoadSceneFromDeviceDeferred(1.0f);
 }
 
 void UMRSpatialRecognitionSubsystem::LoadSceneFromDeviceDeferred(float DelaySeconds)

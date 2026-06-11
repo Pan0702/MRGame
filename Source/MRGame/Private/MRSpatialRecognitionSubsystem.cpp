@@ -570,20 +570,29 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 				continue;
 			}
 
+			const bool bIsCeiling = Anchor->SemanticClassifications.Contains(FMRUKLabels::Ceiling);
+			const bool bIsFloor = Anchor->SemanticClassifications.Contains(FMRUKLabels::Floor);
+			const bool bIsWall = Anchor->SemanticClassifications.Contains(FMRUKLabels::WallFace);
+
 			// 設定で天井/床を除外できるようにする。
-			if (!bIncludeCeilingInOcclusion && Anchor->SemanticClassifications.Contains(FMRUKLabels::Ceiling))
+			if (!bIncludeCeilingInOcclusion && bIsCeiling)
 			{
 				continue;
 			}
-			if (!bIncludeFloorInOcclusion && Anchor->SemanticClassifications.Contains(FMRUKLabels::Floor))
+			if (!bIncludeFloorInOcclusion && bIsFloor)
 			{
 				continue;
 			}
 
-			// アンカーの形状に沿ったコリジョン付きプロシージャルメッシュを生成する（マテリアルは付けない）。
+			// アンカーの形状に沿ったコリジョン付きプロシージャルメッシュを生成する。
 			// 窓/ドア/開口は穴を開けて、その部分は隠さない。
+			// マテリアルの貼り分け:
+			// - 壁/天井: デバッグ可視化時でもマテリアルを貼らない（純粋なオクルージョン専用）。
+			// - 床/家具: デバッグ可視化が有効なら DebugMeshMaterial を貼って目視確認できる。
 			const TArray<FString> CutHoleLabels = { FMRUKLabels::WindowFrame, FMRUKLabels::DoorFrame, FMRUKLabels::Opening };
-			Anchor->AttachProceduralMesh(CutHoleLabels, /*GenerateCollision=*/true, /*ProceduralMaterial=*/nullptr);
+			const bool bAllowMaterial = bDebugVisualizeMesh && !bIsWall && !bIsCeiling;
+			UMaterialInterface* MeshMaterial = bAllowMaterial ? DebugMeshMaterial.Get() : nullptr;
+			Anchor->AttachProceduralMesh(CutHoleLabels, /*GenerateCollision=*/true, MeshMaterial);
 
 			UProceduralMeshComponent* Mesh = Anchor->ProceduralMeshComponent;
 			if (!Mesh)
@@ -591,14 +600,29 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 				continue;
 			}
 
-			// オクルージョン設定の肝:
-			// - メインパス(色)では描かない → 見えない（パススルーの現実映像が透ける）
-			// - 深度パスには書き込む → このメッシュより奥にある敵が深度テストで隠される
-			Mesh->SetRenderInMainPass(false);
+			// デバッグ可視化は壁/天井を除いて適用（壁/天井は常に不可視オクルージョン）。
+			const bool bVisualizeThis = bDebugVisualizeMesh && !bIsWall && !bIsCeiling;
+			if (bVisualizeThis)
+			{
+				// デバッグ: 部屋メッシュをメインパスでも描画して目視確認できるようにする。
+				Mesh->SetRenderInMainPass(true);
+			}
+			else
+			{
+				// オクルージョン設定の肝:
+				// - メインパス(色)では描かない → 見えない（パススルーの現実映像が透ける）
+				// - 深度パスには書き込む → このメッシュより奥にある敵が深度テストで隠される
+				Mesh->SetRenderInMainPass(false);
+			}
 			Mesh->SetRenderInDepthPass(true);
 			Mesh->bRenderInDepthPass = true;
 			Mesh->SetCastShadow(false);
 			Mesh->SetVisibility(true); // Visibility自体はtrue（描画判断はMainPassフラグ側で行う）。
+
+			// 床メッシュだけ NavMesh の生成対象にする（敵AIが床の上だけを歩けるように）。
+			// 壁/天井/家具は床の歩行可能領域から除外したいので Nav 非対象のままにする。
+			Mesh->SetCanEverAffectNavigation(bIsFloor);
+
 			Mesh->MarkRenderStateDirty();
 
 			++NumConfigured;

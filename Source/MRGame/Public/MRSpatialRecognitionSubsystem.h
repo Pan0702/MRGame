@@ -11,6 +11,7 @@ class AMRUKAnchor;
 class AMRUKRoom;
 class UMRUKSubsystem;
 class UAndroidPermissionCallbackProxy;
+class UMaterialInterface;
 
 USTRUCT(BlueprintType)
 struct FMRSpatialAnchorInfo
@@ -182,6 +183,18 @@ public:
 	/** 天井アンカーをオクルージョンに含めるか（見上げた時に敵を隠したくなければ false）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
 	bool bIncludeCeilingInOcclusion = true;
+
+	/**
+	 * デバッグ用: true にすると、オクルージョンメッシュをメインパスでも描画する（部屋が認識
+	 * できているか目視確認できる）。DebugMeshMaterial が設定されていればそれを、無ければ
+	 * 既定のプロシージャルマテリアルを使う。確認が済んだら false に戻すこと（本番は不可視）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
+	bool bDebugVisualizeMesh = false;
+
+	/** デバッグ可視化時にメッシュへ適用するマテリアル（任意。未設定なら描画のみ有効化）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
+	TObjectPtr<UMaterialInterface> DebugMeshMaterial;
 
 private:
 	UFUNCTION()

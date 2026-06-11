@@ -7,6 +7,10 @@
 #include "Components/CapsuleComponent.h"
 #include "GameFramework/Pawn.h"
 #include "Kismet/GameplayStatics.h"
+#include "NavigationSystem.h"
+#include "NavigationData.h"
+#include "NavMesh/RecastNavMesh.h"
+#include "DrawDebugHelpers.h"
 #include "MRSpatialRecognitionSubsystem.h"
 #include "OculusXRPassthroughLayerComponent.h"
 #include "OculusXRPassthroughSubsystem.h"
@@ -15,6 +19,18 @@
 
 AGM_DemoScene::AGM_DemoScene()
 {
+	// NavMeshデバッグ描画のため Tick を有効化（既定では GameMode は Tick しない）。
+	PrimaryActorTick.bCanEverTick = true;
+}
+
+void AGM_DemoScene::Tick(float DeltaSeconds)
+{
+	Super::Tick(DeltaSeconds);
+
+	if (bDebugDrawNavMesh)
+	{
+		DebugDrawNavMesh();
+	}
 }
 
 void AGM_DemoScene::BeginPlay()
@@ -174,6 +190,26 @@ bool AGM_DemoScene::ResolveSpawnTransform(FVector& OutLocation, FRotator& OutRot
 			+ FVector(0.0f, 0.0f, SpawnHeightOffset);
 	}
 
+	// 湧き候補点を NavMesh 上に投影して、歩行可能領域（床）の外に湧かないようにする。
+	// 投影できなければ「範囲外」なので、その回のスポーンはキャンセルする。
+	if (bProjectSpawnToNavMesh)
+	{
+		if (const UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld()))
+		{
+			FNavLocation ProjectedLoc;
+			if (NavSys->ProjectPointToNavigation(SpawnLoc, ProjectedLoc, NavProjectExtent))
+			{
+				// 投影後のZは床面。SpawnHeightOffset は既に乗っているので投影点へ差し替える。
+				SpawnLoc = ProjectedLoc.Location + FVector(0.0f, 0.0f, SpawnHeightOffset);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Verbose, TEXT("ResolveSpawnTransform: spawn point off NavMesh; skipping this spawn"));
+				return false;
+			}
+		}
+	}
+
 	OutLocation = SpawnLoc;
 	OutRotation = (PlayerLocation - SpawnLoc).GetSafeNormal2D().Rotation();
 	return true;
@@ -227,7 +263,12 @@ void AGM_DemoScene::NotifyEnemyKilled()
 	AliveCount = FMath::Max(0, AliveCount - 1);
 	++TotalKills;
 
-	MaintainDesiredAliveCount();
+	// 1体死んだら1体だけ補充する（DesiredAliveCount を超えない範囲で）。
+	// MaintainDesiredAliveCount だと不足ぶんを一気に湧かせてしまうため、ここでは使わない。
+	if (AliveCount < DesiredAliveCount)
+	{
+		CreateEnemies();
+	}
 }
 
 void AGM_DemoScene::DestoroyEnemies()
@@ -282,6 +323,10 @@ void AGM_DemoScene::InitializeOcclusion()
 	{
 		if (UMRSpatialRecognitionSubsystem* Spatial = World->GetSubsystem<UMRSpatialRecognitionSubsystem>())
 		{
+			// デバッグ可視化の設定を、部屋ロード（→BuildOcclusionMeshes）が走る前に渡す。
+			Spatial->bDebugVisualizeMesh = bDebugVisualizeRoomMesh;
+			Spatial->DebugMeshMaterial = DebugRoomMeshMaterial;
+
 			if (bScanRoomOnStart)
 			{
 				// 起動毎にアプリ内から部屋スキャン（スペース設定）を起動する。
@@ -362,6 +407,60 @@ void AGM_DemoScene::MaintainDesiredAliveCount()
 	for (int32 Attempt = 0; Attempt < MaxAttempts && AliveCount < DesiredAliveCount; ++Attempt)
 	{
 		CreateEnemies();
+	}
+}
+
+void AGM_DemoScene::DebugDrawNavMesh() const
+{
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	const UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World);
+	if (!NavSys)
+	{
+		return;
+	}
+
+	// const版（引数なし）の getter を使う。MainNavData を返すだけで生成はしない。
+	const ANavigationData* NavData = NavSys->GetDefaultNavDataInstance();
+	if (!NavData)
+	{
+		return;
+	}
+
+	const ARecastNavMesh* RecastNav = Cast<ARecastNavMesh>(NavData);
+	if (!RecastNav)
+	{
+		return;
+	}
+
+	// NavMeshの歩行可能ポリゴンを三角形メッシュとして取得し、緑のワイヤーで描く。
+	// 床(Floorアンカー)だけが Nav 対象なので、緑の面＝敵が歩ける範囲。
+	// 無効な FNavTileRef を渡すと全タイル分のジオメトリをまとめて集める（API仕様）。
+	FRecastDebugGeometry Geometry;
+	RecastNav->GetDebugGeometryForTile(Geometry, FNavTileRef());
+
+	const TArray<FVector>& Verts = Geometry.MeshVerts;
+	const TArray<int32>& Indices = Geometry.AreaIndices[RECAST_DEFAULT_AREA];
+	// 床面に貼りつくと見にくいので少しだけ上げて描画する。
+	const FVector Lift(0.0f, 0.0f, 3.0f);
+	const FColor NavColor = FColor::Green;
+
+	for (int32 i = 0; i + 2 < Indices.Num(); i += 3)
+	{
+		if (!Verts.IsValidIndex(Indices[i]) || !Verts.IsValidIndex(Indices[i + 1]) || !Verts.IsValidIndex(Indices[i + 2]))
+		{
+			continue;
+		}
+		const FVector A = Verts[Indices[i]] + Lift;
+		const FVector B = Verts[Indices[i + 1]] + Lift;
+		const FVector C = Verts[Indices[i + 2]] + Lift;
+		DrawDebugLine(World, A, B, NavColor, false, -1.0f, 0, 0.5f);
+		DrawDebugLine(World, B, C, NavColor, false, -1.0f, 0, 0.5f);
+		DrawDebugLine(World, C, A, NavColor, false, -1.0f, 0, 0.5f);
 	}
 }
 

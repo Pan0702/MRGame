@@ -18,12 +18,21 @@ class MRGAME_API AGM_DemoScene : public AGameModeBase
 public:
 	AGM_DemoScene();
 	virtual void BeginPlay() override;
+	virtual void Tick(float DeltaSeconds) override;
 	bool CreateEnemies();
 	void NotifyEnemyKilled();
 	void DestoroyEnemies();
 
 	UFUNCTION(BlueprintPure, Category = "EnemyNum")
 	int32 GetTotalKills() const { return TotalKills; }
+
+	// 歩行範囲（NavMesh）のデバッグ描画を ON/OFF する。
+	UFUNCTION(BlueprintCallable, Category = "Spawn|Debug")
+	void SetDebugDrawNavMesh(bool bEnabled) { bDebugDrawNavMesh = bEnabled; }
+
+	// 歩行範囲（NavMesh）のデバッグ描画をトグルする。
+	UFUNCTION(BlueprintCallable, Category = "Spawn|Debug")
+	void ToggleDebugDrawNavMesh() { bDebugDrawNavMesh = !bDebugDrawNavMesh; }
 
 	// 部屋スキャン/ロード完了(OnSceneLoaded)で呼ばれる。壁を測ってループを開始する。
 	UFUNCTION()
@@ -61,6 +70,15 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "MR|Occlusion")
 	bool bScanRoomOnStart = true;
 
+	// デバッグ用: 部屋メッシュを可視マテリアルで描画して、ロードできているか目視確認する。
+	// 本番では false（不可視オクルージョン）に戻すこと。
+	UPROPERTY(EditAnywhere, Category = "MR|Occlusion")
+	bool bDebugVisualizeRoomMesh = false;
+
+	// デバッグ可視化時に部屋メッシュへ適用するマテリアル（任意。未設定なら描画のみ有効化）。
+	UPROPERTY(EditAnywhere, Category = "MR|Occlusion")
+	TObjectPtr<class UMaterialInterface> DebugRoomMeshMaterial;
+
 	// 湧かす敵のBPクラス候補。BP_GM_Demo のディテールで BP_Enemy を1つ以上セットする。
 	// （EnemySpawner Actor を介さず、GameModeが直接ここから敵をスポーンする。）
 	UPROPERTY(EditAnywhere, Category = "Spawn")
@@ -77,6 +95,20 @@ protected:
 	// 湧き位置に加える高さオフセット(cm)。
 	UPROPERTY(EditAnywhere, Category = "Spawn")
 	float SpawnHeightOffset = 0.0f;
+
+	// 湧き位置を NavMesh 上に投影して、歩行可能領域（床）の外に湧かないようにするか。
+	// 投影に失敗（NavMesh外）した場合、その回のスポーンはキャンセルする（範囲外には出さない）。
+	UPROPERTY(EditAnywhere, Category = "Spawn")
+	bool bProjectSpawnToNavMesh = true;
+
+	// NavMesh 投影時の許容ズレ(cm)。湧き候補点からこの範囲内で最寄りの歩行可能点を探す。
+	UPROPERTY(EditAnywhere, Category = "Spawn")
+	FVector NavProjectExtent = FVector(150.0f, 150.0f, 300.0f);
+
+	// デバッグ用: 敵が歩ける範囲（NavMesh）を毎フレーム描画して目視確認する。
+	// 実行中に BP から ON/OFF できる（SetDebugDrawNavMesh / 直接書き込み）。本番では false に。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Debug")
+	bool bDebugDrawNavMesh = false;
 
 	// 接地用の見えないコリジョン床を生成するか。パススルー空間には物理床が無いため、
 	// これが無いと敵(Character)は重力で落下し続ける。
@@ -104,6 +136,9 @@ private:
 	void InitializeOcclusion();
 	void StartLoop();
 	void MaintainDesiredAliveCount();
+
+	// デバッグ用: 敵が歩ける範囲（NavMesh）の境界をワイヤーフレームで描画する。
+	void DebugDrawNavMesh() const;
 
 	// 部屋メッシュへのLineTraceで、壁前のクリアな湧き位置・向きを1つ求める（無理ならフォールバック）。
 	bool ResolveSpawnTransform(FVector& OutLocation, FRotator& OutRotation) const;

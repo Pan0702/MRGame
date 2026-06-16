@@ -369,6 +369,47 @@ bool UMRSpatialRecognitionSubsystem::FindClearSpawnPoint(const FVector& PlayerLo
 	return false;
 }
 
+bool UMRSpatialRecognitionSubsystem::GetSpawnPointsAlongFarthestWall(int32 NumPoints, float Spacing,
+	TArray<FVector>& OutPoints, FVector& OutWallInward) const
+{
+	OutPoints.Reset();
+	OutWallInward = FVector::ZeroVector;
+
+	if (!bWallBaseValid || NumPoints <= 0)
+	{
+		return false;
+	}
+
+	const FVector WallInward = CachedWallNormal.GetSafeNormal2D();
+	const FVector RightDir = FVector::CrossProduct(FVector::UpVector, WallInward).GetSafeNormal();
+	if (WallInward.IsNearlyZero() || RightDir.IsNearlyZero())
+	{
+		return false;
+	}
+
+	// 壁前 WallOffset の中心点を基準に、左右に等間隔で並べる。
+	const FVector Base = CachedWallPoint + WallInward * WallOffset;
+	const float HalfRange = Spacing * (NumPoints - 1) * 0.5f;
+
+	OutPoints.Reserve(NumPoints);
+	for (int32 i = 0; i < NumPoints; ++i)
+	{
+		const float Side = -HalfRange + Spacing * i;
+		FVector P = Base + RightDir * Side;
+		// 床高さに合わせる（取れなければ CachedWallPoint.Z のままにしておく）。
+		float FloorZ = 0.0f;
+		// 非const内部実装にアクセスするため、ここだけ const を外して呼ぶ。
+		if (const_cast<UMRSpatialRecognitionSubsystem*>(this)->MeasureFloorHeight(P, FloorZ))
+		{
+			P.Z = FloorZ;
+		}
+		OutPoints.Add(P);
+	}
+
+	OutWallInward = WallInward;
+	return true;
+}
+
 bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocation, float& OutFloorZ)
 {
 	// 床高さは、まず MRUK の床アンカーの高さを直接使う。
@@ -376,7 +417,14 @@ bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocat
 	if (UMRUKSubsystem* MRUKSubsystem = GetMRUKSubsystem())
 	{
 		const AMRUKAnchor* BestFloor = nullptr;
-		float BestDistSq = TNumericLimits<float>::Max();
+		// 複数の床アンカーがある場合、95.7 より低い「余計な床アンカー」が混ざっていて
+		// そこに敵が落ちてスポーンする問題があった。最も Z が高い床アンカー＝本物の床を採用し、
+		// 低いアンカーは無視する。
+		float BestZ = -TNumericLimits<float>::Max();
+
+		// デバッグ: 床アンカーが何枚あり、それぞれの Z・ラベルが何かを出して
+		// 「95.7より低いアンカーが本当に Floor ラベルなのか」を確認する。
+		int32 FloorAnchorCount = 0;
 
 		for (const AMRUKRoom* Room : MRUKSubsystem->Rooms)
 		{
@@ -390,11 +438,18 @@ bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocat
 				{
 					continue;
 				}
-				// 複数床アンカーがある場合は FromLocation のXYに最も近いものを選ぶ。
-				const float DistSq = FVector::DistSquared2D(Floor->GetActorLocation(), FromLocation);
-				if (DistSq < BestDistSq)
+
+				++FloorAnchorCount;
+				const FVector AnchorLoc = Floor->GetActorLocation();
+				const FString Labels = FString::Join(Floor->SemanticClassifications, TEXT(","));
+				UE_LOG(LogTemp, Log,
+				       TEXT("MeasureFloorHeight: FloorAnchor[%d] Z=%.1f loc=(%.1f,%.1f,%.1f) labels=[%s]"),
+				       FloorAnchorCount - 1, AnchorLoc.Z, AnchorLoc.X, AnchorLoc.Y, AnchorLoc.Z, *Labels);
+
+				// 最も高い床アンカーを採用する（低い余計なアンカーは無視）。
+				if (AnchorLoc.Z > BestZ)
 				{
-					BestDistSq = DistSq;
+					BestZ = AnchorLoc.Z;
 					BestFloor = Floor;
 				}
 			}
@@ -403,6 +458,9 @@ bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocat
 		if (BestFloor)
 		{
 			OutFloorZ = BestFloor->GetActorLocation().Z;
+			UE_LOG(LogTemp, Log,
+			       TEXT("MeasureFloorHeight: selected highest FloorAnchor Z=%.1f (of %d anchors)"),
+			       OutFloorZ, FloorAnchorCount);
 			return true;
 		}
 	}

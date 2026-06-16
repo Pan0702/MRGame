@@ -88,6 +88,20 @@ public:
 	bool IsFrontWallCalibrated() const { return bWallBaseValid; }
 
 	/**
+	 * 最遠壁（CalibrateFrontWallでキャッシュ済み）の壁面に沿って、等間隔のN点を返す。
+	 * 各点は壁面より WallOffset だけ部屋内側へオフセットされ、Zは床高さ（床アンカーがあれば）。
+	 * Spawnerアクターを壁沿いに自動配置するのに使う。
+	 * @param NumPoints  生成する点数（>=1）
+	 * @param Spacing    点と点の間隔(cm)
+	 * @param OutPoints  ワールド座標の配列
+	 * @param OutWallInward 壁の内向き法線（向きを揃えるのに使う）
+	 * @return 取得できたら true
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MR|Spatial|NoScan")
+	bool GetSpawnPointsAlongFarthestWall(int32 NumPoints, float Spacing,
+		TArray<FVector>& OutPoints, FVector& OutWallInward) const;
+
+	/**
 	 * 指定したワールド座標の真下へDepthレイを撃ち、床面の高さ(Z)を測る。
 	 * パススルー空間には物理コリジョンが無いため、敵を床に接地させる高さを得るのに使う。
 	 * @param FromLocation  測定の起点（この水平位置の真下を見る）。Z は頭上側から下ろすため少し上げて使う。

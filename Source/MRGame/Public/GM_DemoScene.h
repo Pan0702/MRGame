@@ -84,6 +84,24 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Spawn")
 	TArray<TSubclassOf<AEnemy>> EnemyClasses;
 
+	// 部屋ロード後に最遠壁沿いへ Spawner を自動配置するか。
+	// true: SpawnerCount 個の AEnemySpawner を壁前に並べ、CreateEnemies はそれらをランダム選択。
+	// false: 従来どおりプレイヤー基準で都度湧き位置を計算する。
+	UPROPERTY(EditAnywhere, Category = "Spawn")
+	bool bUseWallSpawners = true;
+
+	// 壁沿いに配置する Spawner の個数。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "1"))
+	int32 SpawnerCount = 5;
+
+	// 壁沿い Spawner の間隔(cm)。中央を基準に左右対称に並べる。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "1"))
+	float SpawnerSpacing = 120.0f;
+
+	// 壁沿いに配置する Spawner のクラス（未指定なら AEnemySpawner を使う）。
+	UPROPERTY(EditAnywhere, Category = "Spawn")
+	TSubclassOf<class AEnemySpawner> SpawnerClass;
+
 	// Depthで壁前のクリア点が見つからなかった時のフォールバック: プレイヤー正面のこの距離(cm)に湧かす。
 	UPROPERTY(EditAnywhere, Category = "Spawn")
 	float FallbackSpawnDistance = 450.0f;
@@ -98,12 +116,20 @@ protected:
 
 	// 湧き位置を NavMesh 上に投影して、歩行可能領域（床）の外に湧かないようにするか。
 	// 投影に失敗（NavMesh外）した場合、その回のスポーンはキャンセルする（範囲外には出さない）。
+	// ※ true の時は SpawnNavInvoker で MRUK 床メッシュ周囲に NavMesh を生成させる。
 	UPROPERTY(EditAnywhere, Category = "Spawn")
 	bool bProjectSpawnToNavMesh = true;
 
 	// NavMesh 投影時の許容ズレ(cm)。湧き候補点からこの範囲内で最寄りの歩行可能点を探す。
 	UPROPERTY(EditAnywhere, Category = "Spawn")
 	FVector NavProjectExtent = FVector(150.0f, 150.0f, 300.0f);
+
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	float MaxNavProjectionDistance = 80.0f;
+
+	// NavMesh投影が失敗した時に、候補点の近くで歩ける代替点を探す半径(cm)。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	float NavFallbackSearchRadius = 500.0f;
 
 	// デバッグ用: 敵が歩ける範囲（NavMesh）を毎フレーム描画して目視確認する。
 	// 実行中に BP から ON/OFF できる（SetDebugDrawNavMesh / 直接書き込み）。本番では false に。
@@ -112,8 +138,10 @@ protected:
 
 	// 接地用の見えないコリジョン床を生成するか。パススルー空間には物理床が無いため、
 	// これが無いと敵(Character)は重力で落下し続ける。
+	// ※ 既定で OFF。床に敵が湧いて困るため一旦無効化。必要になったら BP_GM のディテールで true に戻す。
+	//    （true にすると床と一緒に NavigationInvoker も生成され NavMesh が作られる。）
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
-	bool bSpawnGroundCollision = true;
+	bool bSpawnGroundCollision = false;
 
 	// 生成する見えない床の一辺の半分(cm)。プレイヤー中心にこの範囲を覆う。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
@@ -123,12 +151,25 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
 	float GroundThickness = 10.0f;
 
+	// NavMesh 生成用 Invoker の生成半径(cm)。プレイヤー足元中心に、この半径ぶんだけ
+	// MRUK 床メッシュ上に NavMesh タイルを張る。最遠壁まで届くよう十分に大きく取る。
+	UPROPERTY(EditAnywhere, Category = "MR|Floor")
+	float NavInvokerGenerationRadius = 1500.0f;
+
 	int32 AliveCount = 0;
 	bool bLoopActive = false;
+
+	// 部屋ロード時に生成した壁沿い Spawner たち。
+	UPROPERTY()
+	TArray<TObjectPtr<class AEnemySpawner>> WallSpawners;
 
 	// 生成した見えない床アクター（重複生成しないよう保持）。
 	UPROPERTY()
 	TObjectPtr<AActor> GroundActor;
+
+	// NavMesh 生成用 Invoker を載せたアクター（重複生成しないよう保持）。
+	UPROPERTY()
+	TObjectPtr<AActor> NavInvokerActor;
 
 private:
 	void InitializePassthrough();
@@ -136,6 +177,9 @@ private:
 	void InitializeOcclusion();
 	void StartLoop();
 	void MaintainDesiredAliveCount();
+
+	// 最遠壁沿いに Spawner を SpawnerCount 個生成する。
+	void SpawnWallSpawners();
 
 	// デバッグ用: 敵が歩ける範囲（NavMesh）の境界をワイヤーフレームで描画する。
 	void DebugDrawNavMesh() const;
@@ -152,6 +196,10 @@ private:
 	// プレイヤー足元の床高さを測り、その高さに見えないコリジョン床を生成する。
 	// 敵(Character)が落下せず床を歩けるようにするため。
 	void SpawnGroundCollision();
+
+	// プレイヤー足元に NavigationInvoker アクターを置き、MRUK 床メッシュ周囲に
+	// 実行時 NavMesh を生成させる。bProjectSpawnToNavMesh が true の時に使う。
+	void SpawnNavInvoker();
 
 	// 部屋ロードが一定時間で完了しない場合に、フォールバックでループを開始する。
 	void StartLoopFallbackIfNeeded();

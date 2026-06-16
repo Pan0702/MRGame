@@ -38,8 +38,11 @@ AVRPawn::AVRPawn()
 void AVRPawn::BeginPlay()
 {
 	Super::BeginPlay();
-	//原点を床基準にセット
-	UHeadMountedDisplayFunctionLibrary::SetTrackingOrigin(EHMDTrackingOrigin::LocalFloor);
+	// 原点を Stage（実空間に固定された床原点）にセットする。
+	// MRUK の部屋アンカー（壁/床/家具）は Stage 空間基準で配置されるため、ここを LocalFloor
+	// （アプリ起動時のヘッド足元基準）にすると部屋全体が現実の物体からずれて MR が破綻する。
+	// Stage に合わせることで部屋メッシュ・敵の湧き位置がパススルーの実物体と一致する。
+	UHeadMountedDisplayFunctionLibrary::SetTrackingOrigin(EHMDTrackingOrigin::Stage);
 
 	if (SwordClass)
 	{

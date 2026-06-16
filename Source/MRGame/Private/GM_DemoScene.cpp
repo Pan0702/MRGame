@@ -3,13 +3,16 @@
 
 #include "GM_DemoScene.h"
 #include "Enemy.h"
+#include "EnemySpawner.h"
 #include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/SceneComponent.h"
 #include "GameFramework/Pawn.h"
 #include "Kismet/GameplayStatics.h"
 #include "NavigationSystem.h"
 #include "NavigationData.h"
 #include "NavMesh/RecastNavMesh.h"
+#include "NavigationInvokerComponent.h"
 #include "DrawDebugHelpers.h"
 #include "MRSpatialRecognitionSubsystem.h"
 #include "OculusXRPassthroughLayerComponent.h"
@@ -101,6 +104,20 @@ void AGM_DemoScene::HandleSceneReady(bool bSuccess)
 	{
 		SpawnGroundCollision();
 	}
+
+	// NavMesh 投影を使うなら、MRUK 床メッシュ周囲に NavMesh を生成させる Invoker を先に置く。
+	// （Spawner 配置や ResolveSpawnTransform の投影が成立する前提。SpawnWallSpawners より前に呼ぶ。）
+	if (bProjectSpawnToNavMesh)
+	{
+		SpawnNavInvoker();
+	}
+
+	// 壁沿いに Spawner を並べる（CalibrateFrontWall 成功後でないと意味がないのでここで）。
+	if (bUseWallSpawners && bCalibrated)
+	{
+		SpawnWallSpawners();
+	}
+
 	StartLoop();
 }
 
@@ -120,16 +137,63 @@ void AGM_DemoScene::StartLoopFallbackIfNeeded()
 
 bool AGM_DemoScene::CreateEnemies()
 {
-	if (!bLoopActive || EnemyClasses.Num() == 0 || AliveCount >= DesiredAliveCount)
+	if (!bLoopActive)
 	{
 		return false;
 	}
 
-	// Depth(壁前のクリア点) or フォールバックで湧き位置を決める。
+	if (EnemyClasses.Num() == 0)
+	{
+		UE_LOG(LogTemp, Error, TEXT("CreateEnemies: spawn failed because EnemyClasses is empty"));
+		return false;
+	}
+
+	if (AliveCount >= DesiredAliveCount)
+	{
+		return false;
+	}
+
+	// 壁沿い Spawner 方式: 並んだ Spawner からランダムに 1 個選んで SpawnOne。
+	if (bUseWallSpawners && WallSpawners.Num() > 0)
+	{
+		// 生きている Spawner だけを選ぶ。
+		TArray<AEnemySpawner*> Alive;
+		Alive.Reserve(WallSpawners.Num());
+		for (AEnemySpawner* S : WallSpawners)
+		{
+			if (S)
+			{
+				Alive.Add(S);
+			}
+		}
+		if (Alive.Num() == 0)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CreateEnemies: spawn failed because all WallSpawners are invalid. StoredWallSpawners=%d"), WallSpawners.Num());
+			return false;
+		}
+		AEnemySpawner* Picked = Alive[FMath::RandRange(0, Alive.Num() - 1)];
+		if (Picked->SpawnOne() != nullptr)
+		{
+			++AliveCount;
+			UE_LOG(LogTemp, Log, TEXT("Enemy spawned via Spawner. AliveCount:%d DesiredAliveCount:%d"), AliveCount, DesiredAliveCount);
+			return true;
+		}
+		UE_LOG(LogTemp, Warning,
+			TEXT("CreateEnemies: spawn failed via Spawner. Spawner=%s Location=%s AliveSpawners=%d DesiredAliveCount=%d AliveCount=%d"),
+			*GetNameSafe(Picked),
+			Picked ? *Picked->GetActorLocation().ToCompactString() : TEXT("null"),
+			Alive.Num(),
+			DesiredAliveCount,
+			AliveCount);
+		return false;
+	}
+
+	// 従来方式: Depth/フォールバックで湧き位置を決め、GM が直接生成する。
 	FVector SpawnLocation = FVector::ZeroVector;
 	FRotator SpawnRotation = FRotator::ZeroRotator;
 	if (!ResolveSpawnTransform(SpawnLocation, SpawnRotation))
 	{
+		UE_LOG(LogTemp, Warning, TEXT("CreateEnemies: spawn failed because ResolveSpawnTransform failed"));
 		return false;
 	}
 
@@ -140,6 +204,10 @@ bool AGM_DemoScene::CreateEnemies()
 		return true;
 	}
 
+	UE_LOG(LogTemp, Error,
+		TEXT("CreateEnemies: spawn failed because SpawnEnemyAt failed. Location=%s Rotation=%s"),
+		*SpawnLocation.ToCompactString(),
+		*SpawnRotation.ToCompactString());
 	return false;
 }
 
@@ -148,6 +216,7 @@ bool AGM_DemoScene::ResolveSpawnTransform(FVector& OutLocation, FRotator& OutRot
 	const APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0);
 	if (!PlayerPawn)
 	{
+		UE_LOG(LogTemp, Warning, TEXT("ResolveSpawnTransform: failed because player pawn is null"));
 		return false;
 	}
 
@@ -157,6 +226,7 @@ bool AGM_DemoScene::ResolveSpawnTransform(FVector& OutLocation, FRotator& OutRot
 	Forward = Forward.GetSafeNormal();
 	if (Forward.IsNearlyZero())
 	{
+		UE_LOG(LogTemp, Warning, TEXT("ResolveSpawnTransform: failed because player forward vector is zero. Player=%s"), *GetNameSafe(PlayerPawn));
 		return false;
 	}
 
@@ -194,19 +264,64 @@ bool AGM_DemoScene::ResolveSpawnTransform(FVector& OutLocation, FRotator& OutRot
 	// 投影できなければ「範囲外」なので、その回のスポーンはキャンセルする。
 	if (bProjectSpawnToNavMesh)
 	{
-		if (const UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld()))
+		if (UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld()))
 		{
 			FNavLocation ProjectedLoc;
 			if (NavSys->ProjectPointToNavigation(SpawnLoc, ProjectedLoc, NavProjectExtent))
 			{
 				// 投影後のZは床面。SpawnHeightOffset は既に乗っているので投影点へ差し替える。
+				if (FVector::DistSquared2D(SpawnLoc, ProjectedLoc.Location) > FMath::Square(MaxNavProjectionDistance))
+				{
+					UE_LOG(LogTemp, Log,
+						TEXT("ResolveSpawnTransform: projected point was too far; trying nearby reachable point. Candidate=%s Projected=%s MaxNavProjectionDistance=%.1f"),
+						*SpawnLoc.ToCompactString(),
+						*ProjectedLoc.Location.ToCompactString(),
+						MaxNavProjectionDistance);
+					if (NavFallbackSearchRadius <= 0.0f ||
+						!NavSys->GetRandomReachablePointInRadius(SpawnLoc, NavFallbackSearchRadius, ProjectedLoc))
+					{
+						UE_LOG(LogTemp, Warning,
+							TEXT("ResolveSpawnTransform: spawn failed; no reachable NavMesh point near far projection. Candidate=%s NavFallbackSearchRadius=%.1f"),
+							*SpawnLoc.ToCompactString(),
+							NavFallbackSearchRadius);
+						return false;
+					}
+					UE_LOG(LogTemp, Log,
+						TEXT("ResolveSpawnTransform: recovered spawn on NavMesh. Candidate=%s Recovered=%s SearchRadius=%.1f"),
+						*SpawnLoc.ToCompactString(),
+						*ProjectedLoc.Location.ToCompactString(),
+						NavFallbackSearchRadius);
+				}
 				SpawnLoc = ProjectedLoc.Location + FVector(0.0f, 0.0f, SpawnHeightOffset);
 			}
 			else
 			{
-				UE_LOG(LogTemp, Verbose, TEXT("ResolveSpawnTransform: spawn point off NavMesh; skipping this spawn"));
-				return false;
+				UE_LOG(LogTemp, Log,
+					TEXT("ResolveSpawnTransform: candidate is off NavMesh; trying nearby reachable point. Candidate=%s NavProjectExtent=%s"),
+					*SpawnLoc.ToCompactString(),
+					*NavProjectExtent.ToCompactString());
+				if (NavFallbackSearchRadius <= 0.0f ||
+					!NavSys->GetRandomReachablePointInRadius(SpawnLoc, NavFallbackSearchRadius, ProjectedLoc))
+				{
+					UE_LOG(LogTemp, Warning,
+						TEXT("ResolveSpawnTransform: spawn failed; no NavMesh point near candidate. Candidate=%s NavProjectExtent=%s NavFallbackSearchRadius=%.1f"),
+						*SpawnLoc.ToCompactString(),
+						*NavProjectExtent.ToCompactString(),
+						NavFallbackSearchRadius);
+					return false;
+				}
+				UE_LOG(LogTemp, Log,
+					TEXT("ResolveSpawnTransform: recovered spawn on NavMesh. Candidate=%s Recovered=%s SearchRadius=%.1f"),
+					*SpawnLoc.ToCompactString(),
+					*ProjectedLoc.Location.ToCompactString(),
+					NavFallbackSearchRadius);
+				SpawnLoc = ProjectedLoc.Location + FVector(0.0f, 0.0f, SpawnHeightOffset);
 			}
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("ResolveSpawnTransform: spawn failed because NavigationSystem is unavailable"));
+			return false;
 		}
 	}
 
@@ -220,6 +335,9 @@ AEnemy* AGM_DemoScene::SpawnEnemyAt(const FVector& Location, const FRotator& Rot
 	UWorld* World = GetWorld();
 	if (!World || EnemyClasses.Num() == 0)
 	{
+		UE_LOG(LogTemp, Error, TEXT("SpawnEnemyAt: failed because World or EnemyClasses is invalid. World=%s EnemyClasses=%d"),
+			World ? TEXT("valid") : TEXT("null"),
+			EnemyClasses.Num());
 		return nullptr;
 	}
 
@@ -237,6 +355,11 @@ AEnemy* AGM_DemoScene::SpawnEnemyAt(const FVector& Location, const FRotator& Rot
 	AEnemy* Enemy = World->SpawnActor<AEnemy>(PickedClass, Location, Rotation, Params);
 	if (!Enemy)
 	{
+		UE_LOG(LogTemp, Error,
+			TEXT("SpawnEnemyAt: SpawnActor failed. Class=%s Location=%s Rotation=%s"),
+			*GetNameSafe(PickedClass.Get()),
+			*Location.ToCompactString(),
+			*Rotation.ToCompactString());
 		return nullptr;
 	}
 
@@ -410,6 +533,84 @@ void AGM_DemoScene::MaintainDesiredAliveCount()
 	}
 }
 
+void AGM_DemoScene::SpawnWallSpawners()
+{
+	UWorld* World = GetWorld();
+	UMRSpatialRecognitionSubsystem* Spatial = World ? World->GetSubsystem<UMRSpatialRecognitionSubsystem>() : nullptr;
+	if (!World || !Spatial)
+	{
+		return;
+	}
+
+	// 既に生成済みなら作り直し（部屋が変わった可能性に備えて）。
+	for (AEnemySpawner* Old : WallSpawners)
+	{
+		if (Old)
+		{
+			Old->Destroy();
+		}
+	}
+	WallSpawners.Reset();
+
+	TArray<FVector> Points;
+	FVector WallInward = FVector::ZeroVector;
+	if (!Spatial->GetSpawnPointsAlongFarthestWall(SpawnerCount, SpawnerSpacing, Points, WallInward))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("SpawnWallSpawners: GetSpawnPointsAlongFarthestWall failed"));
+		return;
+	}
+
+	TSubclassOf<AEnemySpawner> ClassToSpawn = SpawnerClass;
+	if (!ClassToSpawn)
+	{
+		ClassToSpawn = AEnemySpawner::StaticClass();
+	}
+	// 壁の内向き法線方向＝部屋内側 → プレイヤー側を向くように回転を作る。
+	const FRotator Rot = WallInward.Rotation();
+
+	FActorSpawnParameters Params;
+	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	const UNavigationSystemV1* NavSys = bProjectSpawnToNavMesh ? FNavigationSystem::GetCurrent<UNavigationSystemV1>(World) : nullptr;
+	if (bProjectSpawnToNavMesh && !NavSys)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("SpawnWallSpawners: NavigationSystem unavailable"));
+		return;
+	}
+
+	int32 NumOffNavAtPlacement = 0;
+	for (const FVector& P : Points)
+	{
+		// 配置位置を NavMesh 上に寄せておく（あくまで配置時の見栄え用）。
+		// ただし Invoker による NavMesh 生成は非同期で、この時点ではまだタイルが無いことがある。
+		// その場合でも Spawner は壁前の点にそのまま配置し、実際の湧き時に SpawnOne 側で
+		// 改めて NavMesh 投影させる（投影に失敗した点で Spawner を捨てない）。
+		FVector SpawnPoint = P + FVector(0.0f, 0.0f, SpawnHeightOffset);
+		if (NavSys)
+		{
+			FNavLocation ProjectedLoc;
+			if (NavSys->ProjectPointToNavigation(P, ProjectedLoc, NavProjectExtent) &&
+				FVector::DistSquared2D(P, ProjectedLoc.Location) <= FMath::Square(MaxNavProjectionDistance))
+			{
+				SpawnPoint = ProjectedLoc.Location + FVector(0.0f, 0.0f, SpawnHeightOffset);
+			}
+			else
+			{
+				++NumOffNavAtPlacement;
+			}
+		}
+
+		AEnemySpawner* S = World->SpawnActor<AEnemySpawner>(ClassToSpawn, SpawnPoint, Rot, Params);
+		if (S)
+		{
+			// GMの EnemyClasses を Spawner に流し込む（C++生成時はBPデフォルトでは無いため）。
+			S->SetEnemyClasses(EnemyClasses);
+			WallSpawners.Add(S);
+		}
+	}
+	UE_LOG(LogTemp, Log, TEXT("SpawnWallSpawners: placed %d spawners along farthest wall (%d off-NavMesh at placement time, will re-project on spawn)"), WallSpawners.Num(), NumOffNavAtPlacement);
+}
+
 void AGM_DemoScene::DebugDrawNavMesh() const
 {
 	const UWorld* World = GetWorld();
@@ -539,7 +740,63 @@ void AGM_DemoScene::SpawnGroundCollision()
 	Box->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	Box->SetCollisionObjectType(ECC_WorldStatic);
 	Box->SetCollisionResponseToAllChannels(ECR_Block);
+	// この床を NavMesh の歩行可能面にもしておく（床を有効化した場合の保険）。
+	// 通常は MRUK の床メッシュ側が Nav 対象なので、この床が無くても NavMesh は作られる。
+	Box->SetCanEverAffectNavigation(true);
 	Box->SetHiddenInGame(true); // パススルーの床が見えているので描画は不要。
 
-	UE_LOG(LogTemp, Log, TEXT("SpawnGroundCollision: ground at Z=%.1f (player Z=%.1f)"), FloorZ, PlayerLocation.Z);
+	UE_LOG(LogTemp, Log, TEXT("SpawnGroundCollision: ground at Z=%.1f (player Z=%.1f)"),
+	       FloorZ, PlayerLocation.Z);
+}
+
+void AGM_DemoScene::SpawnNavInvoker()
+{
+	UWorld* World = GetWorld();
+	const APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0);
+	if (!World || !PlayerPawn)
+	{
+		return;
+	}
+
+	// 既に作ってあれば作り直さない。
+	if (NavInvokerActor)
+	{
+		return;
+	}
+
+	// MR空間には NavMeshBoundsVolume を置けない（レベルジオメトリが無い）。
+	// 代わりに NavigationInvoker を独立アクターとしてプレイヤー足元に置き、その周囲だけ
+	// 実行時に NavMesh を生成させる。MRUK の床メッシュ（Nav対象）の上にタイルが張られる。
+	// （bGenerateNavigationOnlyAroundNavigationInvokers=True と組で機能する。DefaultEngine.ini 参照。）
+	const FVector PlayerLocation = PlayerPawn->GetActorLocation();
+
+	FActorSpawnParameters Params;
+	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	NavInvokerActor = World->SpawnActor<AActor>(AActor::StaticClass(), PlayerLocation, FRotator::ZeroRotator, Params);
+	if (!NavInvokerActor)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("SpawnNavInvoker: failed to spawn invoker actor"));
+		return;
+	}
+
+	USceneComponent* Root = NewObject<USceneComponent>(NavInvokerActor);
+	NavInvokerActor->SetRootComponent(Root);
+	Root->RegisterComponent();
+
+	UNavigationInvokerComponent* Invoker = NewObject<UNavigationInvokerComponent>(NavInvokerActor);
+	if (Invoker)
+	{
+		// 生成半径は部屋全体（最遠壁まで）をカバーできる大きさにする（cm）。除去半径はそれより少し広く。
+		Invoker->SetGenerationRadii(NavInvokerGenerationRadius, NavInvokerGenerationRadius + 300.0f);
+		Invoker->RegisterComponent();
+	}
+
+	// 念のためナビへ即時リビルドを促す。
+	if (UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World))
+	{
+		NavSys->Build();
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("SpawnNavInvoker: invoker at %s (radius=%.1f)"),
+	       *PlayerLocation.ToCompactString(), NavInvokerGenerationRadius);
 }

@@ -93,6 +93,10 @@ bool UMRSpatialRecognitionSubsystem::LoadSceneFromDevice()
 	ActiveAsyncLoad = AsyncLoad;
 	AsyncLoad->Success.AddDynamic(this, &UMRSpatialRecognitionSubsystem::HandleAsyncLoadSucceeded);
 	AsyncLoad->Failure.AddDynamic(this, &UMRSpatialRecognitionSubsystem::HandleAsyncLoadFailed);
+	// 重要: LoadSceneFromDeviceAsync はオブジェクト生成のみで、実処理は Activate() が行う。
+	// Blueprintノードとして使うとエンジンが自動で呼ぶが、C++から使う場合は明示的に呼ぶ必要がある。
+	// （これを呼ばないと MRUK の StartDiscovery 自体が一度も実行されず、無音で部屋ゼロになる。）
+	AsyncLoad->Activate();
 	UE_LOG(LogTemp, Log, TEXT("LoadSceneFromDevice: started async load (attempt %d)"), LoadAttemptCount);
 
 	// 保険: Async の Success/Failure が発火しない場合に備え、MRUKSubsystem->Rooms が
@@ -146,6 +150,16 @@ void UMRSpatialRecognitionSubsystem::PollForRooms()
 		{
 			World->GetTimerManager().ClearTimer(RoomsPollTimerHandle);
 		}
+
+		// discoveryが完了イベントを返さないままMRUKがBusyで固まると、以後の
+		// LoadSceneFromDevice が全て弾かれて再試行不能になる。状態をリセットして
+		// HandleSceneLoaded(false) 経由のリトライ（MaxLoadAttemptsまで）に繋げる。
+		if (MRUKSubsystem && MRUKSubsystem->SceneLoadStatus == EMRUKInitStatus::Busy)
+		{
+			MRUKSubsystem->ClearScene();
+		}
+		ActiveAsyncLoad = nullptr;
+		HandleSceneLoaded(false);
 	}
 }
 
@@ -194,21 +208,23 @@ bool UMRSpatialRecognitionSubsystem::LaunchRoomScan()
 	// アプリ内からスペース設定（部屋スキャン）画面を起動する。
 	const bool bLaunched = MRUKSubsystem->LaunchSceneCapture();
 	UE_LOG(LogTemp, Log, TEXT("LaunchRoomScan: scene capture launched=%s"), bLaunched ? TEXT("true") : TEXT("false"));
+	if (!bLaunched)
+	{
+		// 起動直後でXRセッションが整っていない等でスキャン画面が開けないことがある。
+		// その場合は保存済みの部屋データのロードに切り替える（部屋ロードが完全に止まるのを防ぐ）。
+		LoadSceneFromDeviceDeferred(1.0f);
+	}
 	return bLaunched;
 }
 
 void UMRSpatialRecognitionSubsystem::HandleCaptureComplete(bool bSuccess)
 {
 	UE_LOG(LogTemp, Log, TEXT("HandleCaptureComplete: success=%s"), bSuccess ? TEXT("true") : TEXT("false"));
-	if (!bSuccess)
-	{
-		// スキャンがキャンセル/失敗。保存済みデータがあればそれでロードを試みる。
-		LoadSceneFromDevice();
-		return;
-	}
 
-	// スキャンで部屋データが更新された。デバイスから読み込む（完了で OnSceneLoaded→HandleSceneLoaded が走る）。
-	LoadSceneFromDevice();
+	// スキャン画面から復帰した直後はXRセッションがまだFOCUSEDに戻っていない
+	// （実測でdiscovery発行がフォーカス回復より44ms早く、ランタイムに黙殺された）。
+	// セッションのフォーカス回復を待ってからdiscoveryを開始する。
+	LoadSceneFromDeviceDeferred(1.0f);
 }
 
 void UMRSpatialRecognitionSubsystem::LoadSceneFromDeviceDeferred(float DelaySeconds)
@@ -353,6 +369,47 @@ bool UMRSpatialRecognitionSubsystem::FindClearSpawnPoint(const FVector& PlayerLo
 	return false;
 }
 
+bool UMRSpatialRecognitionSubsystem::GetSpawnPointsAlongFarthestWall(int32 NumPoints, float Spacing,
+	TArray<FVector>& OutPoints, FVector& OutWallInward) const
+{
+	OutPoints.Reset();
+	OutWallInward = FVector::ZeroVector;
+
+	if (!bWallBaseValid || NumPoints <= 0)
+	{
+		return false;
+	}
+
+	const FVector WallInward = CachedWallNormal.GetSafeNormal2D();
+	const FVector RightDir = FVector::CrossProduct(FVector::UpVector, WallInward).GetSafeNormal();
+	if (WallInward.IsNearlyZero() || RightDir.IsNearlyZero())
+	{
+		return false;
+	}
+
+	// 壁前 WallOffset の中心点を基準に、左右に等間隔で並べる。
+	const FVector Base = CachedWallPoint + WallInward * WallOffset;
+	const float HalfRange = Spacing * (NumPoints - 1) * 0.5f;
+
+	OutPoints.Reserve(NumPoints);
+	for (int32 i = 0; i < NumPoints; ++i)
+	{
+		const float Side = -HalfRange + Spacing * i;
+		FVector P = Base + RightDir * Side;
+		// 床高さに合わせる（取れなければ CachedWallPoint.Z のままにしておく）。
+		float FloorZ = 0.0f;
+		// 非const内部実装にアクセスするため、ここだけ const を外して呼ぶ。
+		if (const_cast<UMRSpatialRecognitionSubsystem*>(this)->MeasureFloorHeight(P, FloorZ))
+		{
+			P.Z = FloorZ;
+		}
+		OutPoints.Add(P);
+	}
+
+	OutWallInward = WallInward;
+	return true;
+}
+
 bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocation, float& OutFloorZ)
 {
 	// 床高さは、まず MRUK の床アンカーの高さを直接使う。
@@ -360,7 +417,14 @@ bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocat
 	if (UMRUKSubsystem* MRUKSubsystem = GetMRUKSubsystem())
 	{
 		const AMRUKAnchor* BestFloor = nullptr;
-		float BestDistSq = TNumericLimits<float>::Max();
+		// 複数の床アンカーがある場合、95.7 より低い「余計な床アンカー」が混ざっていて
+		// そこに敵が落ちてスポーンする問題があった。最も Z が高い床アンカー＝本物の床を採用し、
+		// 低いアンカーは無視する。
+		float BestZ = -TNumericLimits<float>::Max();
+
+		// デバッグ: 床アンカーが何枚あり、それぞれの Z・ラベルが何かを出して
+		// 「95.7より低いアンカーが本当に Floor ラベルなのか」を確認する。
+		int32 FloorAnchorCount = 0;
 
 		for (const AMRUKRoom* Room : MRUKSubsystem->Rooms)
 		{
@@ -374,11 +438,18 @@ bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocat
 				{
 					continue;
 				}
-				// 複数床アンカーがある場合は FromLocation のXYに最も近いものを選ぶ。
-				const float DistSq = FVector::DistSquared2D(Floor->GetActorLocation(), FromLocation);
-				if (DistSq < BestDistSq)
+
+				++FloorAnchorCount;
+				const FVector AnchorLoc = Floor->GetActorLocation();
+				const FString Labels = FString::Join(Floor->SemanticClassifications, TEXT(","));
+				UE_LOG(LogTemp, Log,
+				       TEXT("MeasureFloorHeight: FloorAnchor[%d] Z=%.1f loc=(%.1f,%.1f,%.1f) labels=[%s]"),
+				       FloorAnchorCount - 1, AnchorLoc.Z, AnchorLoc.X, AnchorLoc.Y, AnchorLoc.Z, *Labels);
+
+				// 最も高い床アンカーを採用する（低い余計なアンカーは無視）。
+				if (AnchorLoc.Z > BestZ)
 				{
-					BestDistSq = DistSq;
+					BestZ = AnchorLoc.Z;
 					BestFloor = Floor;
 				}
 			}
@@ -387,6 +458,9 @@ bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocat
 		if (BestFloor)
 		{
 			OutFloorZ = BestFloor->GetActorLocation().Z;
+			UE_LOG(LogTemp, Log,
+			       TEXT("MeasureFloorHeight: selected highest FloorAnchor Z=%.1f (of %d anchors)"),
+			       OutFloorZ, FloorAnchorCount);
 			return true;
 		}
 	}
@@ -554,20 +628,29 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 				continue;
 			}
 
+			const bool bIsCeiling = Anchor->SemanticClassifications.Contains(FMRUKLabels::Ceiling);
+			const bool bIsFloor = Anchor->SemanticClassifications.Contains(FMRUKLabels::Floor);
+			const bool bIsWall = Anchor->SemanticClassifications.Contains(FMRUKLabels::WallFace);
+
 			// 設定で天井/床を除外できるようにする。
-			if (!bIncludeCeilingInOcclusion && Anchor->SemanticClassifications.Contains(FMRUKLabels::Ceiling))
+			if (!bIncludeCeilingInOcclusion && bIsCeiling)
 			{
 				continue;
 			}
-			if (!bIncludeFloorInOcclusion && Anchor->SemanticClassifications.Contains(FMRUKLabels::Floor))
+			if (!bIncludeFloorInOcclusion && bIsFloor)
 			{
 				continue;
 			}
 
-			// アンカーの形状に沿ったコリジョン付きプロシージャルメッシュを生成する（マテリアルは付けない）。
+			// アンカーの形状に沿ったコリジョン付きプロシージャルメッシュを生成する。
 			// 窓/ドア/開口は穴を開けて、その部分は隠さない。
+			// マテリアルの貼り分け:
+			// - 壁/天井: デバッグ可視化時でもマテリアルを貼らない（純粋なオクルージョン専用）。
+			// - 床/家具: デバッグ可視化が有効なら DebugMeshMaterial を貼って目視確認できる。
 			const TArray<FString> CutHoleLabels = { FMRUKLabels::WindowFrame, FMRUKLabels::DoorFrame, FMRUKLabels::Opening };
-			Anchor->AttachProceduralMesh(CutHoleLabels, /*GenerateCollision=*/true, /*ProceduralMaterial=*/nullptr);
+			const bool bAllowMaterial = bDebugVisualizeMesh && !bIsWall && !bIsCeiling;
+			UMaterialInterface* MeshMaterial = bAllowMaterial ? DebugMeshMaterial.Get() : nullptr;
+			Anchor->AttachProceduralMesh(CutHoleLabels, /*GenerateCollision=*/true, MeshMaterial);
 
 			UProceduralMeshComponent* Mesh = Anchor->ProceduralMeshComponent;
 			if (!Mesh)
@@ -575,14 +658,29 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 				continue;
 			}
 
-			// オクルージョン設定の肝:
-			// - メインパス(色)では描かない → 見えない（パススルーの現実映像が透ける）
-			// - 深度パスには書き込む → このメッシュより奥にある敵が深度テストで隠される
-			Mesh->SetRenderInMainPass(false);
+			// デバッグ可視化は壁/天井を除いて適用（壁/天井は常に不可視オクルージョン）。
+			const bool bVisualizeThis = bDebugVisualizeMesh && !bIsWall && !bIsCeiling;
+			if (bVisualizeThis)
+			{
+				// デバッグ: 部屋メッシュをメインパスでも描画して目視確認できるようにする。
+				Mesh->SetRenderInMainPass(true);
+			}
+			else
+			{
+				// オクルージョン設定の肝:
+				// - メインパス(色)では描かない → 見えない（パススルーの現実映像が透ける）
+				// - 深度パスには書き込む → このメッシュより奥にある敵が深度テストで隠される
+				Mesh->SetRenderInMainPass(false);
+			}
 			Mesh->SetRenderInDepthPass(true);
 			Mesh->bRenderInDepthPass = true;
 			Mesh->SetCastShadow(false);
 			Mesh->SetVisibility(true); // Visibility自体はtrue（描画判断はMainPassフラグ側で行う）。
+
+			// 床メッシュだけ NavMesh の生成対象にする（敵AIが床の上だけを歩けるように）。
+			// 壁/天井/家具は床の歩行可能領域から除外したいので Nav 非対象のままにする。
+			Mesh->SetCanEverAffectNavigation(bIsFloor);
+
 			Mesh->MarkRenderStateDirty();
 
 			++NumConfigured;

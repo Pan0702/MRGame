@@ -11,6 +11,7 @@ class AMRUKAnchor;
 class AMRUKRoom;
 class UMRUKSubsystem;
 class UAndroidPermissionCallbackProxy;
+class UMaterialInterface;
 
 USTRUCT(BlueprintType)
 struct FMRSpatialAnchorInfo
@@ -72,12 +73,14 @@ public:
 	void LoadSceneFromDeviceDeferred(float DelaySeconds = 2.0f);
 
 	/**
-	 * 起動時に1回だけ、プレイヤー正面へ部屋メッシュ(壁)へLineTraceして「正面の壁」を測り、結果をキャッシュする。
+	 * 起動時に1回だけ、MRUKの全 WallAnchors からプレイヤーとのXY距離が最も遠い壁を選び、
+	 * その壁の中心(CachedWallPoint)と内向き法線(CachedWallNormal)をキャッシュする。
+	 * 関数名は履歴上 FrontWall だが、実態は「正面の壁」ではなく「プレイヤーから最も遠い壁」。
 	 * その場立ち固定（壁は動かない）前提なので、以後は再測定しない。
-	 * 部屋ロード前に呼ぶと失敗し、bWallBaseValid は false のまま。
-	 * @param PlayerLocation   プレイヤー（VRPawn）のワールド座標
-	 * @param PlayerForward    プレイヤーの正面ベクトル（水平成分推奨）
-	 * @return 壁点の取得に成功したら true
+	 * 部屋ロード前に呼ぶと WallAnchors が空で失敗し、bWallBaseValid は false のまま。
+	 * @param PlayerLocation   プレイヤー（VRPawn）のワールド座標。最遠壁の選択にこのXYを使う。
+	 * @param PlayerForward    互換のため受け取るが最遠壁の選択には未使用（フォールバック用途のみ）。
+	 * @return 最遠壁の取得に成功したら true
 	 */
 	UFUNCTION(BlueprintCallable, Category = "MR|Spatial|NoScan")
 	bool CalibrateFrontWall(const FVector& PlayerLocation, const FVector& PlayerForward);
@@ -85,6 +88,20 @@ public:
 	/** CalibrateFrontWall が成功して壁点をキャッシュ済みか。 */
 	UFUNCTION(BlueprintPure, Category = "MR|Spatial|NoScan")
 	bool IsFrontWallCalibrated() const { return bWallBaseValid; }
+
+	/**
+	 * 最遠壁（CalibrateFrontWallでキャッシュ済み）の壁面に沿って、等間隔のN点を返す。
+	 * 各点は壁面より WallOffset だけ部屋内側へオフセットされ、Zは床高さ（床アンカーがあれば）。
+	 * Spawnerアクターを壁沿いに自動配置するのに使う。
+	 * @param NumPoints  生成する点数（>=1）
+	 * @param Spacing    点と点の間隔(cm)
+	 * @param OutPoints  ワールド座標の配列
+	 * @param OutWallInward 壁の内向き法線（向きを揃えるのに使う）
+	 * @return 取得できたら true
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MR|Spatial|NoScan")
+	bool GetSpawnPointsAlongFarthestWall(int32 NumPoints, float Spacing,
+		TArray<FVector>& OutPoints, FVector& OutWallInward) const;
 
 	/**
 	 * 指定したワールド座標の真下へDepthレイを撃ち、床面の高さ(Z)を測る。
@@ -122,7 +139,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|NoScan")
 	float WallOffset = 30.0f;
 
-	/** 正面の壁を測るレイの最大距離(cm)。 */
+	/** 壁⇔プレイヤー間の遮蔽判定レイ等で使う最大距離(cm)。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|NoScan")
 	float WallScanMaxDistance = 500.0f;
 
@@ -182,6 +199,18 @@ public:
 	/** 天井アンカーをオクルージョンに含めるか（見上げた時に敵を隠したくなければ false）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
 	bool bIncludeCeilingInOcclusion = true;
+
+	/**
+	 * デバッグ用: true にすると、オクルージョンメッシュをメインパスでも描画する（部屋が認識
+	 * できているか目視確認できる）。DebugMeshMaterial が設定されていればそれを、無ければ
+	 * 既定のプロシージャルマテリアルを使う。確認が済んだら false に戻すこと（本番は不可視）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
+	bool bDebugVisualizeMesh = false;
+
+	/** デバッグ可視化時にメッシュへ適用するマテリアル（任意。未設定なら描画のみ有効化）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
+	TObjectPtr<UMaterialInterface> DebugMeshMaterial;
 
 private:
 	UFUNCTION()
@@ -243,9 +272,9 @@ private:
 	int32 RoomsPollAttempts = 0;
 	int32 MaxRoomsPollAttempts = 40; // 0.5s間隔 × 40 = 20秒まで待つ。
 
-	/** 起動時に測った正面の壁の点（CalibrateFrontWall でキャッシュ）。 */
+	/** 起動時に選んだ「プレイヤーから最も遠い壁」の中心点（CalibrateFrontWall でキャッシュ）。 */
 	FVector CachedWallPoint = FVector::ZeroVector;
-	/** その壁面の法線（Depthヒットの normal）。 */
+	/** その壁の内向き法線（MRUK壁アンカーの ForwardVector＝部屋内側向き）。 */
 	FVector CachedWallNormal = FVector::ZeroVector;
 	bool bWallBaseValid = false;
 };

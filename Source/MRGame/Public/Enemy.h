@@ -6,6 +6,7 @@
 #include "GameFramework/Character.h"
 #include "Enemy.generated.h"
 class AGM_DemoScene;
+class USoundBase;
 UCLASS()
 class MRGAME_API AEnemy : public ACharacter
 {
@@ -33,7 +34,13 @@ public:
 	
 	UPROPERTY(EditAnywhere, Category = "Enemy")
 	float MoveSpeed = 150.f;
+
+	UPROPERTY(EditAnywhere, Category = "Enemy|Feedback")
+	TObjectPtr<USoundBase> DeathSound;
 	
 	UPROPERTY()
 	TObjectPtr<AGM_DemoScene> CachedGM;
+
+private:
+	bool bIsDying = false;
 };

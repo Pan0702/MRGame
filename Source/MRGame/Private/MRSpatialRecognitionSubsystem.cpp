@@ -8,8 +8,13 @@
 #include "MRUtilityKitRoom.h"
 #include "MRUtilityKitSubsystem.h"
 #include "Engine/Engine.h"
+#include "GameFramework/Actor.h"
+#include "Components/SceneComponent.h"
 #include "ProceduralMeshComponent.h"
 #include "TimerManager.h"
+#include "NavModifierComponent.h"
+#include "NavAreas/NavArea_Null.h"
+#include "NavigationSystem.h"
 
 #if PLATFORM_ANDROID
 #include "AndroidPermissionCallbackProxy.h"
@@ -18,6 +23,15 @@
 
 void UMRSpatialRecognitionSubsystem::Deinitialize()
 {
+	for (TObjectPtr<AActor>& Blocker : FurnitureNavBlockers)
+	{
+		if (IsValid(Blocker))
+		{
+			Blocker->Destroy();
+		}
+	}
+	FurnitureNavBlockers.Reset();
+
 	if (CachedMRUKSubsystem && bDelegatesBound)
 	{
 		CachedMRUKSubsystem->OnRoomCreated.RemoveDynamic(this, &UMRSpatialRecognitionSubsystem::HandleRoomChanged);
@@ -612,6 +626,15 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 		return 0;
 	}
 
+	for (TObjectPtr<AActor>& Blocker : FurnitureNavBlockers)
+	{
+		if (IsValid(Blocker))
+		{
+			Blocker->Destroy();
+		}
+	}
+	FurnitureNavBlockers.Reset();
+
 	int32 NumConfigured = 0;
 
 	for (AMRUKRoom* Room : MRUKSubsystem->Rooms)
@@ -631,6 +654,17 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 			const bool bIsCeiling = Anchor->SemanticClassifications.Contains(FMRUKLabels::Ceiling);
 			const bool bIsFloor = Anchor->SemanticClassifications.Contains(FMRUKLabels::Floor);
 			const bool bIsWall = Anchor->SemanticClassifications.Contains(FMRUKLabels::WallFace);
+
+			// 床に立つ「障害物家具」かどうか。これらは NavMesh に穴を開けて、敵が回り込むようにする。
+			// （壁掛けの WallArt、開口の Window/Door、部屋全体の GlobalMesh、不定の Other は含めない。）
+			const bool bIsFurnitureObstacle =
+				Anchor->SemanticClassifications.Contains(FMRUKLabels::Table) ||
+				Anchor->SemanticClassifications.Contains(FMRUKLabels::Storage) ||
+				Anchor->SemanticClassifications.Contains(FMRUKLabels::Couch) ||
+				Anchor->SemanticClassifications.Contains(FMRUKLabels::Bed) ||
+				Anchor->SemanticClassifications.Contains(FMRUKLabels::Screen) ||
+				Anchor->SemanticClassifications.Contains(FMRUKLabels::Plant) ||
+				Anchor->SemanticClassifications.Contains(FMRUKLabels::Lamp);
 
 			// 設定で天井/床を除外できるようにする。
 			if (!bIncludeCeilingInOcclusion && bIsCeiling)
@@ -677,9 +711,21 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 			Mesh->SetCastShadow(false);
 			Mesh->SetVisibility(true); // Visibility自体はtrue（描画判断はMainPassフラグ側で行う）。
 
-			// 床メッシュだけ NavMesh の生成対象にする（敵AIが床の上だけを歩けるように）。
-			// 壁/天井/家具は床の歩行可能領域から除外したいので Nav 非対象のままにする。
+			// NavMesh の歩行可能面は「床のみ」。家具メッシュ自体は Nav 非対象にする
+			// （SetCanEverAffectNavigation(true) にすると机の天板が歩行面になり敵が乗り上げて stuck するため）。
+			// 壁/天井/窓/ドア/壁掛け/GlobalMesh/Other も Nav 非対象。
 			Mesh->SetCanEverAffectNavigation(bIsFloor);
+
+			// 家具(机等)は「足元の薄い矩形」だけを NavMesh の穴(歩行不可エリア)にして障害物化する。
+			// メッシュのコリジョン(縦に厚い3D Box)を NavModifier に見させると、机だらけの部屋で
+			// Null 領域が縦横に広がり NavMesh が全滅した(verts=14)。そこで MRUK アンカーの実寸
+			// (VolumeBounds/PlaneBounds)から机の足元サイズを取り、NavModifier の FailsafeExtent に
+			// 「XY=机サイズ / Z=薄く」を指定する。FailsafeExtent はコリジョンを持たないアクターで
+			// 使われる代替Extentなので、メッシュコリジョンに引きずられず確実に薄い板にできる。
+			if (bFurnitureBlocksNavigation && bIsFurnitureObstacle)
+			{
+				SpawnFurnitureNavBlocker(Anchor);
+			}
 
 			Mesh->MarkRenderStateDirty();
 
@@ -688,7 +734,170 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 	}
 
 	UE_LOG(LogTemp, Log, TEXT("BuildOcclusionMeshes: configured %d occlusion anchors"), NumConfigured);
+
+	// 診断: NavMesh タイルが生成されるのを待って（2秒後）、各家具ブロッカーで穴が開いたか確認する。
+	if (bFurnitureBlocksNavigation && FurnitureNavBlockers.Num() > 0)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			FTimerHandle VerifyHandle;
+			World->GetTimerManager().SetTimer(
+				VerifyHandle, this, &UMRSpatialRecognitionSubsystem::VerifyFurnitureBlockers, 2.0f, false);
+		}
+	}
+
 	return NumConfigured;
+}
+
+void UMRSpatialRecognitionSubsystem::SpawnFurnitureNavBlocker(AMRUKAnchor* Anchor)
+{
+	UWorld* World = GetWorld();
+	if (!World || !Anchor)
+	{
+		return;
+	}
+
+	// 机の足元サイズ(XY)を MRUK アンカーの実寸から取る。
+	// MRUK VolumeアンカーはPitch=-90度の倒れた座標系になることがあるため、
+	// 水平矩形として扱いやすいPlaneBoundsを優先する。メッシュのコリジョンには頼らない。
+	FVector2D HalfXY(0.0f, 0.0f);
+	bool bUsedPlaneBounds = false;
+	if (Anchor->PlaneBounds.bIsValid)
+	{
+		HalfXY = Anchor->PlaneBounds.GetExtent();
+		bUsedPlaneBounds = true;
+	}
+	else if (Anchor->VolumeBounds.IsValid)
+	{
+		const FVector Ext = Anchor->VolumeBounds.GetExtent(); // ローカル半径
+		HalfXY = FVector2D(Ext.X, Ext.Y);
+	}
+	else
+	{
+		// 実寸が取れない家具はスキップ（無理に障害物化しない）。
+		UE_LOG(LogTemp, Warning,
+		       TEXT("FurnitureNavBlocker: skipped %s labels=[%s] AnchorLoc=%s no valid VolumeBounds/PlaneBounds"),
+		       *Anchor->GetName(),
+		       *FString::Join(Anchor->SemanticClassifications, TEXT(",")),
+		       *Anchor->GetActorLocation().ToString());
+		return;
+	}
+
+	// 薄い板にする: XY は机サイズ、Z は床面付近だけ（FurnitureBlockerHalfHeight）。
+	// これにより NavMesh は机の足元だけ削れ、天板の高さや隣の机まで広がらない。
+	const FVector Failsafe(
+		FMath::Max(5.0f, HalfXY.X),
+		FMath::Max(5.0f, HalfXY.Y),
+		FMath::Max(2.0f, FurnitureBlockerHalfHeight));
+
+	// 障害物アクターを机の位置(床高さ)に置く。アンカーの XY を使い、Z は床面に合わせる。
+	const FVector AnchorLoc = Anchor->GetActorLocation();
+	float FloorZ = AnchorLoc.Z;
+	bool bMeasuredFloor = false;
+	{
+		float MeasuredZ = 0.0f;
+		if (MeasureFloorHeight(AnchorLoc, MeasuredZ))
+		{
+			FloorZ = MeasuredZ;
+			bMeasuredFloor = true;
+		}
+	}
+	const FVector BlockerLoc(AnchorLoc.X, AnchorLoc.Y, FloorZ + FurnitureBlockerHalfHeight);
+
+	UE_LOG(LogTemp, Log,
+	       TEXT("FurnitureNavBlocker: %s labels=[%s] AnchorLoc=%s AnchorRot=%s BlockerRot=%s VolumeValid=%d VolumeMin=%s VolumeMax=%s VolumeExtent=%s PlaneValid=%d PlaneMin=%s PlaneMax=%s PlaneExtent=%s UsedBounds=%s HalfXY=(%.1f,%.1f) bMeasuredFloor=%s FloorZ=%.1f BlockerLoc=%s Failsafe=%s"),
+	       *Anchor->GetName(),
+	       *FString::Join(Anchor->SemanticClassifications, TEXT(",")),
+	       *AnchorLoc.ToString(),
+	       *Anchor->GetActorRotation().ToString(),
+	       *FRotator::ZeroRotator.ToString(),
+	       Anchor->VolumeBounds.IsValid ? 1 : 0,
+	       *Anchor->VolumeBounds.Min.ToString(),
+	       *Anchor->VolumeBounds.Max.ToString(),
+	       *Anchor->VolumeBounds.GetExtent().ToString(),
+	       Anchor->PlaneBounds.bIsValid ? 1 : 0,
+	       *Anchor->PlaneBounds.Min.ToString(),
+	       *Anchor->PlaneBounds.Max.ToString(),
+	       *Anchor->PlaneBounds.GetExtent().ToString(),
+	       bUsedPlaneBounds ? TEXT("PlaneBounds") : TEXT("VolumeBounds"),
+	       HalfXY.X,
+	       HalfXY.Y,
+	       bMeasuredFloor ? TEXT("true") : TEXT("false"),
+	       FloorZ,
+	       *BlockerLoc.ToString(),
+	       *Failsafe.ToString());
+
+	FActorSpawnParameters Params;
+	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	AActor* Blocker = World->SpawnActor<AActor>(AActor::StaticClass(), BlockerLoc, FRotator::ZeroRotator, Params);
+	if (!Blocker)
+	{
+		return;
+	}
+
+	// ルートを付けて NavModifier を載せる。NavModifier はコリジョンが無いので FailsafeExtent を使う。
+	USceneComponent* Root = NewObject<USceneComponent>(Blocker);
+	Blocker->SetRootComponent(Root);
+	Root->RegisterComponent();
+
+	UNavModifierComponent* NavMod = NewObject<UNavModifierComponent>(Blocker);
+	if (NavMod)
+	{
+		// コリジョンを持たないアクターなので FailsafeExtent(薄い板)が領域になる。
+		NavMod->FailsafeExtent = Failsafe;
+		// 下方へエージェント高さ分広げる挙動を止める（これが効くと床を縦に削りすぎる）。
+		NavMod->bIncludeAgentHeight = false;
+		NavMod->SetAreaClass(UNavArea_Null::StaticClass());
+		NavMod->RegisterComponent();
+	}
+
+	FurnitureNavBlockers.Add(Blocker);
+}
+
+void UMRSpatialRecognitionSubsystem::VerifyFurnitureBlockers()
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+	UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World);
+	if (!NavSys)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("VerifyFurnitureBlockers: NavSys unavailable"));
+		return;
+	}
+
+	// 各ブロッカー中心を NavMesh に投影し、穴が開いているか確認する。
+	// 投影「成功」= その点に歩行可能な NavMesh が残っている = 穴が開いていない（NavModifier 効いてない）。
+	// 投影「失敗」= その点は歩行不可（穴）= NavModifier が効いている。
+	int32 HoleOk = 0;
+	int32 NoHole = 0;
+	const FVector ProjExtent(20.0f, 20.0f, 40.0f); // 薄い範囲で「その真上に床NavがあるかR」を見る
+	for (const TObjectPtr<AActor>& Blocker : FurnitureNavBlockers)
+	{
+		if (!IsValid(Blocker))
+		{
+			continue;
+		}
+		const FVector Loc = Blocker->GetActorLocation();
+		FNavLocation Proj;
+		const bool bOnNav = NavSys->ProjectPointToNavigation(Loc, Proj, ProjExtent);
+		if (bOnNav)
+		{
+			++NoHole;
+			UE_LOG(LogTemp, Warning,
+				TEXT("VerifyFurnitureBlockers: NO HOLE at %s (projected to %s) -> NavModifier NOT applied here"),
+				*Loc.ToCompactString(), *Proj.Location.ToCompactString());
+		}
+		else
+		{
+			++HoleOk;
+		}
+	}
+	UE_LOG(LogTemp, Warning,
+		TEXT("VerifyFurnitureBlockers: total=%d hole_ok=%d no_hole=%d (hole_ok=NavModifier効いてる / no_hole=効いてない)"),
+		FurnitureNavBlockers.Num(), HoleOk, NoHole);
 }
 
 void UMRSpatialRecognitionSubsystem::HandleSceneLoaded(bool bSuccess)

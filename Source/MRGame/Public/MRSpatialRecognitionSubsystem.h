@@ -9,6 +9,7 @@
 
 class AMRUKAnchor;
 class AMRUKRoom;
+class AActor;
 class UMRUKSubsystem;
 class UAndroidPermissionCallbackProxy;
 class UMaterialInterface;
@@ -201,6 +202,21 @@ public:
 	bool bIncludeCeilingInOcclusion = true;
 
 	/**
+	 * 床に立つ家具(机/椅子/収納/ベッド/画面/植物/照明)を NavMesh の障害物(穴)にするか。
+	 * true: 家具ごとに「足元の薄い矩形」を Null エリアにして、敵が机を回り込むようにする。
+	 * false: 家具を Nav 関与させない（床のみ歩行可能）。問題が出たら false で即無効化できる保険。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Navigation")
+	bool bFurnitureBlocksNavigation = true;
+
+	/**
+	 * 家具の NavMesh 障害物(Null板)の高さの半分(cm)。床面付近だけを薄く削るための値。
+	 * 厚いと机の天板高さや縦方向に削りすぎて NavMesh が痩せるため小さめにする。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Navigation")
+	float FurnitureBlockerHalfHeight = 15.0f;
+
+	/**
 	 * デバッグ用: true にすると、オクルージョンメッシュをメインパスでも描画する（部屋が認識
 	 * できているか目視確認できる）。DebugMeshMaterial が設定されていればそれを、無ければ
 	 * 既定のプロシージャルマテリアルを使う。確認が済んだら false に戻すこと（本番は不可視）。
@@ -246,6 +262,9 @@ private:
 	bool IsCandidateClear(const FVector& Candidate, const FVector& PlayerLocation, const FVector& RightDir);
 	/** 1本ぶんの遮蔽判定。プレイヤーより手前(ObstacleClearance考慮)でHitしたら遮蔽ありとみなす。 */
 	bool IsRayBlocked(const FVector& From, const FVector& To);
+	void SpawnFurnitureNavBlocker(AMRUKAnchor* Anchor);
+	/** 診断: NavMesh生成後に各家具ブロッカーで穴(歩行不可)が開いたか確認しログする。 */
+	void VerifyFurnitureBlockers();
 
 	UPROPERTY()
 	TObjectPtr<UMRUKSubsystem> CachedMRUKSubsystem;
@@ -259,6 +278,9 @@ private:
 	// 非同期ロードオブジェクトをGC回収から守るため保持する（保持しないとデリゲートが発火しないことがある）。
 	UPROPERTY()
 	TObjectPtr<class UMRUKLoadFromDevice> ActiveAsyncLoad;
+
+	UPROPERTY()
+	TArray<TObjectPtr<AActor>> FurnitureNavBlockers;
 
 	FTimerHandle DeferredLoadTimerHandle;
 	int32 LoadAttemptCount = 0;

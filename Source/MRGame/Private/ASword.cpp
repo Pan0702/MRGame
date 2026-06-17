@@ -9,6 +9,7 @@
 #include "MotionControllerComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
+#include "DrawDebugHelpers.h"
 
 // Sets default values
 ASword::ASword()
@@ -25,9 +26,6 @@ ASword::ASword()
 
 	SwordColl = CreateDefaultSubobject<UBoxComponent>(TEXT("HitBox"));
 	SwordColl->SetupAttachment(BladeMesh);
-	SwordColl->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
-	SwordColl->SetCollisionProfileName(TEXT("OverlapAll"));
-	SwordColl->SetGenerateOverlapEvents(true);
 	//debug機能 trueにすると見えなくなる
 	SwordColl->SetHiddenInGame(true);
 	SwordColl->OnComponentBeginOverlap.AddDynamic(this, &ASword::OnHitBoxBeginOverlap);
@@ -37,6 +35,7 @@ void ASword::BeginPlay()
 {
 	Super::BeginPlay();
 	PrevTipLocation = SwordColl->GetComponentLocation();
+	SetSwordCollActive(false);
 }
 
 void ASword::Tick(float DeltaTime)
@@ -75,19 +74,20 @@ void ASword::OnHitBoxBeginOverlap(UPrimitiveComponent* OVerlappedComp, AActor* O
 
 void ASword::UpdateSwing(float DeltaTime)
 {
-	static float maxspeed = 100.f;
 	if (DeltaTime <= KINDA_SMALL_NUMBER) return;
 
 	const bool bWasSwinging = bIsSwing;
 	const FVector CurrentTip = SwordColl->GetComponentLocation();
 	const float Speed = FVector::Dist(CurrentTip, PrevTipLocation) / DeltaTime;
 	PrevTipLocation = CurrentTip;
+	const float OffThreshold = FMath::Max(0.0f, SwingSpeedOffThreshold);
+	const float OnThreshold = FMath::Max(SwingSpeedOnThreshold, OffThreshold + 1.0f);
 
-	if (bIsSwing && Speed <= SwingSpeedOffThreshold)
+	if (bIsSwing && Speed <= OffThreshold)
 	{
 		bIsSwing = false;
 	}
-	else if (!bIsSwing && Speed >= SwingSpeedOffThreshold)
+	else if (!bIsSwing && Speed >= OnThreshold)
 	{
 		bIsSwing = true;
 	}
@@ -110,10 +110,12 @@ void ASword::UpdateSwing(float DeltaTime)
 	{
 		const FColor C = bIsSwing ? FColor::Red : FColor::White;
 		DrawDebugSphere(GetWorld(), CurrentTip, 5.f, 12, C, false, -1.f, 0, 0.5f);
+		DebugMaxSwingSpeed = FMath::Max(DebugMaxSwingSpeed, Speed);
+		UE_LOG(LogTemp, Verbose, TEXT("Sword Speed: %.1f cm/s Swinging: %s MaxSpeed: %.1f"),
+			Speed,
+			bIsSwing ? TEXT("YES") : TEXT("NO"),
+			DebugMaxSwingSpeed);
 	}
-	if (maxspeed < Speed)
-		maxspeed = Speed;
-	UE_LOG(LogTemp, Warning, TEXT("Sword Speed: %.1f cm/sSwinging: %s MaxSpeed : %.1f"),Speed, bIsSwing ? TEXT("YES") : TEXT("NO"), maxspeed);
 	
 }
 

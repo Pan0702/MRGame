@@ -44,7 +44,16 @@ public:
 	
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VR|Sword")
 	TSubclassOf<ASword> SwordClass;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VR|Sword")
+	bool bEquipSwordInLeftHand = false;
+
+	UPROPERTY(EditAnywhere, Category = "VR|Debug")
+	bool bDebugDrawControllers = false;
 	
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "VR|Sword")
 	TObjectPtr<ASword> EquippedSword;
+
+private:
+	UMotionControllerComponent* GetSwordAttachController() const;
 };

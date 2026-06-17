@@ -34,6 +34,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Spawn|Debug")
 	void ToggleDebugDrawNavMesh() { bDebugDrawNavMesh = !bDebugDrawNavMesh; }
 
+	// 壁沿い Spawner の位置可視化を ON/OFF する。
+	UFUNCTION(BlueprintCallable, Category = "Spawn|Debug")
+	void SetDebugDrawSpawners(bool bEnabled) { bDebugDrawSpawners = bEnabled; }
+
+	// 壁沿い Spawner の位置可視化をトグルする。
+	UFUNCTION(BlueprintCallable, Category = "Spawn|Debug")
+	void ToggleDebugDrawSpawners() { bDebugDrawSpawners = !bDebugDrawSpawners; }
+
 	// 部屋スキャン/ロード完了(OnSceneLoaded)で呼ばれる。壁を測ってループを開始する。
 	UFUNCTION()
 	void HandleSceneReady(bool bSuccess);
@@ -136,6 +144,11 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Debug")
 	bool bDebugDrawNavMesh = false;
 
+	// デバッグ用: 壁沿い Spawner の位置を毎フレーム描画して、Spawner が設置されているか目視確認する。
+	// 黄=Spawner位置, 水色矢印=向き, 文字=有効/保持数。実行中に BP から ON/OFF 可。本番では false に。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Debug")
+	bool bDebugDrawSpawners = false;
+
 	// 接地用の見えないコリジョン床を生成するか。パススルー空間には物理床が無いため、
 	// これが無いと敵(Character)は重力で落下し続ける。
 	// ※ 既定で OFF。床に敵が湧いて困るため一旦無効化。必要になったら BP_GM のディテールで true に戻す。
@@ -155,6 +168,15 @@ protected:
 	// MRUK 床メッシュ上に NavMesh タイルを張る。最遠壁まで届くよう十分に大きく取る。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
 	float NavInvokerGenerationRadius = 1500.0f;
+
+	// NavMesh 生成時のエージェント半径(cm)。敵カプセル(≈15cm)に合わせて細くすると、
+	// 細い隙間も歩行可能領域になり「通れそうな隙間を通らない」が解消する。既定35は太すぎる。
+	UPROPERTY(EditAnywhere, Category = "MR|Floor")
+	float NavAgentRadius = 20.0f;
+
+	// NavMesh 生成時の最大ステップ高さ(cm)。既定8だと急斜面でNavMeshに穴が空く警告が出るため少し上げる。
+	UPROPERTY(EditAnywhere, Category = "MR|Floor")
+	float NavAgentMaxStepHeight = 12.0f;
 
 	int32 AliveCount = 0;
 	bool bLoopActive = false;
@@ -184,13 +206,20 @@ private:
 	// デバッグ用: 敵が歩ける範囲（NavMesh）の境界をワイヤーフレームで描画する。
 	void DebugDrawNavMesh() const;
 
+	// デバッグ用: 壁沿い Spawner の位置・向きを描画して、設置されているか目視確認する。
+	void DebugDrawSpawners() const;
+
+	// 診断用: 現在の NavMesh の頂点数を返す。0=未生成/空、>0=生成済み、負値=NavSys/RecastNav取得失敗。
+	int32 GetNavMeshVertCount() const;
+
 	// 部屋メッシュへのLineTraceで、壁前のクリアな湧き位置・向きを1つ求める（無理ならフォールバック）。
 	bool ResolveSpawnTransform(FVector& OutLocation, FRotator& OutRotation) const;
 
 	// 求めた位置に EnemyClasses からランダムに選んだ敵を1体スポーンする。失敗時 nullptr。
 	AEnemy* SpawnEnemyAt(const FVector& Location, const FRotator& Rotation);
 
-	// 正面の壁をキャリブレーションする（プレイヤーのVRPawnの位置・正面を使う）。
+	// プレイヤーからXY距離が最も遠い壁をキャリブレーションする（VRPawnの位置を使う。向きは未使用）。
+	// 関数名は履歴上 FrontWall だが、実態は「正面」ではなく「最遠壁」。
 	bool CalibrateFrontWallFromPlayer();
 
 	// プレイヤー足元の床高さを測り、その高さに見えないコリジョン床を生成する。
@@ -211,5 +240,13 @@ private:
 
 	// ロード完了待ちのフォールバックタイマー。
 	FTimerHandle SceneLoadFallbackTimerHandle;
+
+	// MR空間の Runtime NavMesh は Invoker 起動から生成まで遅延するため、湧きが充足するまで
+	// この間隔(秒)で MaintainDesiredAliveCount を再試行する。NavMesh生成を待って敵を出す。
+	UPROPERTY(EditAnywhere, Category = "Spawn")
+	float SpawnRetryInterval = 0.5f;
+
+	// 湧き再試行タイマー。充足したら停止する。
+	FTimerHandle SpawnRetryTimerHandle;
 
 };

@@ -5,54 +5,69 @@
 
 #include "GameFramework/Pawn.h"
 #include "Kismet/GameplayStatics.h"
+#include "TimerManager.h"
 
 AEnemyAIController::AEnemyAIController()
 {
-	PrimaryActorTick.bCanEverTick = true;
+	// 移動は MoveToActor + PathFollowingComponent（NavMesh経路追従）に任せるので毎Tickは不要。
+	PrimaryActorTick.bCanEverTick = false;
 }
 
 void AEnemyAIController::OnPossess(APawn* InPawn)
 {
 	Super::OnPossess(InPawn);
-	
-	TargetPawn = UGameplayStatics::GetPlayerPawn(this ,0);
+
+	TargetPawn = UGameplayStatics::GetPlayerPawn(this, 0);
+
+	// 一定間隔でプレイヤーへの NavMesh 経路を引き直す。これにより机/壁を回り込んで近づく
+	//（AddMovementInput の直進と違い、隙間や障害物をパスファインディングで避ける）。
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().SetTimer(
+			ChaseTimerHandle, this, &AEnemyAIController::UpdateChase,
+			FMath::Max(0.05f, ChaseUpdateInterval), /*bLoop=*/true);
+	}
+
+	// 初回は即実行して動き出しの遅延を無くす。
+	UpdateChase();
 }
 
-void AEnemyAIController::Tick(float DeltaTime)
+void AEnemyAIController::OnUnPossess()
 {
-	Super::Tick(DeltaTime);
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(ChaseTimerHandle);
+	}
+	StopMovement();
+
+	Super::OnUnPossess();
+}
+
+void AEnemyAIController::UpdateChase()
+{
 	if (!IsValid(TargetPawn))
 	{
-		//Playerが取得できていない場合再度取得を試みる
-		TargetPawn = UGameplayStatics::GetPlayerPawn(this ,0);
+		// プレイヤーが取得できていない場合は再取得を試みる。
+		TargetPawn = UGameplayStatics::GetPlayerPawn(this, 0);
+		if (!IsValid(TargetPawn))
+		{
+			return;
+		}
 	}
 
-	APawn* ControlledPawn = GetPawn();
-	if (!IsValid(ControlledPawn) || !IsValid(TargetPawn))
+	if (!GetPawn())
 	{
 		return;
 	}
 
-	FVector ToTarget = TargetPawn->GetActorLocation() - ControlledPawn->GetActorLocation();
-	ToTarget.Z = 0.0f;
-
-	const float Distance = ToTarget.Size();
-	if (Distance <= KINDA_SMALL_NUMBER)
-	{
-		return;
-	}
-
-	const FVector MoveDirection = ToTarget / Distance;
-	const FRotator DesiredRotation = MoveDirection.Rotation();
-	const FRotator NewRotation = FMath::RInterpTo(
-		ControlledPawn->GetActorRotation(),
-		DesiredRotation,
-		DeltaTime,
-		RotationInterpSpeed);
-	ControlledPawn->SetActorRotation(FRotator(0.0f, NewRotation.Yaw, 0.0f));
-
-	if (Distance > StopDistance)
-	{
-		ControlledPawn->AddMovementInput(MoveDirection);
-	}
+	// NavMesh 経路でプレイヤーへ。StopDistance まで来たら停止（攻撃間合い）。
+	// bUsePathfinding=true で机/壁を回り込む。部分経路も許可して、完全到達できなくても近づく。
+	MoveToActor(
+		TargetPawn,
+		StopDistance,
+		/*bStopOnOverlap=*/true,
+		/*bUsePathfinding=*/true,
+		/*bCanStrafe=*/false,
+		/*FilterClass=*/nullptr,
+		/*bAllowPartialPath=*/true);
 }

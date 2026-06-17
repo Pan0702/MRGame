@@ -73,12 +73,14 @@ public:
 	void LoadSceneFromDeviceDeferred(float DelaySeconds = 2.0f);
 
 	/**
-	 * 起動時に1回だけ、プレイヤー正面へ部屋メッシュ(壁)へLineTraceして「正面の壁」を測り、結果をキャッシュする。
+	 * 起動時に1回だけ、MRUKの全 WallAnchors からプレイヤーとのXY距離が最も遠い壁を選び、
+	 * その壁の中心(CachedWallPoint)と内向き法線(CachedWallNormal)をキャッシュする。
+	 * 関数名は履歴上 FrontWall だが、実態は「正面の壁」ではなく「プレイヤーから最も遠い壁」。
 	 * その場立ち固定（壁は動かない）前提なので、以後は再測定しない。
-	 * 部屋ロード前に呼ぶと失敗し、bWallBaseValid は false のまま。
-	 * @param PlayerLocation   プレイヤー（VRPawn）のワールド座標
-	 * @param PlayerForward    プレイヤーの正面ベクトル（水平成分推奨）
-	 * @return 壁点の取得に成功したら true
+	 * 部屋ロード前に呼ぶと WallAnchors が空で失敗し、bWallBaseValid は false のまま。
+	 * @param PlayerLocation   プレイヤー（VRPawn）のワールド座標。最遠壁の選択にこのXYを使う。
+	 * @param PlayerForward    互換のため受け取るが最遠壁の選択には未使用（フォールバック用途のみ）。
+	 * @return 最遠壁の取得に成功したら true
 	 */
 	UFUNCTION(BlueprintCallable, Category = "MR|Spatial|NoScan")
 	bool CalibrateFrontWall(const FVector& PlayerLocation, const FVector& PlayerForward);
@@ -137,7 +139,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|NoScan")
 	float WallOffset = 30.0f;
 
-	/** 正面の壁を測るレイの最大距離(cm)。 */
+	/** 壁⇔プレイヤー間の遮蔽判定レイ等で使う最大距離(cm)。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|NoScan")
 	float WallScanMaxDistance = 500.0f;
 
@@ -270,9 +272,9 @@ private:
 	int32 RoomsPollAttempts = 0;
 	int32 MaxRoomsPollAttempts = 40; // 0.5s間隔 × 40 = 20秒まで待つ。
 
-	/** 起動時に測った正面の壁の点（CalibrateFrontWall でキャッシュ）。 */
+	/** 起動時に選んだ「プレイヤーから最も遠い壁」の中心点（CalibrateFrontWall でキャッシュ）。 */
 	FVector CachedWallPoint = FVector::ZeroVector;
-	/** その壁面の法線（Depthヒットの normal）。 */
+	/** その壁の内向き法線（MRUK壁アンカーの ForwardVector＝部屋内側向き）。 */
 	FVector CachedWallNormal = FVector::ZeroVector;
 	bool bWallBaseValid = false;
 };

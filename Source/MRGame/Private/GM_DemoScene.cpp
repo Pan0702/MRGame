@@ -34,6 +34,11 @@ void AGM_DemoScene::Tick(float DeltaSeconds)
 	{
 		DebugDrawNavMesh();
 	}
+
+	if (bDebugDrawSpawners)
+	{
+		DebugDrawSpawners();
+	}
 }
 
 void AGM_DemoScene::BeginPlay()
@@ -96,7 +101,8 @@ void AGM_DemoScene::HandleSceneReady(bool bSuccess)
 		return;
 	}
 
-	// 部屋メッシュが揃った。正面の壁を測り、接地用の床を作ってからループを開始する。
+	// 部屋メッシュが揃った。プレイヤーからXY距離が最も遠い壁を測り、接地用の床を作ってからループを開始する。
+	// （関数名は CalibrateFrontWall だが、実態は「正面」ではなく「最遠壁」を選ぶ。）
 	const bool bCalibrated = CalibrateFrontWallFromPlayer();
 	UE_LOG(LogTemp, Log, TEXT("HandleSceneReady: room loaded. Front wall calibrated: %s"),
 	       bCalibrated ? TEXT("true") : TEXT("false"));
@@ -153,13 +159,15 @@ bool AGM_DemoScene::CreateEnemies()
 		return false;
 	}
 
-	// 壁沿い Spawner 方式: 並んだ Spawner からランダムに 1 個選んで SpawnOne。
+	// 壁沿い Spawner 方式: 一番遠い壁沿いに並んだ Spawner を、ランダムな開始位置から巡回して試す。
+	// 1 個だけ引いて失敗で諦めると、その Spawner がたまたま NavMesh 外だった時に取りこぼすため、
+	// どれか 1 個が成功するまで順に試して成功率を上げる（敵の実 Spawn 位置は SpawnOne 側で NavMesh 補正）。
 	if (bUseWallSpawners && WallSpawners.Num() > 0)
 	{
 		// 生きている Spawner だけを選ぶ。
-		TArray<AEnemySpawner*> Alive;
+		TArray<TObjectPtr<AEnemySpawner>> Alive;
 		Alive.Reserve(WallSpawners.Num());
-		for (AEnemySpawner* S : WallSpawners)
+		for (const TObjectPtr<AEnemySpawner>& S : WallSpawners)
 		{
 			if (S)
 			{
@@ -171,20 +179,30 @@ bool AGM_DemoScene::CreateEnemies()
 			UE_LOG(LogTemp, Warning, TEXT("CreateEnemies: spawn failed because all WallSpawners are invalid. StoredWallSpawners=%d"), WallSpawners.Num());
 			return false;
 		}
-		AEnemySpawner* Picked = Alive[FMath::RandRange(0, Alive.Num() - 1)];
-		if (Picked->SpawnOne() != nullptr)
+
+		// 偏りを避けるため開始 Index だけランダムにし、そこから一巡する。
+		const int32 StartIndex = FMath::RandRange(0, Alive.Num() - 1);
+		for (int32 Offset = 0; Offset < Alive.Num(); ++Offset)
 		{
-			++AliveCount;
-			UE_LOG(LogTemp, Log, TEXT("Enemy spawned via Spawner. AliveCount:%d DesiredAliveCount:%d"), AliveCount, DesiredAliveCount);
-			return true;
+			const int32 Index = (StartIndex + Offset) % Alive.Num();
+			AEnemySpawner* Picked = Alive[Index];
+			if (Picked && Picked->SpawnOne() != nullptr)
+			{
+				++AliveCount;
+				UE_LOG(LogTemp, Log, TEXT("Enemy spawned via Spawner. AliveCount:%d DesiredAliveCount:%d"), AliveCount, DesiredAliveCount);
+				return true;
+			}
 		}
+
+		// 全 Spawner が失敗 = この時点では壁沿いのどこも NavMesh に乗っていない。
+		// NavMesh 頂点数も併記して「NavMeshがまだ空(=生成待ち)なのか、生成済みでも壁沿いに無いのか」を切り分ける。
+		// verts=0 なら NavMesh 未生成、verts>0 なのに失敗なら投影距離/位置の問題。
 		UE_LOG(LogTemp, Warning,
-			TEXT("CreateEnemies: spawn failed via Spawner. Spawner=%s Location=%s AliveSpawners=%d DesiredAliveCount=%d AliveCount=%d"),
-			*GetNameSafe(Picked),
-			Picked ? *Picked->GetActorLocation().ToCompactString() : TEXT("null"),
+			TEXT("CreateEnemies: spawn failed; all %d wall spawners failed this attempt. DesiredAliveCount=%d AliveCount=%d NavMeshVerts=%d"),
 			Alive.Num(),
 			DesiredAliveCount,
-			AliveCount);
+			AliveCount,
+			GetNavMeshVertCount());
 		return false;
 	}
 
@@ -531,6 +549,24 @@ void AGM_DemoScene::MaintainDesiredAliveCount()
 	{
 		CreateEnemies();
 	}
+
+	// まだ足りない場合 = この瞬間は湧き位置が NavMesh に乗っていない可能性が高い。
+	// MR空間の Runtime NavMesh は Invoker 起動から生成までに数フレーム〜数百ms遅れるため、
+	// 1フレームで諦めず、短間隔のタイマーで生成完了を待って再試行する（敵が出るまで粘る）。
+	if (bLoopActive && AliveCount < DesiredAliveCount && GetWorld())
+	{
+		GetWorld()->GetTimerManager().SetTimer(
+			SpawnRetryTimerHandle,
+			this,
+			&AGM_DemoScene::MaintainDesiredAliveCount,
+			SpawnRetryInterval,
+			false);
+	}
+	else if (GetWorld())
+	{
+		// 充足したらリトライタイマーは止める。
+		GetWorld()->GetTimerManager().ClearTimer(SpawnRetryTimerHandle);
+	}
 }
 
 void AGM_DemoScene::SpawnWallSpawners()
@@ -665,6 +701,45 @@ void AGM_DemoScene::DebugDrawNavMesh() const
 	}
 }
 
+void AGM_DemoScene::DebugDrawSpawners() const
+{
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	// 各 WallSpawner の位置を可視化する。Spawner が壁沿いに並んでいるか目視確認するため。
+	// - 黄の球   : Spawner の配置位置（壁沿いの意図位置）。
+	// - 水色の矢印: Spawner の向き（プレイヤー側を向くはず＝壁の内向き法線）。
+	// - 赤の球   : Spawner 配列に居るが無効(null)になったスロット（数の食い違い確認用、通常は出ない）。
+	int32 ValidCount = 0;
+	for (const TObjectPtr<AEnemySpawner>& S : WallSpawners)
+	{
+		if (!S)
+		{
+			continue;
+		}
+		++ValidCount;
+
+		const FVector Loc = S->GetActorLocation();
+		DrawDebugSphere(World, Loc, 12.0f, 12, FColor::Yellow, false, -1.0f, 0, 1.0f);
+		// 向き（プレイヤー側）を矢印で。
+		const FVector Forward = S->GetActorForwardVector();
+		DrawDebugDirectionalArrow(World, Loc, Loc + Forward * 40.0f, 8.0f, FColor::Cyan, false, -1.0f, 0, 1.0f);
+		// 床から立ち上がる縦線（床に埋もれても位置が見えるように）。
+		DrawDebugLine(World, Loc, Loc + FVector(0.0f, 0.0f, 60.0f), FColor::Yellow, false, -1.0f, 0, 1.0f);
+	}
+
+	// 配置数の食い違いがあれば、プレイヤー足元付近に件数を文字で出す（HMDで読める位置）。
+	if (const APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0))
+	{
+		const FVector TextLoc = PlayerPawn->GetActorLocation() + FVector(0.0f, 0.0f, 50.0f);
+		const FString Msg = FString::Printf(TEXT("WallSpawners valid=%d / stored=%d"), ValidCount, WallSpawners.Num());
+		DrawDebugString(World, TextLoc, Msg, nullptr, FColor::White, 0.0f, false);
+	}
+}
+
 bool AGM_DemoScene::CalibrateFrontWallFromPlayer()
 {
 	UWorld* World = GetWorld();
@@ -681,6 +756,8 @@ bool AGM_DemoScene::CalibrateFrontWallFromPlayer()
 	}
 
 	const FVector PlayerLocation = PlayerPawn->GetActorLocation();
+	// 最遠壁の選択はプレイヤー位置のXY距離だけで決まり、向き(Forward)は使わない。
+	// （API互換のため引数は渡すが、Subsystem 側はフォールバック時以外 Forward を参照しない。）
 	FVector Forward = PlayerPawn->GetActorForwardVector();
 	Forward.Z = 0.0f;
 	Forward = Forward.GetSafeNormal();
@@ -791,12 +868,39 @@ void AGM_DemoScene::SpawnNavInvoker()
 		Invoker->RegisterComponent();
 	}
 
-	// 念のためナビへ即時リビルドを促す。
+	// 敵カプセル(≈15cm)に対し NavMesh の AgentRadius 既定(35)が太すぎると、実際は通れる細い隙間が
+	// 歩行可能領域から外れ、敵が「通れそうな隙間を通らない」。AgentRadius は DefaultEngine.ini の
+	// [/Script/NavigationSystem.RecastNavMesh] AgentRadius=20 で設定する（生成時に反映される）。
+	// ※ ここで RecastNav->RebuildAll() を呼ぶと全タイル再生成で数秒ゲームスレッドをブロックし、
+	//    MR起動直後に HMD の BeginFrame4 が連続失敗(-1000)して画面が出なくなるため呼ばない。
+	//    Invoker による差分生成(Build)だけで十分。
 	if (UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World))
 	{
 		NavSys->Build();
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("SpawnNavInvoker: invoker at %s (radius=%.1f)"),
-	       *PlayerLocation.ToCompactString(), NavInvokerGenerationRadius);
+	UE_LOG(LogTemp, Log, TEXT("SpawnNavInvoker: invoker at %s (radius=%.1f). NavMesh verts now=%d"),
+	       *PlayerLocation.ToCompactString(), NavInvokerGenerationRadius, GetNavMeshVertCount());
+}
+
+int32 AGM_DemoScene::GetNavMeshVertCount() const
+{
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return -1;
+	}
+	const UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World);
+	if (!NavSys)
+	{
+		return -1;
+	}
+	const ARecastNavMesh* RecastNav = Cast<ARecastNavMesh>(NavSys->GetDefaultNavDataInstance());
+	if (!RecastNav)
+	{
+		return -2;
+	}
+	FRecastDebugGeometry Geometry;
+	RecastNav->GetDebugGeometryForTile(Geometry, FNavTileRef());
+	return Geometry.MeshVerts.Num();
 }

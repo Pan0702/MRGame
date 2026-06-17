@@ -44,6 +44,16 @@ void AVRPawn::BeginPlay()
 	// Stage に合わせることで部屋メッシュ・敵の湧き位置がパススルーの実物体と一致する。
 	UHeadMountedDisplayFunctionLibrary::SetTrackingOrigin(EHMDTrackingOrigin::Stage);
 
+	// 診断: 仮想空間が現実に対して回転してずれる件の切り分け。
+	// VRPawn 自身の Yaw が 0 でないと、トラッキング空間全体が回って部屋メッシュ/敵が現実から回転して見える。
+	{
+		const FRotator PawnRot = GetActorRotation();
+		const FRotator ControlRot = GetControlRotation();
+		UE_LOG(LogTemp, Warning,
+			TEXT("VRPawn alignment: ActorLoc=%s ActorYaw=%.1f ControlYaw=%.1f (ActorYaw!=0 -> tracking space rotated -> MR misaligned)"),
+			*GetActorLocation().ToCompactString(), PawnRot.Yaw, ControlRot.Yaw);
+	}
+
 	if (SwordClass)
 	{
 		//SpawnActorに渡すオブジェクト群

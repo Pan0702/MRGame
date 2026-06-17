@@ -3,11 +3,13 @@
 #include "EnemySpawner.h"
 
 #include "Components/BoxComponent.h"
+#include "Components/CapsuleComponent.h"
 #include "Enemy.h"
 #include "GameFramework/Pawn.h"
 #include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "NavigationSystem.h"
+#include "EngineUtils.h"
 
 AEnemySpawner::AEnemySpawner()
 {
@@ -17,6 +19,31 @@ AEnemySpawner::AEnemySpawner()
 	SetRootComponent(SpawnVolume);
 	SpawnVolume->SetBoxExtent(FVector(100.0f, 100.0f, 100.0f));
 	SpawnVolume->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+}
+
+bool AEnemySpawner::IsTooCloseToExistingEnemy(const FVector& Location) const
+{
+	const UWorld* World = GetWorld();
+	if (!World || MinEnemySeparation <= 0.0f)
+	{
+		return false;
+	}
+
+	// 既存の敵の水平距離が MinEnemySeparation 未満なら「近すぎる」。
+	const float MinSepSq = FMath::Square(MinEnemySeparation);
+	for (TActorIterator<AEnemy> It(World); It; ++It)
+	{
+		const AEnemy* Other = *It;
+		if (!IsValid(Other))
+		{
+			continue;
+		}
+		if (FVector::DistSquared2D(Other->GetActorLocation(), Location) < MinSepSq)
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 AEnemy* AEnemySpawner::SpawnOne()
@@ -61,14 +88,18 @@ AEnemy* AEnemySpawner::SpawnOne()
 	int32 NumProjectedTooFar = 0;
 	for (int32 Attempt = 0; Attempt < Attempts; ++Attempt)
 	{
-		const FVector Candidate = (Attempt == 0)
-			? VolumeCenter
-			: UKismetMathLibrary::RandomPointInBoundingBox(VolumeCenter, VolumeExtent);
+		// 常に Box 内ランダムにする。以前は Attempt==0 で VolumeCenter 固定だったため、
+		// 投影が即成功して毎回まったく同じ点に湧き、複数体が重なって貫通→浮く/動けない/落下していた。
+		const FVector Candidate = UKismetMathLibrary::RandomPointInBoundingBox(VolumeCenter, VolumeExtent);
 
 		if (!NavSys)
 		{
+			// NavMesh 投影を使わない設定。床が無い空中に湧いて落下する原因になりうるので警告する。
 			SpawnLoc = Candidate + FVector(0.0f, 0.0f, SpawnHeightOffset);
 			bFoundSpawnLoc = true;
+			UE_LOG(LogActor, Warning,
+				TEXT("EnemySpawner: NavMesh projection DISABLED (bProjectSpawnToNavMesh=false). Spawning without floor check at %s -> may fall. Spawner=%s"),
+				*SpawnLoc.ToCompactString(), *GetName());
 			break;
 		}
 
@@ -94,14 +125,27 @@ AEnemy* AEnemySpawner::SpawnOne()
 			}
 		}
 
+		// 既に居る敵と近すぎる点は弾く（重なって貫通するのを防ぐ）。最後の試行では妥協して受け入れる。
+		if (Attempt < Attempts - 1 && IsTooCloseToExistingEnemy(ProjectedLoc.Location))
+		{
+			continue;
+		}
+
 		SpawnLoc = ProjectedLoc.Location + FVector(0.0f, 0.0f, SpawnHeightOffset);
 		bFoundSpawnLoc = true;
+		// 投影/フォールバックで決まった最終位置を診断出力（落下個体の出所切り分け用）。
+		UE_LOG(LogActor, Verbose,
+			TEXT("EnemySpawner: resolved spawn. Spawner=%s Candidate=%s -> NavLoc=%s projFailed=%d tooFar=%d"),
+			*GetName(), *Candidate.ToCompactString(), *ProjectedLoc.Location.ToCompactString(), NumProjectionFailed, NumProjectedTooFar);
 		break;
 	}
 
 	if (!bFoundSpawnLoc)
 	{
-		UE_LOG(LogActor, Warning,
+		// 個々の Spawner が NavMesh 点を見つけられないのは巡回方式では正常な過程
+		// （GM 側が次の Spawner を試す）。全滅したかは GM 側の Warning で分かるので、
+		// ここは調査時のみ見える Verbose に留めてログ連発を避ける。
+		UE_LOG(LogActor, Verbose,
 			TEXT("EnemySpawner: spawn failed; no valid NavMesh point. Spawner=%s Center=%s Extent=%s Attempts=%d ProjectionFailed=%d ProjectedTooFar=%d NavExtent=%s MaxNavProjectionDistance=%.1f NavFallbackSearchRadius=%.1f"),
 			*GetName(),
 			*VolumeCenter.ToCompactString(),
@@ -125,10 +169,17 @@ AEnemy* AEnemySpawner::SpawnOne()
 		}
 	}
 
+	// MRUK の床/壁オクルージョンメッシュにはコリジョンが付いているため、湧き位置に敵カプセルが
+	// 接触して通常の SpawnActor では「collision at spawn location」で生成失敗する。
+	// NavMesh 上の正しい位置まで来ているので、接触しても押し出して必ず生成する。
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+
 	AEnemy* SpawnedEnemy = GetWorld()->SpawnActor<AEnemy>(
 		PickedClass,
 		SpawnLoc,
-		SpawnRot
+		SpawnRot,
+		SpawnParams
 	);
 	if (!SpawnedEnemy)
 	{
@@ -138,7 +189,20 @@ AEnemy* AEnemySpawner::SpawnOne()
 			*GetNameSafe(PickedClass.Get()),
 			*SpawnLoc.ToCompactString(),
 			*SpawnRot.ToCompactString());
+		return nullptr;
 	}
+
+	// AdjustIfPossibleButAlwaysSpawn は床/壁メッシュのコリジョンを避けるためにカプセルを
+	// 上下「だけでなく水平にも」押し出す。その結果、検証済みの SpawnLoc から横にずれて
+	// 床の縁を越え、NavMesh外（床の無い空中）に着地して落下する個体が出ていた。
+	// 対策: 押し出し後の水平ドリフトを捨て、検証済みの NavMesh 点(SpawnLoc)の XY に引き戻す。
+	// Z はカプセル HalfHeight ぶん持ち上げて床に接地させる（めり込み/浮き防止）。
+	FVector FinalLoc = SpawnLoc;
+	if (const UCapsuleComponent* Capsule = SpawnedEnemy->GetCapsuleComponent())
+	{
+		FinalLoc.Z = SpawnLoc.Z + Capsule->GetScaledCapsuleHalfHeight();
+	}
+	SpawnedEnemy->SetActorLocation(FinalLoc, false, nullptr, ETeleportType::TeleportPhysics);
 
 	return SpawnedEnemy;
 }

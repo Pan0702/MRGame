@@ -51,4 +51,12 @@ protected:
 
 	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "1"))
 	int32 SpawnPointAttempts = 8;
+
+	// 既存の敵とこの水平距離(cm)未満には湧かさない（重なって貫通し、浮く/動けない/落下するのを防ぐ）。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	float MinEnemySeparation = 80.0f;
+
+private:
+	// 候補点が既存の敵と近すぎる（MinEnemySeparation未満）かを返す。重なり回避に使う。
+	bool IsTooCloseToExistingEnemy(const FVector& Location) const;
 };

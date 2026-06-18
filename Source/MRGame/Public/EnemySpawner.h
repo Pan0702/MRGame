@@ -16,6 +16,7 @@ class MRGAME_API AEnemySpawner : public AActor
 public:
 	// Sets default values for this actor's properties
 	AEnemySpawner();
+	UFUNCTION(BlueprintCallable, Category = "Spawn")
 	AEnemy* SpawnOne();
 
 	// GMから動的に Spawner を生成する時に、湧かす敵クラス配列を流し込むためのセッター。

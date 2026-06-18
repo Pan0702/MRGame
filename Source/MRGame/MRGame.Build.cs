@@ -9,7 +9,7 @@ public class MRGame : ModuleRules
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 	
 		PublicDependencyModuleNames.AddRange(new string[] {
-			"Core", "CoreUObject", "Engine", "InputCore" ,"HeadMountedDisplay","XRBase","NavigationSystem","EnhancedInput","AIModule","OculusXRHMD","OculusXRPassthrough","OculusXRAnchors","MRUtilityKit","AndroidPermission","ProceduralMeshComponent"
+			"Core", "CoreUObject", "Engine", "InputCore" ,"HeadMountedDisplay","XRBase","NavigationSystem","EnhancedInput","AIModule","OculusXRHMD","OculusXRPassthrough","OculusXRAnchors","MRUtilityKit","AndroidPermission","ProceduralMeshComponent","UMG"
         });
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });

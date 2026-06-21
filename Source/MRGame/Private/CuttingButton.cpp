@@ -84,17 +84,17 @@ ECutDirection ACuttingButton::JudgeCutType(const FVector& BladeDir) const
 
 	// 切断「線」の角度を 0..180度 に畳む（振る向きの正負は無視）
 	float Angle = FMath::RadiansToDegrees(FMath::Atan2(U, R));
-	Angle = FMath::Fmod(Angle + 180.0f, 180.0f); // 0..180
+	Angle = FMath::Fmod(Angle + 180.0f, 180.0f); // 0..180//
 
 	if (Angle < 22.5f || Angle >= 157.5f)
 	{
-		return ECutDirection::Horizontal; // ≒0/180 真横
+		return ECutDirection::Horizontal; // ≒0/180 真横//
 	}
 	if (Angle < 90.0f)
 	{
-		return ECutDirection::Slash; // ≒45  /
+		return ECutDirection::Slash; // ≒45 //
 	}
-	return ECutDirection::BackSlash; // ≒135 \ //
+	return ECutDirection::BackSlash; // ≒135 //
 }
 
 void ACuttingButton::DoCut(ECutDirection Type)
@@ -134,11 +134,9 @@ void ACuttingButton::DoCut(ECutDirection Type)
 	LaunchHalf(HalfA, SepDir);
 	LaunchHalf(HalfB, -SepDir);
 
-	//  ここで演出（パーティクル/SE/スコア加算など）
-
-	// 一定時間後に半身を消す
+	// 着地しなかった場合の保険：DisappearDelay秒後に完了させる
 	GetWorldTimerManager().SetTimer(
-		DisappearTimerHandle, this, &ACuttingButton::OnDisappear, DisappearDelay, false);
+		DisappearTimerHandle, this, &ACuttingButton::FinishCut, DisappearDelay, false);
 }
 
 void ACuttingButton::LaunchHalf(UStaticMeshComponent* Half, const FVector& Dir)
@@ -150,8 +148,18 @@ void ACuttingButton::LaunchHalf(UStaticMeshComponent* Half, const FVector& Dir)
 	Half->SetCollisionProfileName(TEXT("PhysicsActor"));
 	Half->SetSimulatePhysics(true);
 
+	// 着地(Sleep)を検知できるようにする
+	Half->BodyInstance.bGenerateWakeEvents = true;
+	Half->OnComponentSleep.AddDynamic(this, &ACuttingButton::OnHalfSleep);
+
 	// bVelChange=true で質量に依存しない速度変化として与える
 	Half->AddImpulse(Dir * SeparationImpulse, NAME_None, true);
+}
+
+void ACuttingButton::OnHalfSleep(UPrimitiveComponent* SleepingComp, FName BoneName)
+{
+	// 半身が止まった＝着地 → 完了（タイマーより早ければこちらが先に走る）
+	FinishCut();
 }
 
 void ACuttingButton::HideHalf(UStaticMeshComponent* Half)
@@ -163,8 +171,17 @@ void ACuttingButton::HideHalf(UStaticMeshComponent* Half)
 	Half->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 }
 
-void ACuttingButton::OnDisappear()
+void ACuttingButton::FinishCut()
 {
+	if (bFinished) return;   // 着地 or タイムアウトのどちらか早い方で1回だけ
+	bFinished = true;
+
+	// 保険タイマーが残っていれば止める
+	GetWorldTimerManager().ClearTimer(DisappearTimerHandle);
+
+	// 演出フック（BPで実装：SE/スコア/エフェクトなど）
+	OnCutFinished();
+
 	// 表示中の半身（実際に飛んでいるもの）をまとめて消す
 	HideHalf(AfterHorizontalA);
 	HideHalf(AfterHorizontalB);

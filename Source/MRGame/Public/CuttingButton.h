@@ -37,6 +37,15 @@ public:
 	                    UPrimitiveComponent* OtherComp, int32 OtherBodyIndex,
 	                    bool bFromSweep, const FHitResult& SweepResult);
 
+	// 半身が止まった(着地)時に物理から呼ばれる
+	UFUNCTION()
+	void OnHalfSleep(UPrimitiveComponent* SleepingComp, FName BoneName);
+
+	// 「着地」or「DisappearDelayでのタイムアウト」のどちらか早い方で1回だけ呼ばれる演出フック。
+	// BP側で実装すると、SE/スコア加算/エフェクトなどを差し込める
+	UFUNCTION(BlueprintImplementableEvent, Category = "Button")
+	void OnCutFinished();
+
 	// 切る前のボタン（当たり判定はこれが持つ）
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Button")
 	TObjectPtr<UStaticMeshComponent> CuttingBeforeButton;
@@ -48,14 +57,14 @@ public:
 	TObjectPtr<UStaticMeshComponent> AfterHorizontalB;   // 真横 半身B
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Button|Slash")
-	TObjectPtr<UStaticMeshComponent> AfterSlashA;        // / 半身A
+	TObjectPtr<UStaticMeshComponent> AfterSlashA;        // 半身A
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Button|Slash")
-	TObjectPtr<UStaticMeshComponent> AfterSlashB;        // / 半身B
+	TObjectPtr<UStaticMeshComponent> AfterSlashB;        // 半身B
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Button|BackSlash")
-	TObjectPtr<UStaticMeshComponent> AfterBackSlashA;    // \ 半身A
+	TObjectPtr<UStaticMeshComponent> AfterBackSlashA;    // 半身A
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Button|BackSlash")
-	TObjectPtr<UStaticMeshComponent> AfterBackSlashB;    // \ 半身B
+	TObjectPtr<UStaticMeshComponent> AfterBackSlashB;    // 半身B
 
 	// 切れる最低スピード(cm/s)。これ未満の速度では切れない
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Button")
@@ -71,6 +80,7 @@ public:
 
 private:
 	bool bIsCut = false;
+	bool bFinished = false;   // 完了処理が走ったか（着地 or タイムアウトで1回だけ）
 	FTimerHandle DisappearTimerHandle;
 
 	// 剣の移動方向から切断タイプを判定
@@ -85,6 +95,7 @@ private:
 	// 半身を非表示＋物理OFFにする
 	void HideHalf(UStaticMeshComponent* Half);
 
-	// DisappearDelay後に呼ばれる：半身を消す
-	void OnDisappear();
+	// 着地 or タイムアウトのどちらか早い方で1回だけ実行：演出フック→半身を消す
+	UFUNCTION(BlueprintCallable, Category = "Button")
+	void FinishCut();
 };

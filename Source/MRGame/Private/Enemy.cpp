@@ -6,6 +6,7 @@
 #include "ASword.h"
 #include "CombatDirectorSubsystem.h"
 #include "EnemyAIController.h"
+#include "GI_MR.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Animation/AnimInstance.h"
 #include "Components/CapsuleComponent.h"
@@ -110,7 +111,13 @@ void AEnemy::OnHitCapsuleBeginOverlap(UPrimitiveComponent* OverlappedComp, AActo
 
 			if (CachedGM)
 			{
-				CachedGM->NotifyEnemyKilled();
+					CachedGM->NotifyEnemyKilled();
+			}
+			UGI_MR* Gi = Cast<UGI_MR>(GetWorld()->GetGameInstance());
+			if (Gi)
+			{
+				constexpr int32 KillCount = 1;
+				Gi->AddScore(KillCount);
 			}
 			Destroy();
 		}

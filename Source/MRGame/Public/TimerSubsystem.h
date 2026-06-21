@@ -14,8 +14,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnTimeUp);
 /**
  * 
  */
-UCLASS()
-class MRGAME_API UTimerSubsystem : public USubsystem
+UCLASS(Blueprintable)
+class MRGAME_API UTimerSubsystem : public UWorldSubsystem
 {
 	GENERATED_BODY()
 	// 制限時間を指定して開始（秒）

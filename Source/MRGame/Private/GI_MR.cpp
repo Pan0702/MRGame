@@ -17,3 +17,13 @@ void UGI_MR::AddScore(int32 NewAddScore)
 {
 	Score += NewAddScore;
 }
+
+void UGI_MR::SetHand(UMotionControllerComponent* NewHand)
+{
+	Hand = NewHand;
+}
+
+UMotionControllerComponent* UGI_MR::GetHand() const
+{
+	return Hand;
+}

@@ -33,6 +33,10 @@ public:
 	
 	UFUNCTION(BlueprintPure, Category = "Sword|Swing")
 	bool IsSwinging() const { return bIsSwing; }
+
+	// 刃先の速度ベクトル(cm/s)。大きさ=スピード、向き=振った方向
+	UFUNCTION(BlueprintPure, Category = "Sword|Swing")
+	FVector GetBladeVelocity() const { return BladeVelocity; }
 	
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Sword")
 	TObjectPtr<UArrowComponent> Root;
@@ -63,6 +67,7 @@ public:
 
 private:
 	FVector PrevTipLocation = FVector::ZeroVector;
+	FVector BladeVelocity = FVector::ZeroVector;
 	bool bIsSwing = false;
 	float DebugMaxSwingSpeed = 0.0f;
 

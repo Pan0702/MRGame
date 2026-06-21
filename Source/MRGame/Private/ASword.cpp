@@ -78,7 +78,8 @@ void ASword::UpdateSwing(float DeltaTime)
 
 	const bool bWasSwinging = bIsSwing;
 	const FVector CurrentTip = SwordColl->GetComponentLocation();
-	const float Speed = FVector::Dist(CurrentTip, PrevTipLocation) / DeltaTime;
+	BladeVelocity = (CurrentTip - PrevTipLocation) / DeltaTime;
+	const float Speed = BladeVelocity.Size();
 	PrevTipLocation = CurrentTip;
 	const float OffThreshold = FMath::Max(0.0f, SwingSpeedOffThreshold);
 	const float OnThreshold = FMath::Max(SwingSpeedOnThreshold, OffThreshold + 1.0f);

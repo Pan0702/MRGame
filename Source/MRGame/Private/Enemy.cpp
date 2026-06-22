@@ -100,9 +100,9 @@ void AEnemy::OnHitCapsuleBeginOverlap(UPrimitiveComponent* OverlappedComp, AActo
 	if (ASword* Sword = Cast<ASword>(OtherActor))
 	{
 		//剣が振ってる場外だったら当たりにして敵を消す
-		if (Sword->IsSwinging() && !bIsDying)
+		if (Sword->IsSwinging() && !bIsDead)
 		{
-			bIsDying = true;
+			bIsDead = true;
 
 			if (DeathSound)
 			{
@@ -122,5 +122,10 @@ void AEnemy::OnHitCapsuleBeginOverlap(UPrimitiveComponent* OverlappedComp, AActo
 			Destroy();
 		}
 	}
+}
+
+bool AEnemy::GetDyFlag()
+{
+	return bIsDead;
 }
 

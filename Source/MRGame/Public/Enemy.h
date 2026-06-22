@@ -32,6 +32,13 @@ public:
 	void OnHitCapsuleBeginOverlap(UPrimitiveComponent* OverlappedComp,AActor* OtherActor,
 		UPrimitiveComponent* OtherComp,int32 OtherBodyIndex,bool bFromSweep, const FHitResult& SweepResult);
 	
+	UFUNCTION(BlueprintPure, Category="Enemy")
+	bool GetDyFlag();
+
+
+private:
+
+	
 	UPROPERTY(EditAnywhere, Category = "Enemy")
 	float MoveSpeed = 150.f;
 
@@ -40,7 +47,7 @@ public:
 	
 	UPROPERTY()
 	TObjectPtr<AGM_DemoScene> CachedGM;
-
-private:
-	bool bIsDying = false;
+	
+	UPROPERTY(EditAnywhere, Category = "State")
+	bool bIsDead = false;
 };

@@ -64,6 +64,7 @@ void ACuttingButton::OnOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor*
                                     UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep,
                                     const FHitResult& SweepResult)
 {
+	
 	if (bIsCut) return; // 二重発火防止//
 
 	ASword* Sword = Cast<ASword>(OtherActor);

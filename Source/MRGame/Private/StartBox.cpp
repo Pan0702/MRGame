@@ -247,7 +247,15 @@ void AStartBox::TravelToNextLevel()
 		return;
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("AStartBox: OpenLevel %s"), *NEXT_LEVEL_NAME.ToString());
+	// エディタ/BP で NextLevel が設定されていればそれを開く。未設定ならフォールバック。
+	if (!NextLevel.IsNull())
+	{
+		UE_LOG(LogTemp, Log, TEXT("AStartBox: OpenLevel (soft) %s"), *NextLevel.ToString());
+		UGameplayStatics::OpenLevelBySoftObjectPtr(this, NextLevel);
+		return;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("AStartBox: NextLevel 未設定 -> フォールバックで %s を開く"), *NEXT_LEVEL_NAME.ToString());
 	UGameplayStatics::OpenLevel(this, NEXT_LEVEL_NAME);
 }
 

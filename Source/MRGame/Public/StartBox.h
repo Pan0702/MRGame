@@ -120,6 +120,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box|Cut")
 	float TravelDelay = 1.0f;
 
+	/** 切断後に遷移する先のレベル。エディタ/BP からレベルアセットを直接選ぶ。
+	 *  未設定の場合はフォールバックとして DemoScene を開く。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Box|Cut", meta = (AllowedClasses = "/Script/Engine.World"))
+	TSoftObjectPtr<UWorld> NextLevel;
+
 	/** 切断ピースのスケール補正。DefaultMesh相対スケール × この値を各ピースに適用する。
 	 *  断片メッシュが大きい場合に 1 未満へ下げる（例: 0.5）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box|Cut")
@@ -130,7 +135,7 @@ public:
 	float PieceYawCorrection = 0.f;
 
 	/** テスト用ループ。true の間は切断後にレベル遷移せず、箱を元に戻して繰り返しテストできる。
-	 *  本番は false にすると NEXT_LEVEL_NAME へ遷移する（切替はこのフラグのみ）。 */
+	 *  本番は false にすると NextLevel（未設定ならフォールバック）へ遷移する（切替はこのフラグのみ）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box|Test")
 	bool bTestLoopMode = true;
 

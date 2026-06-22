@@ -6,6 +6,7 @@
 #include "MotionControllerComponent.h"
 #include "HeadMountedDisplayFunctionLibrary.h"
 #include "ASword.h"
+#include "GI_MR.h"
 #include "DrawDebugHelpers.h"
 #include "UObject/ConstructorHelpers.h"
 
@@ -129,5 +130,26 @@ void AVRPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 
 UMotionControllerComponent* AVRPawn::GetSwordAttachController() const
 {
-	return bEquipSwordInLeftHand ? LeftController : RightController;
+	// GameInstance(GI_MR)に保存された「どちらの手に持つか」を見て左右を決める。
+	// GI のHandはMotionControllerコンポーネントのポインタだが、レベル遷移で前のPawnごと
+	// 破棄されると無効になるため、ポインタを直接使わず MotionSource(Left/Right)だけを読み取り、
+	// 「今の」Pawnの対応するコントローラを返す。
+	// Handが未設定(null)、または左右どちらでもない場合は右手をデフォルトにする。
+	if (const UGI_MR* GI = Cast<UGI_MR>(GetGameInstance()))
+	{
+		if (const UMotionControllerComponent* HandFromGI = GI->GetHand())
+		{
+			if (HandFromGI->MotionSource == FName("Left"))
+			{
+				return LeftController;
+			}
+			if (HandFromGI->MotionSource == FName("Right"))
+			{
+				return RightController;
+			}
+		}
+	}
+
+	// どちらでもなければ右手。
+	return RightController;
 }

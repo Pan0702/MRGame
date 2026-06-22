@@ -19,6 +19,7 @@
 #include "OculusXRPassthroughSubsystem.h"
 #include "OculusXRPersistentPassthroughInstance.h"
 #include "TimerManager.h"
+#include "OculusXRFunctionLibrary.h"
 
 AGM_DemoScene::AGM_DemoScene()
 {
@@ -78,6 +79,8 @@ void AGM_DemoScene::BeginPlay()
 			FMath::Max(0.5f, SceneLoadTimeout),
 			false);
 	}
+	UOculusXRFunctionLibrary::StartEnvironmentDepth();
+	UOculusXRFunctionLibrary::SetXROcclusionsMode(this, EOculusXROcclusionsMode::SoftOcclusions);
 }
 
 void AGM_DemoScene::HandleSceneReady(bool bSuccess)

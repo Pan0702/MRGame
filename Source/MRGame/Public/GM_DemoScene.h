@@ -55,8 +55,12 @@ public:
 	void SetPassthroughEnabled(bool bEnabled);
 
 protected:
-	
-	
+
+	// MR初期化（チュートリアル等のサブクラスから再利用するため protected）
+	void InitializePassthrough();
+	// 部屋スキャン/ロードを起動してオクルージョン(部屋メッシュ方式)を準備する。
+	void InitializeOcclusion();
+
 	UPROPERTY(EditAnywhere, Category = "EnemyNum")
 	int32 DesiredAliveCount = 4;
 	
@@ -194,9 +198,6 @@ protected:
 	TObjectPtr<AActor> NavInvokerActor;
 
 private:
-	void InitializePassthrough();
-	// 部屋スキャン/ロードを起動してオクルージョン(部屋メッシュ方式)を準備する。
-	void InitializeOcclusion();
 	void StartLoop();
 	void MaintainDesiredAliveCount();
 

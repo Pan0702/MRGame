@@ -143,6 +143,12 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
 	float NavFallbackSearchRadius = 500.0f;
 
+	// Spawner 配置時の空間チェックで、敵カプセルから差し引く余裕(cm)。
+	// 壁/床にカプセルがわずかに触れただけで「埋まり」と誤判定して全 Spawner を弾くのを防ぐ。
+	// 大きくすると判定が甘く（埋まり気味でも置く）、小さくすると厳しく（クリアな点だけ置く）なる。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	float SpawnFitClearance = 5.0f;
+
 	// デバッグ用: 敵が歩ける範囲（NavMesh）を毎フレーム描画して目視確認する。
 	// 実行中に BP から ON/OFF できる（SetDebugDrawNavMesh / 直接書き込み）。本番では false に。
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Debug")
@@ -202,7 +208,15 @@ private:
 	void MaintainDesiredAliveCount();
 
 	// 最遠壁沿いに Spawner を SpawnerCount 個生成する。
+	// ただし NavMesh に乗らない／敵カプセルが埋まる点には置かない（湧かせない置物 Spawner を作らない）。
 	void SpawnWallSpawners();
+
+	// 実際に湧かす敵クラス(EnemyClasses)の CDO からカプセル半径/半高さを取る。配置検証に使う。
+	float GetEnemyCapsuleRadius() const;
+	float GetEnemyCapsuleHalfHeight() const;
+
+	// 指定位置(カプセル中心)に敵カプセルが壁/家具(WorldStatic)に埋まらず収まるかを返す。
+	bool CanEnemyFitAt(const FVector& CapsuleCenter, float Radius, float HalfHeight) const;
 
 	// デバッグ用: 敵が歩ける範囲（NavMesh）の境界をワイヤーフレームで描画する。
 	void DebugDrawNavMesh() const;
@@ -249,5 +263,14 @@ private:
 
 	// 湧き再試行タイマー。充足したら停止する。
 	FTimerHandle SpawnRetryTimerHandle;
+
+	// 壁沿い Spawner の配置が 0 個だった時（NavMesh 未生成等）の再試行タイマーと回数。
+	FTimerHandle WallSpawnerRetryTimerHandle;
+	int32 WallSpawnerRetryCount = 0;
+
+	// 壁沿い Spawner 配置の最大リトライ回数（SpawnRetryInterval 間隔）。
+	// 0 個のまま諦めるまでの上限。NavMesh 生成遅延を吸収できる程度に確保する。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	int32 MaxWallSpawnerRetries = 20;
 
 };

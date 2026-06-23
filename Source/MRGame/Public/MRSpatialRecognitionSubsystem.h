@@ -298,5 +298,7 @@ private:
 	FVector CachedWallPoint = FVector::ZeroVector;
 	/** その壁の内向き法線（MRUK壁アンカーの ForwardVector＝部屋内側向き）。 */
 	FVector CachedWallNormal = FVector::ZeroVector;
+	/** その壁の水平方向の半幅(cm)。Spawnerを壁端から飛び出さないようクランプするのに使う。0なら未取得。 */
+	float CachedWallHalfWidth = 0.0f;
 	bool bWallBaseValid = false;
 };

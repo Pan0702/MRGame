@@ -38,6 +38,20 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "AI|Steering")
 	float GoalRefreshDistance = 100.0f;
 
+	// 経路追従中なのに、この距離(cm)未満しか進んでいない状態が StuckTimeThreshold 秒続いたら
+	//「引っかかり(stuck)」とみなして経路を引き直す。家具/壁のコリジョン角に引っかかって
+	// その場で止まる（NavMesh上は経路があるのに物理で進めない）状態からの復帰用。
+	UPROPERTY(EditAnywhere, Category = "AI|Steering")
+	float StuckMoveThreshold = 5.0f;
+
+	// 上記の「ほとんど進んでいない」が継続したら stuck と判定するまでの秒数。
+	UPROPERTY(EditAnywhere, Category = "AI|Steering")
+	float StuckTimeThreshold = 0.8f;
+
+	// stuck 検出時に、引っかかりを外すため近くの歩ける点へ「ずらし移動」する探索半径(cm)。
+	UPROPERTY(EditAnywhere, Category = "AI|Steering")
+	float StuckNudgeRadius = 100.0f;
+
 	UPROPERTY()
 	TObjectPtr<APawn> TargetPawn;
 
@@ -47,6 +61,10 @@ private:
 
 	// 前回 MoveToActor を発行した時のプレイヤー位置。これからの移動量で再発行要否を判定する。
 	FVector LastChaseGoal = FVector(FLT_MAX);
+
+	// 引っかかり検出用: 前回 UpdateChase 時の自分(敵)の位置と、ほとんど進めていない経過時間。
+	FVector LastSelfLocation = FVector(FLT_MAX);
+	float StuckAccumTime = 0.0f;
 
 	// 診断用: 前回ログした「MoveToActor結果＋プレイヤーがNav上か」の状態。
 	// 0.3秒ごとのログ洪水を避けるため、状態が前回と変わった時だけログする。

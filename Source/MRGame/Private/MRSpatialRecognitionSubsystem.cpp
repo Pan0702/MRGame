@@ -307,6 +307,19 @@ bool UMRSpatialRecognitionSubsystem::CalibrateFrontWall(const FVector& PlayerLoc
 	CachedWallNormal = FarthestWall->GetActorForwardVector();
 	// 高さはプレイヤー基準に寄せる（湧きは床へ別途接地させるため、ここはXY基準点として使う）。
 	CachedWallPoint.Z = PlayerLocation.Z;
+
+	// 壁の水平半幅をキャッシュする（Spawnerを壁端から飛び出させないクランプ用）。
+	// MRUK壁アンカーの PlaneBounds は面ローカルの2D矩形で、X が水平方向の半幅。
+	CachedWallHalfWidth = 0.0f;
+	if (FarthestWall->PlaneBounds.bIsValid)
+	{
+		CachedWallHalfWidth = FarthestWall->PlaneBounds.GetExtent().X;
+	}
+	else if (FarthestWall->VolumeBounds.IsValid)
+	{
+		CachedWallHalfWidth = FarthestWall->VolumeBounds.GetExtent().X;
+	}
+
 	bWallBaseValid = true;
 
 	UE_LOG(LogTemp, Log, TEXT("CalibrateFrontWall: farthest wall at %s (dist=%.0f)"),
@@ -403,12 +416,23 @@ bool UMRSpatialRecognitionSubsystem::GetSpawnPointsAlongFarthestWall(int32 NumPo
 
 	// 壁前 WallOffset の中心点を基準に、左右に等間隔で並べる。
 	const FVector Base = CachedWallPoint + WallInward * WallOffset;
-	const float HalfRange = Spacing * (NumPoints - 1) * 0.5f;
+	float HalfRange = Spacing * (NumPoints - 1) * 0.5f;
+
+	// 壁幅を超えて壁の端から飛び出さないようにクランプする（バグ: Spawner数/間隔を増やすと
+	// 壁の前でもない所に並ぶ問題）。壁端ぴったりだとカプセルが角に埋まるので EnemyRadius ぶん内側に寄せる。
+	if (CachedWallHalfWidth > 0.0f)
+	{
+		const float UsableHalf = FMath::Max(0.0f, CachedWallHalfWidth - EnemyRadius);
+		HalfRange = FMath::Min(HalfRange, UsableHalf);
+	}
+
+	// クランプ後の実効間隔（NumPoints==1 のときは 0）。
+	const float EffectiveSpacing = (NumPoints > 1) ? (HalfRange * 2.0f / (NumPoints - 1)) : 0.0f;
 
 	OutPoints.Reserve(NumPoints);
 	for (int32 i = 0; i < NumPoints; ++i)
 	{
-		const float Side = -HalfRange + Spacing * i;
+		const float Side = -HalfRange + EffectiveSpacing * i;
 		FVector P = Base + RightDir * Side;
 		// 床高さに合わせる（取れなければ CachedWallPoint.Z のままにしておく）。
 		float FloorZ = 0.0f;

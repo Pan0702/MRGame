@@ -19,6 +19,7 @@ ASword::ASword()
 	//柄
 	Root = CreateDefaultSubobject<UArrowComponent>(TEXT("Root"));
 	SetRootComponent(Root);
+	Root->SetVisibility(false);
 	//モデル
 	BladeMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("BladeMesh"));
 	BladeMesh->SetupAttachment(Root);

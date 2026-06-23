@@ -57,7 +57,14 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
 	float MinEnemySeparation = 80.0f;
 
+	// 空間チェックで敵カプセルから差し引く余裕(cm)。床/壁にわずかに触れただけで弾かないため。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	float SpawnFitClearance = 5.0f;
+
 private:
 	// 候補点が既存の敵と近すぎる（MinEnemySeparation未満）かを返す。重なり回避に使う。
 	bool IsTooCloseToExistingEnemy(const FVector& Location) const;
+
+	// FloorLocation(床上)に EnemyType の敵カプセルが壁/家具に埋まらず収まるかを返す。
+	bool CanEnemyFitAt(const TSubclassOf<AEnemy>& EnemyType, const FVector& FloorLocation) const;
 };

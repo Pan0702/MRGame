@@ -23,6 +23,9 @@ public:
 	void NotifyEnemyKilled();
 	void DestoroyEnemies();
 
+	// 湧きループを止める（時間切れ等）。以後 CreateEnemies/補充/リトライが走らない。
+	void StopSpawning();
+
 	UFUNCTION(BlueprintPure, Category = "EnemyNum")
 	int32 GetTotalKills() const { return TotalKills; }
 
@@ -165,12 +168,11 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Debug")
 	bool bDebugDrawSpawners = false;
 
-	// 接地用の見えないコリジョン床を生成するか。パススルー空間には物理床が無いため、
-	// これが無いと敵(Character)は重力で落下し続ける。
-	// ※ 既定で OFF。床に敵が湧いて困るため一旦無効化。必要になったら BP_GM のディテールで true に戻す。
-	//    （true にすると床と一緒に NavigationInvoker も生成され NavMesh が作られる。）
+	// 接地用の見えないコリジョン床を生成するか。床アンカーの位置・サイズに合わせた固定平面を1枚敷き、
+	// それを敵の接地＋NavMesh土台にする。MRUK床メッシュ(World Lockで上下ドリフトする)に頼らないため
+	// 既定で ON。これと組で MRUK床メッシュ側は Nav 非対象にして二重生成を避ける（下の bFloorMeshAffectsNav）。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
-	bool bSpawnGroundCollision = false;
+	bool bSpawnGroundCollision = true;
 
 	// 生成する見えない床の一辺の半分(cm)。プレイヤー中心にこの範囲を覆う。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")

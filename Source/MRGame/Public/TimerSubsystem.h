@@ -37,6 +37,7 @@ class MRGAME_API UTimerSubsystem : public UWorldSubsystem
 {
 	GENERATED_BODY()
 
+public:
 	// === 演出シーケンス（Ready→Go→Playing→Finish）。これ1つで全フェーズをC++が進める ===
 	// InDurationSeconds : 本編の制限時間（秒）
 	// ReadySeconds      : 「Ready」を表示する時間（秒）

@@ -463,6 +463,63 @@ bool UMRSpatialRecognitionSubsystem::GetSpawnPointsAlongFarthestWall(int32 NumPo
 	return true;
 }
 
+bool UMRSpatialRecognitionSubsystem::GetFloorRect(FVector& OutCenter, FVector2D& OutHalfXY) const
+{
+	const UMRUKSubsystem* MRUKSubsystem = GetMRUKSubsystem();
+	if (!MRUKSubsystem)
+	{
+		return false;
+	}
+
+	// MeasureFloorHeight と同様、最も Z が高い床アンカー＝本物の床を採用する。
+	const AMRUKAnchor* BestFloor = nullptr;
+	float BestZ = -TNumericLimits<float>::Max();
+	for (const AMRUKRoom* Room : MRUKSubsystem->Rooms)
+	{
+		if (!Room)
+		{
+			continue;
+		}
+		for (const AMRUKAnchor* Floor : Room->FloorAnchors)
+		{
+			if (!Floor)
+			{
+				continue;
+			}
+			const float Z = Floor->GetActorLocation().Z;
+			if (Z > BestZ)
+			{
+				BestZ = Z;
+				BestFloor = Floor;
+			}
+		}
+	}
+
+	if (!BestFloor)
+	{
+		return false;
+	}
+
+	OutCenter = BestFloor->GetActorLocation();
+
+	// 水平半サイズ。床面アンカーは PlaneBounds（面ローカル2D矩形）を持つのでそれを優先。
+	if (BestFloor->PlaneBounds.bIsValid)
+	{
+		OutHalfXY = BestFloor->PlaneBounds.GetExtent();
+	}
+	else if (BestFloor->VolumeBounds.IsValid)
+	{
+		const FVector Ext = BestFloor->VolumeBounds.GetExtent();
+		OutHalfXY = FVector2D(Ext.X, Ext.Y);
+	}
+	else
+	{
+		// 実寸が取れない場合は広め(5m四方)のフォールバック。
+		OutHalfXY = FVector2D(500.0f, 500.0f);
+	}
+	return true;
+}
+
 bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocation, float& OutFloorZ)
 {
 	// 床高さは、まず MRUK の床アンカーの高さを直接使う。
@@ -740,29 +797,47 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 				Mesh->DetachFromComponent(FDetachmentTransformRules::KeepWorldTransform);
 			}
 
-			// デバッグ可視化は壁/天井を除いて適用（壁/天井は常に不可視オクルージョン）。
+			// デバッグ可視化は壁/天井を除いて適用（壁/天井は常に不可視）。
 			const bool bVisualizeThis = bDebugVisualizeMesh && !bIsWall && !bIsCeiling;
 			if (bVisualizeThis)
 			{
 				// デバッグ: 部屋メッシュをメインパスでも描画して目視確認できるようにする。
 				Mesh->SetRenderInMainPass(true);
+				Mesh->SetRenderInDepthPass(true);
+				Mesh->bRenderInDepthPass = true;
+				Mesh->SetVisibility(true);
+			}
+			else if (bSceneMeshVisualOcclusion)
+			{
+				// Scene方式オクルージョン（旧挙動）:
+				// - メインパス(色)では描かない → 見えない（パススルーの現実映像が透ける）
+				// - 深度パスには書き込む → このメッシュより奥にある敵が深度テストで隠される
+				// ※ ただし Scene メッシュはトラッキング補正(World Lock)で実行中に上下ドリフトし、
+				//   それが深度パス経由で「現実の床が上下して見える」原因になる（Meta も visual 用途は非推奨）。
+				Mesh->SetRenderInMainPass(false);
+				Mesh->SetRenderInDepthPass(true);
+				Mesh->bRenderInDepthPass = true;
+				Mesh->SetVisibility(true);
 			}
 			else
 			{
-				// オクルージョン設定の肝:
-				// - メインパス(色)では描かない → 見えない（パススルーの現実映像が透ける）
-				// - 深度パスには書き込む → このメッシュより奥にある敵が深度テストで隠される
+				// 完全不可視（推奨・既定）:
+				// メインパスも深度パスも描画しない。メッシュは NavMesh 土台と衝突専用にする。
+				// これで Scene メッシュのドリフトが画面に一切出ない（床/壁が上下して見えない）。
+				// 現実物体による敵のオクルージョンが必要なら Depth API 側(SetXROcclusionsMode)で行う。
 				Mesh->SetRenderInMainPass(false);
+				Mesh->SetRenderInDepthPass(false);
+				Mesh->bRenderInDepthPass = false;
+				Mesh->SetVisibility(false);
 			}
-			Mesh->SetRenderInDepthPass(true);
-			Mesh->bRenderInDepthPass = true;
 			Mesh->SetCastShadow(false);
-			Mesh->SetVisibility(true); // Visibility自体はtrue（描画判断はMainPassフラグ側で行う）。
 
-			// NavMesh の歩行可能面は「床のみ」。家具メッシュ自体は Nav 非対象にする
-			// （SetCanEverAffectNavigation(true) にすると机の天板が歩行面になり敵が乗り上げて stuck するため）。
-			// 壁/天井/窓/ドア/壁掛け/GlobalMesh/Other も Nav 非対象。
-			Mesh->SetCanEverAffectNavigation(bIsFloor);
+			// NavMesh の歩行可能面の扱い。家具/壁/天井等は常に Nav 非対象。
+			// 床は bFloorMeshAffectsNavigation 次第:
+			//  - false（GMの固定床を使う場合・既定）: MRUK床メッシュも Nav 非対象にする。
+			//    MRUK床メッシュは World Lock で上下ドリフトするので Nav 面にすると NavMesh が揺れるため。
+			//  - true（単体利用時）: 床メッシュを Nav 面にする。
+			Mesh->SetCanEverAffectNavigation(bIsFloor && bFloorMeshAffectsNavigation);
 
 			// 家具(机等)は「足元の薄い矩形」だけを NavMesh の穴(歩行不可エリア)にして障害物化する。
 			// メッシュのコリジョン(縦に厚い3D Box)を NavModifier に見させると、机だらけの部屋で

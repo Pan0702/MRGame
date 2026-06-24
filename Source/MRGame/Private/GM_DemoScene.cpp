@@ -472,6 +472,11 @@ void AGM_DemoScene::InitializeOcclusion()
 			Spatial->bDebugVisualizeMesh = bDebugVisualizeRoomMesh;
 			Spatial->DebugMeshMaterial = DebugRoomMeshMaterial;
 
+			// 固定床(SpawnGroundCollision)を使う場合は、MRUK床メッシュを Nav 非対象にして
+			// NavMesh の二重生成と World Lock ドリフトによる NavMesh の揺れを防ぐ。
+			// 固定床を使わない場合のみ MRUK床メッシュを Nav 面にする。
+			Spatial->bFloorMeshAffectsNavigation = !bSpawnGroundCollision;
+
 			if (bScanRoomOnStart)
 			{
 				// 起動毎にアプリ内から部屋スキャン（スペース設定）を起動する。
@@ -527,6 +532,17 @@ void AGM_DemoScene::TogglePassthrough()
 	}
 
 	SetPassthroughEnabled(!Instance->IsVisible());
+}
+
+void AGM_DemoScene::StopSpawning()
+{
+	bLoopActive = false;
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SpawnRetryTimerHandle);
+		World->GetTimerManager().ClearTimer(WallSpawnerRetryTimerHandle);
+	}
+	UE_LOG(LogTemp, Log, TEXT("GM: StopSpawning - spawn loop halted"));
 }
 
 void AGM_DemoScene::CountAllBlueprintNodes()
@@ -900,19 +916,36 @@ void AGM_DemoScene::SpawnGroundCollision()
 
 	const FVector PlayerLocation = PlayerPawn->GetActorLocation();
 
-	// 床高さを決める。Depthで足元の床が測れればそれを使い、ダメならVRPawn（LocalFloor原点）のZ。
+	// 床の中心・サイズを床アンカーから取る。これにより「床アンカーぴったりの固定平面」を1枚敷ける。
+	// MRUK の床メッシュ(World Lockで上下ドリフトする)に頼らず、自前の固定コリジョン床を NavMesh 土台にする。
+	// 床アンカーが取れなければ従来どおりプレイヤー足元中心＋GroundHalfExtent四方にフォールバック。
+	FVector GroundCenterXY = PlayerLocation;
+	FVector2D HalfXY(GroundHalfExtent, GroundHalfExtent);
 	float FloorZ = PlayerLocation.Z;
 	if (UMRSpatialRecognitionSubsystem* Spatial = World->GetSubsystem<UMRSpatialRecognitionSubsystem>())
 	{
-		float MeasuredZ = 0.0f;
-		if (Spatial->MeasureFloorHeight(PlayerLocation, MeasuredZ))
+		FVector FloorCenter = FVector::ZeroVector;
+		FVector2D FloorHalfXY = FVector2D::ZeroVector;
+		if (Spatial->GetFloorRect(FloorCenter, FloorHalfXY))
 		{
-			FloorZ = MeasuredZ;
+			GroundCenterXY = FloorCenter;
+			FloorZ = FloorCenter.Z;
+			// 床端ぴったりだと敵が縁で落ちうるので少しだけ余裕(20cm)を持たせる。
+			HalfXY = FloorHalfXY + FVector2D(20.0f, 20.0f);
+		}
+		else
+		{
+			// 床矩形が取れない場合は高さだけ測る。
+			float MeasuredZ = 0.0f;
+			if (Spatial->MeasureFloorHeight(PlayerLocation, MeasuredZ))
+			{
+				FloorZ = MeasuredZ;
+			}
 		}
 	}
 
 	// 床天面が FloorZ に来るよう、中心を厚みの半分だけ下げる。
-	const FVector GroundCenter(PlayerLocation.X, PlayerLocation.Y, FloorZ - GroundThickness);
+	const FVector GroundCenter(GroundCenterXY.X, GroundCenterXY.Y, FloorZ - GroundThickness);
 
 	FActorSpawnParameters Params;
 	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
@@ -923,7 +956,7 @@ void AGM_DemoScene::SpawnGroundCollision()
 		return;
 	}
 
-	// 見えないコリジョンBoxを付ける（描画なし・コリジョンのみ）。
+	// 見えないコリジョンBoxを付ける（描画なし・コリジョンのみ）。サイズは床アンカー実寸に合わせる。
 	UBoxComponent* Box = NewObject<UBoxComponent>(GroundActor);
 	if (!Box)
 	{
@@ -931,17 +964,16 @@ void AGM_DemoScene::SpawnGroundCollision()
 	}
 	GroundActor->SetRootComponent(Box);
 	Box->RegisterComponent();
-	Box->SetBoxExtent(FVector(GroundHalfExtent, GroundHalfExtent, GroundThickness));
+	Box->SetBoxExtent(FVector(FMath::Max(10.0f, HalfXY.X), FMath::Max(10.0f, HalfXY.Y), GroundThickness));
 	Box->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	Box->SetCollisionObjectType(ECC_WorldStatic);
 	Box->SetCollisionResponseToAllChannels(ECR_Block);
-	// この床を NavMesh の歩行可能面にもしておく（床を有効化した場合の保険）。
-	// 通常は MRUK の床メッシュ側が Nav 対象なので、この床が無くても NavMesh は作られる。
+	// この固定床を NavMesh の歩行可能面にする。MRUK 床メッシュ側は Nav 非対象にして二重を避ける。
 	Box->SetCanEverAffectNavigation(true);
-	Box->SetHiddenInGame(true); // パススルーの床が見えているので描画は不要。
+	Box->SetHiddenInGame(true); // 見せない（パススルーの現実床が見えている）。
 
-	UE_LOG(LogTemp, Log, TEXT("SpawnGroundCollision: ground at Z=%.1f (player Z=%.1f)"),
-	       FloorZ, PlayerLocation.Z);
+	UE_LOG(LogTemp, Log, TEXT("SpawnGroundCollision: fixed ground at center=%s halfXY=(%.1f,%.1f) Z=%.1f"),
+	       *GroundCenter.ToCompactString(), HalfXY.X, HalfXY.Y, FloorZ);
 }
 
 void AGM_DemoScene::SpawnNavInvoker()

@@ -111,6 +111,15 @@ void AEnemy::OnHitCapsuleBeginOverlap(UPrimitiveComponent* OverlappedComp, AActo
 	//当たったものが剣か？
 	if (ASword* Sword = Cast<ASword>(OtherActor))
 	{
+		// 戦闘終了後(時間切れ等)は倒せない。CombatDirector が終了状態なら被ダメージを無効化する。
+		if (const UCombatDirectorSubsystem* Director = GetWorld()->GetSubsystem<UCombatDirectorSubsystem>())
+		{
+			if (Director->IsCombatEnded())
+			{
+				return;
+			}
+		}
+
 		//剣が振ってる場外だったら当たりにして敵を消す
 		if (Sword->IsSwinging() && !bIsDead)
 		{
@@ -156,6 +165,27 @@ void AEnemy::StartDeath()
 void AEnemy::FinishDeath()
 {
 	Destroy();
+}
+
+void AEnemy::StopForCombatEnd()
+{
+	// AIControllerの追跡(MoveTo再発行タイマー)を止める。UnPossessすると追跡ループが止まり、
+	// 以後 MoveToActor が発行されないのでその場に留まる。
+	if (AController* C = GetController())
+	{
+		if (AEnemyAIController* AICon = Cast<AEnemyAIController>(C))
+		{
+			AICon->StopMovement();
+		}
+		C->UnPossess();
+	}
+
+	// 移動を即停止してその場に立たせる（滑り防止）。コリジョンは残すので床に立ち続ける。
+	if (UCharacterMovementComponent* Move = GetCharacterMovement())
+	{
+		Move->StopMovementImmediately();
+		Move->DisableMovement();
+	}
 }
 
 bool AEnemy::GetDyFlag()

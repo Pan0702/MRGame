@@ -29,6 +29,18 @@ AEnemy::AEnemy()
 	//進行方向を向く
 	CharaMove->bOrientRotationToMovement = true;
 
+	// RVOアバイダンス: 敵同士が互いの進路を予測して避け合う。
+	// これが無いと複数の敵が同じ経路でプレイヤーへ向かったとき、狭い通路で「団子」になって
+	// カプセル同士が押し合い前に進めなくなる。また先頭の敵が家具に引っかかって止まると、
+	// 後続はそれを動的障害物として回り込めず後ろで渋滞する。RVOで両方を緩和する。
+	CharaMove->bUseRVOAvoidance = true;
+	// 回避をどれだけ優先するか(0〜1)。高いほど周囲を強く避ける＝団子になりにくいが、
+	// 全員が高いと譲り合って進みが鈍るので中庸に。
+	CharaMove->AvoidanceWeight = 0.5f;
+	// この半径(cm)内の他エージェントを回避対象として考慮する。
+	// 敵カプセル＋αにして、近づきすぎる前に避け始める。
+	CharaMove->AvoidanceConsiderationRadius = 100.0f;
+
 	//　AIControllerを指定
 	AIControllerClass = AEnemyAIController::StaticClass();
 	AutoPossessAI = EAutoPossessAI::PlacedInWorldOrSpawned;
@@ -119,9 +131,31 @@ void AEnemy::OnHitCapsuleBeginOverlap(UPrimitiveComponent* OverlappedComp, AActo
 				constexpr int32 KillCount = 1;
 				Gi->AddScore(KillCount);
 			}
-			Destroy();
+			// 即 Destroy せず死亡演出を開始する。
+			// 実際の Destroy は Death アニメ末尾の AnimNotify → FinishDeath() で行う。
+			StartDeath();
 		}
 	}
+}
+
+void AEnemy::StartDeath()
+{
+	// 倒れている最中に剣やプレイヤーが再ヒットしないよう当たり判定を切る。
+	SetActorEnableCollision(false);
+
+	// AI で移動中だと Death アニメ再生中も滑ってしまうので止める。
+	if (UCharacterMovementComponent* Move = GetCharacterMovement())
+	{
+		Move->StopMovementImmediately();
+		Move->DisableMovement();
+	}
+	// ここでは Destroy しない。bIsDead により AnimBP が Death に遷移し、
+	// アニメ末尾の AnimNotify が FinishDeath() を呼ぶ。
+}
+
+void AEnemy::FinishDeath()
+{
+	Destroy();
 }
 
 bool AEnemy::GetDyFlag()

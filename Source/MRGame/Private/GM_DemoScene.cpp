@@ -20,6 +20,7 @@
 #include "OculusXRPersistentPassthroughInstance.h"
 #include "TimerManager.h"
 #include "OculusXRFunctionLibrary.h"
+#include "BlueprintStatsLibrary.h"
 
 AGM_DemoScene::AGM_DemoScene()
 {
@@ -526,6 +527,14 @@ void AGM_DemoScene::TogglePassthrough()
 	}
 
 	SetPassthroughEnabled(!Instance->IsVisible());
+}
+
+void AGM_DemoScene::CountAllBlueprintNodes()
+{
+	// エディタのコンソールから実行されるラッパー。集計の実体はライブラリ側（エディタ限定）。
+	// 結果は UBlueprintStatsLibrary 側の UE_LOG（LogTemp Warning「Total BP nodes: ...」）に出る。
+	const int32 Total = UBlueprintStatsLibrary::CountAllBlueprintNodes();
+	UE_LOG(LogTemp, Warning, TEXT("CountAllBlueprintNodes (exec): Total BP nodes = %d"), Total);
 }
 
 void AGM_DemoScene::StartLoop()

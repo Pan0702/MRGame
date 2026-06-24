@@ -54,6 +54,12 @@ public:
 	UFUNCTION(Exec)
 	void SetPassthroughEnabled(bool bEnabled);
 
+	// デバッグ用コンソールコマンド: プロジェクト内の全BPノード数を数えてログ出力する。
+	// エディタのコンソール(`)で「CountAllBlueprintNodes」と打つと実行できる。
+	// 実体は UBlueprintStatsLibrary::CountAllBlueprintNodes（エディタ限定）。
+	UFUNCTION(Exec)
+	void CountAllBlueprintNodes();
+
 protected:
 
 	// MR初期化（チュートリアル等のサブクラスから再利用するため protected）

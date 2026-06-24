@@ -193,6 +193,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
 	bool bAutoBuildOcclusionOnSceneLoaded = true;
 
+	/**
+	 * オクルージョンメッシュを生成時点のワールド位置に固定するか。
+	 * true: 生成直後にアンカーからデタッチして固定を試みる。
+	 *   ※ 実機検証では MRUK がアンカーアクター自体を毎フレーム動かすため、コンポーネントを
+	 *      デタッチしてもドリフトは止まらなかった（効果なし）。さらに床メッシュをデタッチすると
+	 *      接地コリジョンに副作用が出る恐れがあるため、既定は false（無効）。
+	 * false: アンカーの子のまま（MRUK標準の追従挙動）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
+	bool bFreezeOcclusionMeshTransform = false;
+
 	/** 床アンカーにもオクルージョンメッシュを生成するか（敵の接地にも使える）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
 	bool bIncludeFloorInOcclusion = true;

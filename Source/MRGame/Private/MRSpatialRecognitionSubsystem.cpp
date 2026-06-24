@@ -76,11 +76,26 @@ bool UMRSpatialRecognitionSubsystem::LoadSceneFromDevice()
 	// 新しいロード試行ごとに処理済みフラグをリセット。
 	bSceneLoadHandled = false;
 
-	// 既にロード済みなら即成功扱い。
-	if (MRUKSubsystem->SceneLoadStatus == EMRUKInitStatus::Complete)
+	// 既にロード済みで、かつ部屋アクターが実在する場合のみ即成功扱い。
+	// 注意: UMRUKSubsystem は GameInstance サブシステムでレベル遷移をまたいで生き残るため、
+	// 前のレベル(Title)でロード済みだと SceneLoadStatus は Complete のまま。しかし OpenLevel で
+	// 前ワールドの部屋アクター(Rooms)は破棄されるので、新ワールドでは Rooms が空のことがある。
+	// その状態で即 HandleSceneLoaded(true) すると「認識アンカー0/壁なし/NavMesh生成されず」で
+	// 敵が出ない（Title→Play 遷移時に再現）。Rooms が空なら下の通常ロードに進んで再取得させる。
+	if (MRUKSubsystem->SceneLoadStatus == EMRUKInitStatus::Complete && MRUKSubsystem->Rooms.Num() > 0)
 	{
 		HandleSceneLoaded(true);
 		return true;
+	}
+
+	// ステータスは Complete なのに Rooms が空 = 前レベルのロード結果が残っているだけで、
+	// 新ワールドには部屋アクターが無い状態。このまま LoadSceneFromDeviceAsync を呼んでも
+	// MRUK が「もう Complete」と判断して再ディスカバリーせず、部屋が永久に空のままになりうる。
+	// ClearScene() でステータスをリセットし、確実に再ロード(再ディスカバリー)を走らせる。
+	if (MRUKSubsystem->SceneLoadStatus == EMRUKInitStatus::Complete && MRUKSubsystem->Rooms.Num() == 0)
+	{
+		UE_LOG(LogTemp, Log, TEXT("LoadSceneFromDevice: status=Complete but Rooms empty (level transition). ClearScene and reload."));
+		MRUKSubsystem->ClearScene();
 	}
 
 	++LoadAttemptCount;
@@ -714,6 +729,15 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 			if (!Mesh)
 			{
 				continue;
+			}
+
+			// オクルージョンメッシュの位置を生成時点で固定する。
+			// MRUK アンカーはトラッキングのドリフト補正で実行中もジワジワ動き続けるため、
+			// アンカーの子のままだと壁/床メッシュも一緒に動いて見える（敵基準で壁が動く現象）。
+			// 生成直後にアンカーからデタッチしてワールド位置を保持し、以後追従させない。
+			if (bFreezeOcclusionMeshTransform)
+			{
+				Mesh->DetachFromComponent(FDetachmentTransformRules::KeepWorldTransform);
 			}
 
 			// デバッグ可視化は壁/天井を除いて適用（壁/天井は常に不可視オクルージョン）。

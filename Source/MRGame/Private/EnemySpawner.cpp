@@ -164,15 +164,18 @@ AEnemy* AEnemySpawner::SpawnOne()
 			}
 		}
 
-		// 既に居る敵と近すぎる点は弾く（重なって貫通するのを防ぐ）。最後の試行では妥協して受け入れる。
-		if (Attempt < Attempts - 1 && IsTooCloseToExistingEnemy(ProjectedLoc.Location))
+		// 既に居る敵と近すぎる点は弾く（重なって貫通し、互いに押し合って動けなくなるのを防ぐ）。
+		// bStrictSeparation=true の場合は最後の試行でも妥協せず弾く（離れた点が無ければこの回は湧かさない）。
+		// false の場合のみ、従来どおり最後の試行で妥協して受け入れる。
+		const bool bLastAttempt = (Attempt == Attempts - 1);
+		if ((bStrictSeparation || !bLastAttempt) && IsTooCloseToExistingEnemy(ProjectedLoc.Location))
 		{
 			continue;
 		}
 
 		// 敵カプセルが壁/家具に埋まらず収まる点か確認する（空間不足でMeshに埋まる/動けないのを防ぐ）。
-		// 最後の試行では妥協して受け入れる（どこにも収まらないなら巡回元のGMが別Spawnerを試す）。
-		if (Attempt < Attempts - 1 && !CanEnemyFitAt(PickedClass, ProjectedLoc.Location))
+		// こちらは最後の試行では妥協して受け入れる（どこにも収まらないなら巡回元のGMが別Spawnerを試す）。
+		if (!bLastAttempt && !CanEnemyFitAt(PickedClass, ProjectedLoc.Location))
 		{
 			continue;
 		}

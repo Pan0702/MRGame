@@ -12,7 +12,7 @@ void UTimerSubsystem::StartCountdownSequence(int32 InDurationSeconds, float Read
 
 	// 残り秒数を初期表示用にセット（タイマーはまだ動かさない）
 	RemainingSeconds = InDurationSeconds;
-	OnTimeChanged.Broadcast(RemainingSeconds);
+	BroadcastTimeChanged();
 
 	// Ready フェーズ開始
 	SetPhase(EGameTimerPhase::Ready);
@@ -61,10 +61,40 @@ void UTimerSubsystem::SetPhase(EGameTimerPhase NewPhase)
 	OnPhaseChanged.Broadcast(CurrentPhase);
 }
 
+EFinalCountdownPhase UTimerSubsystem::GetFinalCountdownPhase(int32 Seconds) const
+{
+	switch (Seconds)
+	{
+	case 5:
+		return EFinalCountdownPhase::Sec5;
+	case 4:
+		return EFinalCountdownPhase::Sec4;
+	case 3:
+		return EFinalCountdownPhase::Sec3;
+	case 2:
+		return EFinalCountdownPhase::Sec2;
+	case 1:
+		return EFinalCountdownPhase::Sec1;
+	default:
+		return EFinalCountdownPhase::None;
+	}
+}
+
+void UTimerSubsystem::BroadcastTimeChanged()
+{
+	OnTimeChanged.Broadcast(RemainingSeconds);
+
+	if (CurrentPhase == EGameTimerPhase::Playing && RemainingSeconds >= 1 && RemainingSeconds <= 5)
+	{
+		OnFinalCountdownTick.Broadcast(RemainingSeconds);
+		OnFinalCountdownPhaseChanged.Broadcast(GetFinalCountdownPhase(RemainingSeconds));
+	}
+}
+
 void UTimerSubsystem::StartTimer(int32 InDurationSeconds)
 {
 	RemainingSeconds = InDurationSeconds;
-	OnTimeChanged.Broadcast(RemainingSeconds); // 初期値を即通知
+	BroadcastTimeChanged(); // 初期値を即通知
 
 	GetWorld()->GetTimerManager().SetTimer(
 		CountHandle, this, &UTimerSubsystem::Tick1Second, 1.0f, /*bLoop=*/true);
@@ -73,7 +103,7 @@ void UTimerSubsystem::StartTimer(int32 InDurationSeconds)
 void UTimerSubsystem::Tick1Second()
 {
 	RemainingSeconds = FMath::Max(0, RemainingSeconds - 1);
-	OnTimeChanged.Broadcast(RemainingSeconds);
+	BroadcastTimeChanged();
 
 	if (RemainingSeconds <= 0)
 	{

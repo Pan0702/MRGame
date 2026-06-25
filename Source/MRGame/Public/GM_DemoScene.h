@@ -75,6 +75,8 @@ protected:
 
 	// MR初期化（チュートリアル等のサブクラスから再利用するため protected）
 	void InitializePassthrough();
+	// Meta Depth API を起動し、現実物体による仮想オブジェクトの遮蔽を有効化する。
+	void InitializeDepthOcclusion();
 	// 部屋スキャン/ロードを起動してオクルージョン(部屋メッシュ方式)を準備する。
 	void InitializeOcclusion();
 
@@ -87,10 +89,18 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "MR|Passthrough")
 	bool bInitializePassthrough = true;
 
-	// 起動時に MRUK の部屋データを準備してオクルージョン(部屋メッシュ方式)を有効化するか。
-	// 部屋ロード/スキャン完了後、部屋の壁/机/椅子の形に透明オクルージョンメッシュが自動生成され、
-	// 現実の物体の後ろに回った敵がその物体に隠れて見えるようになる（コードで完結・マテリアル不要）。
-	// ※ Meta の Soft Occlusion (リアルタイムDepth) は公式UEでは動かないためこの方式を採用。
+	// Depth API によるリアルタイム遮蔽を有効化するか。
+	// true: 現実の机・椅子・手などの奥にある敵や弾がパススルー側に隠れる。
+	UPROPERTY(EditAnywhere, Category = "MR|Depth")
+	bool bEnableDepthOcclusion = true;
+
+	// Soft Occlusion を使うか。Meta fork の Unreal Engine でのみ有効。
+	// Epic公式UE/標準MetaXRでは false のまま Hard Occlusion を使う。
+	UPROPERTY(EditAnywhere, Category = "MR|Depth")
+	bool bUseSoftDepthOcclusion = false;
+
+	// 起動時に MRUK の部屋データを準備するか。
+	// ここは壁/床/机などのScene情報、スポーン、NavMesh用。見た目の遮蔽は Depth API 側で行う。
 	UPROPERTY(EditAnywhere, Category = "MR|Occlusion")
 	bool bEnableOcclusion = true;
 
@@ -282,6 +292,9 @@ private:
 
 	// ロード完了待ちのフォールバックタイマー。
 	FTimerHandle SceneLoadFallbackTimerHandle;
+
+	// Depth API 起動は非同期なので、少し遅らせて状態をログに出す。
+	void LogDepthOcclusionStatus();
 
 	// MR空間の Runtime NavMesh は Invoker 起動から生成まで遅延するため、湧きが充足するまで
 	// この間隔(秒)で MaintainDesiredAliveCount を再試行する。NavMesh生成を待って敵を出す。

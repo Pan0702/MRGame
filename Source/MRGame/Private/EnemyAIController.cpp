@@ -3,6 +3,7 @@
 
 #include "EnemyAIController.h"
 
+#include "Camera/CameraComponent.h"
 #include "GameFramework/Pawn.h"
 #include "Kismet/GameplayStatics.h"
 #include "TimerManager.h"
@@ -11,8 +12,26 @@
 
 AEnemyAIController::AEnemyAIController()
 {
-	// 移動は MoveToActor + PathFollowingComponent（NavMesh経路追従）に任せるので毎Tickは不要。
+	// 移動は MoveToLocation + PathFollowingComponent（NavMesh経路追従）に任せるので毎Tickは不要。
 	PrimaryActorTick.bCanEverTick = false;
+}
+
+FVector AEnemyAIController::GetChaseTargetLocation() const
+{
+	if (!TargetPawn)
+	{
+		return FVector::ZeroVector;
+	}
+
+	if (bUseCameraLocationAsTarget)
+	{
+		if (const UCameraComponent* Camera = TargetPawn->FindComponentByClass<UCameraComponent>())
+		{
+			return Camera->GetComponentLocation();
+		}
+	}
+
+	return TargetPawn->GetActorLocation();
 }
 
 void AEnemyAIController::OnPossess(APawn* InPawn)
@@ -62,6 +81,8 @@ void AEnemyAIController::UpdateChase()
 		return;
 	}
 
+	const FVector TargetLocation = GetChaseTargetLocation();
+
 	// 引っかかり(stuck)検出: 経路追従中(Moving)なのに前回からほとんど進めていなければ、
 	// 家具/壁のコリジョン角に物理的に引っかかって止まっている可能性が高い。
 	// 一定時間続いたら下の再発行ガードを無視して経路を引き直し、別ルートで復帰させる。
@@ -89,16 +110,16 @@ void AEnemyAIController::UpdateChase()
 	}
 
 	// 既に経路追従中で、かつプレイヤーが前回の目標位置からあまり動いていなければ、
-	// MoveToActor を再発行しない。0.3秒ごとに無条件で再発行すると PathFollowingComponent が
+	// MoveTo を再発行しない。0.3秒ごとに無条件で再発行すると PathFollowingComponent が
 	// 毎回経路をリセットし、敵が動き出してはリセットされ「その場で足踏みして進まない」原因になる。
 	// ただし stuck 中は引っかかり復帰のため、このガードを無視して必ず引き直す。
-	const float TargetDriftSq = FVector::DistSquared(TargetPawn->GetActorLocation(), LastChaseGoal);
+	const float TargetDriftSq = FVector::DistSquared2D(TargetLocation, LastChaseGoal);
 	if (!bStuck && bMoving && TargetDriftSq < FMath::Square(GoalRefreshDistance))
 	{
 		// 追従継続中・目標もほぼ動いていない → 経路をいじらず追従に任せる。
 		return;
 	}
-	LastChaseGoal = TargetPawn->GetActorLocation();
+	LastChaseGoal = TargetLocation;
 	if (bStuck)
 	{
 		// 引っかかりからの復帰。プレイヤーへ同じ経路を引き直すだけでは同じ角に戻るので、
@@ -135,15 +156,14 @@ void AEnemyAIController::UpdateChase()
 	// bUsePathfinding=true で机/壁を回り込む。
 	// bAllowPartialPath=false: 完全経路が引けない時は部分経路で「途中の空間」まで歩いて
 	// その終端で恒久停止するのを防ぐ。完全経路が出ない間は下のリトライで生成/位置変化を待つ。
-	FVector ChaseGoal = TargetPawn->GetActorLocation();
+	FVector ChaseGoal = TargetLocation;
 	bool bPlayerOnNav = false;
 	bool bEnemyOnNav = false;
 	FVector PlayerProj = FVector::ZeroVector;
 	if (UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld()))
 	{
-		const FVector ProjExtent(150.0f, 150.0f, 300.0f);
 		FNavLocation Loc;
-		if (NavSys->ProjectPointToNavigation(TargetPawn->GetActorLocation(), Loc, ProjExtent))
+		if (NavSys->ProjectPointToNavigation(TargetLocation, Loc, TargetNavProjectExtent))
 		{
 			bPlayerOnNav = true;
 			PlayerProj = Loc.Location;
@@ -151,7 +171,7 @@ void AEnemyAIController::UpdateChase()
 		}
 
 		FNavLocation EnemyLoc;
-		bEnemyOnNav = NavSys->ProjectPointToNavigation(GetPawn()->GetActorLocation(), EnemyLoc, ProjExtent);
+		bEnemyOnNav = NavSys->ProjectPointToNavigation(GetPawn()->GetActorLocation(), EnemyLoc, TargetNavProjectExtent);
 	}
 
 	const EPathFollowingRequestResult::Type MoveResult = MoveToLocation(
@@ -183,7 +203,7 @@ void AEnemyAIController::UpdateChase()
 		const FVector EnemyLoc = GetPawn()->GetActorLocation();
 		const FVector EnemyVelocity = GetPawn()->GetVelocity();
 		const float EnemySpeed2D = EnemyVelocity.Size2D();
-		const float DistanceToPlayer = FVector::Dist(EnemyLoc, TargetPawn->GetActorLocation());
+		const float DistanceToPlayer = FVector::Dist(EnemyLoc, TargetLocation);
 		const int32 DiagKey = (int32)MoveResult * 100 + (int32)MoveStatus * 10 + (bPlayerOnNav ? 2 : 0) + (bEnemyOnNav ? 1 : 0);
 		const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
 		const bool bIntervalElapsed = bLogChaseDiagnostics &&
@@ -193,7 +213,7 @@ void AEnemyAIController::UpdateChase()
 			LastChaseDiagKey = DiagKey;
 			LastChaseDiagLogTime = Now;
 			UE_LOG(LogTemp, Warning,
-				TEXT("EnemyChase: pawn=%s controller=%s MoveResult=%d MoveStatus=%d playerOnNav=%d enemyOnNav=%d stuck=%d stuckTime=%.2f moved2D=%.1f speed2D=%.1f enemyLoc=%s playerLoc=%s playerProj=%s dist=%.0f"),
+				TEXT("EnemyChase: pawn=%s controller=%s MoveResult=%d MoveStatus=%d playerOnNav=%d enemyOnNav=%d stuck=%d stuckTime=%.2f moved2D=%.1f speed2D=%.1f enemyLoc=%s targetLoc=%s pawnLoc=%s playerProj=%s dist=%.0f"),
 				*GetNameSafe(GetPawn()),
 				*GetNameSafe(this),
 				(int32)MoveResult,
@@ -205,6 +225,7 @@ void AEnemyAIController::UpdateChase()
 				Moved2D,
 				EnemySpeed2D,
 				*EnemyLoc.ToCompactString(),
+				*TargetLocation.ToCompactString(),
 				*TargetPawn->GetActorLocation().ToCompactString(),
 				bPlayerOnNav ? *PlayerProj.ToCompactString() : TEXT("(none)"),
 				DistanceToPlayer);

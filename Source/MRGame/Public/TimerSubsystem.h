@@ -17,8 +17,26 @@ enum class EGameTimerPhase : uint8
 	Finished UMETA(DisplayName="Finished")  // 「Finish」表示中
 };
 
+// 終了直前カウントダウン表示用。WBPはReady/Go/Finishと同じようにSwitchで画像を切り替える。
+UENUM(BlueprintType)
+enum class EFinalCountdownPhase : uint8
+{
+	None UMETA(DisplayName="None"),
+	Sec5 UMETA(DisplayName="Sec5"),
+	Sec4 UMETA(DisplayName="Sec4"),
+	Sec3 UMETA(DisplayName="Sec3"),
+	Sec2 UMETA(DisplayName="Sec2"),
+	Sec1 UMETA(DisplayName="Sec1")
+};
+
 // UI更新用：残り秒数が変わるたびに通知
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnTimeChanged, int32, RemainingSeconds);
+
+// 終了直前カウントダウン用：残り5〜1秒になった瞬間だけ通知
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnFinalCountdownTick, int32, RemainingSeconds);
+
+// 終了直前カウントダウン用：残り5〜1秒をenum化して通知
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnFinalCountdownPhaseChanged, EFinalCountdownPhase, Phase);
 
 // 時間切れ通知
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnTimeUp);
@@ -71,6 +89,14 @@ public:
 	UPROPERTY(BlueprintAssignable, Category="GameTimer")
 	FOnTimeChanged OnTimeChanged;
 
+	// 残り5〜1秒の大きなカウントダウン表示用。WBPはここを購読して画像を切り替える。
+	UPROPERTY(BlueprintAssignable, Category="GameTimer")
+	FOnFinalCountdownTick OnFinalCountdownTick;
+
+	// 残り5〜1秒の大きなカウントダウン表示用。ApplyPhaseと同じようにenum Switchで扱える。
+	UPROPERTY(BlueprintAssignable, Category="GameTimer")
+	FOnFinalCountdownPhaseChanged OnFinalCountdownPhaseChanged;
+
 	UPROPERTY(BlueprintAssignable, Category="GameTimer")
 	FOnTimeUp OnTimeUp;
 
@@ -83,6 +109,11 @@ public:
 	FOnSequenceFinished OnSequenceFinished;
 
 private:
+	EFinalCountdownPhase GetFinalCountdownPhase(int32 Seconds) const;
+
+	// 残り秒数変更を通知し、必要なら終了直前カウントダウンも通知する。
+	void BroadcastTimeChanged();
+
 	// フェーズを変更して通知するヘルパー
 	void SetPhase(EGameTimerPhase NewPhase);
 

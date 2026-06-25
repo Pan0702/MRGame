@@ -22,6 +22,14 @@
 #include "OculusXRFunctionLibrary.h"
 #include "BlueprintStatsLibrary.h"
 
+namespace
+{
+const TCHAR* GetDepthOcclusionModeName(bool bUseSoftDepthOcclusion)
+{
+	return bUseSoftDepthOcclusion ? TEXT("SoftOcclusions") : TEXT("HardOcclusions");
+}
+}
+
 AGM_DemoScene::AGM_DemoScene()
 {
 	// NavMeshデバッグ描画のため Tick を有効化（既定では GameMode は Tick しない）。
@@ -53,6 +61,7 @@ void AGM_DemoScene::BeginPlay()
 	Super::BeginPlay();
 
 	InitializePassthrough();
+	InitializeDepthOcclusion();
 
 	// 敵BPクラスが1つも設定されていなければ湧かせない。BP_GM_Main の EnemyClasses に BP_Enemy を設定すること。
 	if (EnemyClasses.Num() == 0)
@@ -85,8 +94,6 @@ void AGM_DemoScene::BeginPlay()
 			FMath::Max(0.5f, SceneLoadTimeout),
 			false);
 	}
-	UOculusXRFunctionLibrary::StartEnvironmentDepth();
-	UOculusXRFunctionLibrary::SetXROcclusionsMode(this, EOculusXROcclusionsMode::SoftOcclusions);
 }
 
 void AGM_DemoScene::HandleSceneReady(bool bSuccess)
@@ -453,6 +460,45 @@ void AGM_DemoScene::InitializePassthrough()
 	PassthroughSubsystem->InitializePersistentPassthrough(Parameters, LayerResumed);
 }
 
+void AGM_DemoScene::InitializeDepthOcclusion()
+{
+	if (!bEnableDepthOcclusion)
+	{
+		UOculusXRFunctionLibrary::SetXROcclusionsMode(this, EOculusXROcclusionsMode::Disabled);
+		UOculusXRFunctionLibrary::StopEnvironmentDepth();
+		UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: disabled"));
+		return;
+	}
+
+	UOculusXRFunctionLibrary::StartEnvironmentDepth();
+
+	const EOculusXROcclusionsMode Mode = bUseSoftDepthOcclusion
+		? EOculusXROcclusionsMode::SoftOcclusions
+		: EOculusXROcclusionsMode::HardOcclusions_Deprecated;
+	UOculusXRFunctionLibrary::SetXROcclusionsMode(this, Mode);
+
+	UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: StartEnvironmentDepth requested. Mode=%s"),
+	       GetDepthOcclusionModeName(bUseSoftDepthOcclusion));
+
+	if (UWorld* World = GetWorld())
+	{
+		FTimerHandle DepthStatusTimerHandle;
+		World->GetTimerManager().SetTimer(
+			DepthStatusTimerHandle,
+			this,
+			&AGM_DemoScene::LogDepthOcclusionStatus,
+			1.0f,
+			false);
+	}
+}
+
+void AGM_DemoScene::LogDepthOcclusionStatus()
+{
+	UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: IsEnvironmentDepthStarted=%s Mode=%s"),
+	       UOculusXRFunctionLibrary::IsEnvironmentDepthStarted() ? TEXT("true") : TEXT("false"),
+	       bEnableDepthOcclusion ? GetDepthOcclusionModeName(bUseSoftDepthOcclusion) : TEXT("Disabled"));
+}
+
 void AGM_DemoScene::InitializeOcclusion()
 {
 	if (!bEnableOcclusion)
@@ -460,14 +506,8 @@ void AGM_DemoScene::InitializeOcclusion()
 		return;
 	}
 
-	// 注意: Meta の Soft Occlusion (SetXROcclusionsMode/StartEnvironmentDepth による
-	// リアルタイムDepthオクルージョン) は WITH_OCULUS_BRANCH 版（Metaフォークの特別なUE）
-	// でしか動作せず、Epic公式UEでは中身が空で何も起きない（呼んでも机/壁に隠れない）。
-	// そのため公式UEでは Scene(MRUK) の部屋メッシュに透明オクルージョンマテリアルを貼る方式を採る。
-	//
-	// このプロジェクトでは MRUKAnchorActorSpawner をレベルに配置し、その ProceduralMaterial に
-	// オクルージョンマテリアルを指定することで、部屋ロード時に壁/机/椅子の形に透明メッシュが生成され、
-	// 敵がその後ろに隠れる。ここでは部屋データのロードだけを起動する（Spawnerが OnSceneLoaded を拾う）。
+	// Scene/MRUK は部屋形状、スポーン、NavMesh のためにロードする。
+	// 見た目の遮蔽は InitializeDepthOcclusion の Depth API 側で行う。
 	if (UWorld* World = GetWorld())
 	{
 		if (UMRSpatialRecognitionSubsystem* Spatial = World->GetSubsystem<UMRSpatialRecognitionSubsystem>())

@@ -14,6 +14,16 @@ public class MRGame : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[] {  });
 
+		// エディタビルド限定の依存。BP ノード数カウント(UBlueprintStatsLibrary)が使う
+		// UnrealEd/AssetRegistry/BlueprintGraph はエディタモジュールなので、実機(Android)
+		// パッケージには含めない（含めるとリンクできずビルドが壊れる）。
+		if (Target.bBuildEditor)
+		{
+			PrivateDependencyModuleNames.AddRange(new string[] {
+				"UnrealEd", "AssetRegistry", "BlueprintGraph"
+			});
+		}
+
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 		

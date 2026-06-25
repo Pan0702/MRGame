@@ -76,11 +76,26 @@ bool UMRSpatialRecognitionSubsystem::LoadSceneFromDevice()
 	// 新しいロード試行ごとに処理済みフラグをリセット。
 	bSceneLoadHandled = false;
 
-	// 既にロード済みなら即成功扱い。
-	if (MRUKSubsystem->SceneLoadStatus == EMRUKInitStatus::Complete)
+	// 既にロード済みで、かつ部屋アクターが実在する場合のみ即成功扱い。
+	// 注意: UMRUKSubsystem は GameInstance サブシステムでレベル遷移をまたいで生き残るため、
+	// 前のレベル(Title)でロード済みだと SceneLoadStatus は Complete のまま。しかし OpenLevel で
+	// 前ワールドの部屋アクター(Rooms)は破棄されるので、新ワールドでは Rooms が空のことがある。
+	// その状態で即 HandleSceneLoaded(true) すると「認識アンカー0/壁なし/NavMesh生成されず」で
+	// 敵が出ない（Title→Play 遷移時に再現）。Rooms が空なら下の通常ロードに進んで再取得させる。
+	if (MRUKSubsystem->SceneLoadStatus == EMRUKInitStatus::Complete && MRUKSubsystem->Rooms.Num() > 0)
 	{
 		HandleSceneLoaded(true);
 		return true;
+	}
+
+	// ステータスは Complete なのに Rooms が空 = 前レベルのロード結果が残っているだけで、
+	// 新ワールドには部屋アクターが無い状態。このまま LoadSceneFromDeviceAsync を呼んでも
+	// MRUK が「もう Complete」と判断して再ディスカバリーせず、部屋が永久に空のままになりうる。
+	// ClearScene() でステータスをリセットし、確実に再ロード(再ディスカバリー)を走らせる。
+	if (MRUKSubsystem->SceneLoadStatus == EMRUKInitStatus::Complete && MRUKSubsystem->Rooms.Num() == 0)
+	{
+		UE_LOG(LogTemp, Log, TEXT("LoadSceneFromDevice: status=Complete but Rooms empty (level transition). ClearScene and reload."));
+		MRUKSubsystem->ClearScene();
 	}
 
 	++LoadAttemptCount;
@@ -307,6 +322,19 @@ bool UMRSpatialRecognitionSubsystem::CalibrateFrontWall(const FVector& PlayerLoc
 	CachedWallNormal = FarthestWall->GetActorForwardVector();
 	// 高さはプレイヤー基準に寄せる（湧きは床へ別途接地させるため、ここはXY基準点として使う）。
 	CachedWallPoint.Z = PlayerLocation.Z;
+
+	// 壁の水平半幅をキャッシュする（Spawnerを壁端から飛び出させないクランプ用）。
+	// MRUK壁アンカーの PlaneBounds は面ローカルの2D矩形で、X が水平方向の半幅。
+	CachedWallHalfWidth = 0.0f;
+	if (FarthestWall->PlaneBounds.bIsValid)
+	{
+		CachedWallHalfWidth = FarthestWall->PlaneBounds.GetExtent().X;
+	}
+	else if (FarthestWall->VolumeBounds.IsValid)
+	{
+		CachedWallHalfWidth = FarthestWall->VolumeBounds.GetExtent().X;
+	}
+
 	bWallBaseValid = true;
 
 	UE_LOG(LogTemp, Log, TEXT("CalibrateFrontWall: farthest wall at %s (dist=%.0f)"),
@@ -403,12 +431,23 @@ bool UMRSpatialRecognitionSubsystem::GetSpawnPointsAlongFarthestWall(int32 NumPo
 
 	// 壁前 WallOffset の中心点を基準に、左右に等間隔で並べる。
 	const FVector Base = CachedWallPoint + WallInward * WallOffset;
-	const float HalfRange = Spacing * (NumPoints - 1) * 0.5f;
+	float HalfRange = Spacing * (NumPoints - 1) * 0.5f;
+
+	// 壁幅を超えて壁の端から飛び出さないようにクランプする（バグ: Spawner数/間隔を増やすと
+	// 壁の前でもない所に並ぶ問題）。壁端ぴったりだとカプセルが角に埋まるので EnemyRadius ぶん内側に寄せる。
+	if (CachedWallHalfWidth > 0.0f)
+	{
+		const float UsableHalf = FMath::Max(0.0f, CachedWallHalfWidth - EnemyRadius);
+		HalfRange = FMath::Min(HalfRange, UsableHalf);
+	}
+
+	// クランプ後の実効間隔（NumPoints==1 のときは 0）。
+	const float EffectiveSpacing = (NumPoints > 1) ? (HalfRange * 2.0f / (NumPoints - 1)) : 0.0f;
 
 	OutPoints.Reserve(NumPoints);
 	for (int32 i = 0; i < NumPoints; ++i)
 	{
-		const float Side = -HalfRange + Spacing * i;
+		const float Side = -HalfRange + EffectiveSpacing * i;
 		FVector P = Base + RightDir * Side;
 		// 床高さに合わせる（取れなければ CachedWallPoint.Z のままにしておく）。
 		float FloorZ = 0.0f;
@@ -421,6 +460,99 @@ bool UMRSpatialRecognitionSubsystem::GetSpawnPointsAlongFarthestWall(int32 NumPo
 	}
 
 	OutWallInward = WallInward;
+	return true;
+}
+
+bool UMRSpatialRecognitionSubsystem::GetFloorRect(FVector& OutCenter, FVector2D& OutHalfXY) const
+{
+	const UMRUKSubsystem* MRUKSubsystem = GetMRUKSubsystem();
+	if (!MRUKSubsystem)
+	{
+		return false;
+	}
+
+	// MeasureFloorHeight と同様、最も Z が高い床アンカー＝本物の床を採用する。
+	const AMRUKAnchor* BestFloor = nullptr;
+	float BestZ = -TNumericLimits<float>::Max();
+	for (const AMRUKRoom* Room : MRUKSubsystem->Rooms)
+	{
+		if (!Room)
+		{
+			continue;
+		}
+		for (const AMRUKAnchor* Floor : Room->FloorAnchors)
+		{
+			if (!Floor)
+			{
+				continue;
+			}
+			const float Z = Floor->GetActorLocation().Z;
+			if (Z > BestZ)
+			{
+				BestZ = Z;
+				BestFloor = Floor;
+			}
+		}
+	}
+
+	if (!BestFloor)
+	{
+		return false;
+	}
+
+	const FVector AnchorLoc = BestFloor->GetActorLocation();
+
+	// PlaneBounds（面ローカルの2D矩形）の4隅を、アンカーのワールドTransformで変換し、
+	// その XY の min/max から「ワールド軸に揃った床矩形」を求める。
+	// これにより床アンカーの回転(Pitch=-90/Yaw)を一切考慮せず、4隅を全部カバーする無回転Boxになる
+	// → 生成床が傾く/ズレる問題が原理的に消える。
+	if (BestFloor->PlaneBounds.bIsValid)
+	{
+		const FVector2D PMin = BestFloor->PlaneBounds.Min;
+		const FVector2D PMax = BestFloor->PlaneBounds.Max;
+		// 面ローカル2D(X,Y)。MRUK床アンカーは Pitch=-90 で寝ているので、面ローカルの (X,Y) は
+		// アクターTransform上は (X, Z) 平面に乗る。ローカル点は (X, Y, 0) として変換すれば、
+		// アクターの回転がそのまま適用されてワールドXYに落ちる。
+		const FVector LocalCorners[4] = {
+			FVector(PMin.X, PMin.Y, 0.0f),
+			FVector(PMax.X, PMin.Y, 0.0f),
+			FVector(PMax.X, PMax.Y, 0.0f),
+			FVector(PMin.X, PMax.Y, 0.0f)
+		};
+		const FTransform& Xform = BestFloor->GetActorTransform();
+		float MinX = TNumericLimits<float>::Max();
+		float MinY = TNumericLimits<float>::Max();
+		float MaxX = -TNumericLimits<float>::Max();
+		float MaxY = -TNumericLimits<float>::Max();
+		for (const FVector& LC : LocalCorners)
+		{
+			const FVector WC = Xform.TransformPosition(LC);
+			MinX = FMath::Min(MinX, WC.X);
+			MinY = FMath::Min(MinY, WC.Y);
+			MaxX = FMath::Max(MaxX, WC.X);
+			MaxY = FMath::Max(MaxY, WC.Y);
+		}
+		OutCenter = FVector((MinX + MaxX) * 0.5f, (MinY + MaxY) * 0.5f, AnchorLoc.Z);
+		OutHalfXY = FVector2D((MaxX - MinX) * 0.5f, (MaxY - MinY) * 0.5f);
+
+		UE_LOG(LogTemp, Warning,
+			TEXT("GetFloorRect: worldRect center=%s halfXY=(%.1f,%.1f) [from 4 corners, no rotation]"),
+			*OutCenter.ToCompactString(), OutHalfXY.X, OutHalfXY.Y);
+		return true;
+	}
+
+	// PlaneBounds が無ければ VolumeBounds → それも無ければ広めフォールバック。
+	OutCenter = AnchorLoc;
+	if (BestFloor->VolumeBounds.IsValid)
+	{
+		const FVector Ext = BestFloor->VolumeBounds.GetExtent();
+		OutHalfXY = FVector2D(FMath::Abs(Ext.X), FMath::Abs(Ext.Y));
+	}
+	else
+	{
+		// 実寸が取れない場合は広め(5m四方)のフォールバック。
+		OutHalfXY = FVector2D(500.0f, 500.0f);
+	}
 	return true;
 }
 
@@ -692,29 +824,56 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 				continue;
 			}
 
-			// デバッグ可視化は壁/天井を除いて適用（壁/天井は常に不可視オクルージョン）。
+			// オクルージョンメッシュの位置を生成時点で固定する。
+			// MRUK アンカーはトラッキングのドリフト補正で実行中もジワジワ動き続けるため、
+			// アンカーの子のままだと壁/床メッシュも一緒に動いて見える（敵基準で壁が動く現象）。
+			// 生成直後にアンカーからデタッチしてワールド位置を保持し、以後追従させない。
+			if (bFreezeOcclusionMeshTransform)
+			{
+				Mesh->DetachFromComponent(FDetachmentTransformRules::KeepWorldTransform);
+			}
+
+			// デバッグ可視化は壁/天井を除いて適用（壁/天井は常に不可視）。
 			const bool bVisualizeThis = bDebugVisualizeMesh && !bIsWall && !bIsCeiling;
 			if (bVisualizeThis)
 			{
 				// デバッグ: 部屋メッシュをメインパスでも描画して目視確認できるようにする。
 				Mesh->SetRenderInMainPass(true);
+				Mesh->SetRenderInDepthPass(true);
+				Mesh->bRenderInDepthPass = true;
+				Mesh->SetVisibility(true);
+			}
+			else if (bSceneMeshVisualOcclusion)
+			{
+				// Scene方式オクルージョン（旧挙動）:
+				// - メインパス(色)では描かない → 見えない（パススルーの現実映像が透ける）
+				// - 深度パスには書き込む → このメッシュより奥にある敵が深度テストで隠される
+				// ※ ただし Scene メッシュはトラッキング補正(World Lock)で実行中に上下ドリフトし、
+				//   それが深度パス経由で「現実の床が上下して見える」原因になる（Meta も visual 用途は非推奨）。
+				Mesh->SetRenderInMainPass(false);
+				Mesh->SetRenderInDepthPass(true);
+				Mesh->bRenderInDepthPass = true;
+				Mesh->SetVisibility(true);
 			}
 			else
 			{
-				// オクルージョン設定の肝:
-				// - メインパス(色)では描かない → 見えない（パススルーの現実映像が透ける）
-				// - 深度パスには書き込む → このメッシュより奥にある敵が深度テストで隠される
+				// 完全不可視（推奨・既定）:
+				// メインパスも深度パスも描画しない。メッシュは NavMesh 土台と衝突専用にする。
+				// これで Scene メッシュのドリフトが画面に一切出ない（床/壁が上下して見えない）。
+				// 現実物体による敵のオクルージョンが必要なら Depth API 側(SetXROcclusionsMode)で行う。
 				Mesh->SetRenderInMainPass(false);
+				Mesh->SetRenderInDepthPass(false);
+				Mesh->bRenderInDepthPass = false;
+				Mesh->SetVisibility(false);
 			}
-			Mesh->SetRenderInDepthPass(true);
-			Mesh->bRenderInDepthPass = true;
 			Mesh->SetCastShadow(false);
-			Mesh->SetVisibility(true); // Visibility自体はtrue（描画判断はMainPassフラグ側で行う）。
 
-			// NavMesh の歩行可能面は「床のみ」。家具メッシュ自体は Nav 非対象にする
-			// （SetCanEverAffectNavigation(true) にすると机の天板が歩行面になり敵が乗り上げて stuck するため）。
-			// 壁/天井/窓/ドア/壁掛け/GlobalMesh/Other も Nav 非対象。
-			Mesh->SetCanEverAffectNavigation(bIsFloor);
+			// NavMesh の歩行可能面の扱い。家具/壁/天井等は常に Nav 非対象。
+			// 床は bFloorMeshAffectsNavigation 次第:
+			//  - false（GMの固定床を使う場合・既定）: MRUK床メッシュも Nav 非対象にする。
+			//    MRUK床メッシュは World Lock で上下ドリフトするので Nav 面にすると NavMesh が揺れるため。
+			//  - true（単体利用時）: 床メッシュを Nav 面にする。
+			Mesh->SetCanEverAffectNavigation(bIsFloor && bFloorMeshAffectsNavigation);
 
 			// 家具(机等)は「足元の薄い矩形」だけを NavMesh の穴(歩行不可エリア)にして障害物化する。
 			// メッシュのコリジョン(縦に厚い3D Box)を NavModifier に見させると、机だらけの部屋で

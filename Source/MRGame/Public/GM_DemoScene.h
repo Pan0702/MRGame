@@ -23,6 +23,9 @@ public:
 	void NotifyEnemyKilled();
 	void DestoroyEnemies();
 
+	// 湧きループを止める（時間切れ等）。以後 CreateEnemies/補充/リトライが走らない。
+	void StopSpawning();
+
 	UFUNCTION(BlueprintPure, Category = "EnemyNum")
 	int32 GetTotalKills() const { return TotalKills; }
 
@@ -42,6 +45,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Spawn|Debug")
 	void ToggleDebugDrawSpawners() { bDebugDrawSpawners = !bDebugDrawSpawners; }
 
+	// 固定コリジョン床の範囲可視化を ON/OFF する。
+	UFUNCTION(BlueprintCallable, Category = "Spawn|Debug")
+	void SetDebugDrawGround(bool bEnabled) { bDebugDrawGround = bEnabled; }
+
+	// 固定コリジョン床の範囲可視化をトグルする。
+	UFUNCTION(BlueprintCallable, Category = "Spawn|Debug")
+	void ToggleDebugDrawGround() { bDebugDrawGround = !bDebugDrawGround; }
+
 	// 部屋スキャン/ロード完了(OnSceneLoaded)で呼ばれる。壁を測ってループを開始する。
 	UFUNCTION()
 	void HandleSceneReady(bool bSuccess);
@@ -54,10 +65,18 @@ public:
 	UFUNCTION(Exec)
 	void SetPassthroughEnabled(bool bEnabled);
 
+	// デバッグ用コンソールコマンド: プロジェクト内の全BPノード数を数えてログ出力する。
+	// エディタのコンソール(`)で「CountAllBlueprintNodes」と打つと実行できる。
+	// 実体は UBlueprintStatsLibrary::CountAllBlueprintNodes（エディタ限定）。
+	UFUNCTION(Exec)
+	void CountAllBlueprintNodes();
+
 protected:
 
 	// MR初期化（チュートリアル等のサブクラスから再利用するため protected）
 	void InitializePassthrough();
+	// Meta Depth API を起動し、現実物体による仮想オブジェクトの遮蔽を有効化する。
+	void InitializeDepthOcclusion();
 	// 部屋スキャン/ロードを起動してオクルージョン(部屋メッシュ方式)を準備する。
 	void InitializeOcclusion();
 
@@ -70,10 +89,18 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "MR|Passthrough")
 	bool bInitializePassthrough = true;
 
-	// 起動時に MRUK の部屋データを準備してオクルージョン(部屋メッシュ方式)を有効化するか。
-	// 部屋ロード/スキャン完了後、部屋の壁/机/椅子の形に透明オクルージョンメッシュが自動生成され、
-	// 現実の物体の後ろに回った敵がその物体に隠れて見えるようになる（コードで完結・マテリアル不要）。
-	// ※ Meta の Soft Occlusion (リアルタイムDepth) は公式UEでは動かないためこの方式を採用。
+	// Depth API によるリアルタイム遮蔽を有効化するか。
+	// true: 現実の机・椅子・手などの奥にある敵や弾がパススルー側に隠れる。
+	UPROPERTY(EditAnywhere, Category = "MR|Depth")
+	bool bEnableDepthOcclusion = true;
+
+	// Soft Occlusion を使うか。Meta fork の Unreal Engine でのみ有効。
+	// Epic公式UE/標準MetaXRでは false のまま Hard Occlusion を使う。
+	UPROPERTY(EditAnywhere, Category = "MR|Depth")
+	bool bUseSoftDepthOcclusion = false;
+
+	// 起動時に MRUK の部屋データを準備するか。
+	// ここは壁/床/机などのScene情報、スポーン、NavMesh用。見た目の遮蔽は Depth API 側で行う。
 	UPROPERTY(EditAnywhere, Category = "MR|Occlusion")
 	bool bEnableOcclusion = true;
 
@@ -143,6 +170,12 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
 	float NavFallbackSearchRadius = 500.0f;
 
+	// Spawner 配置時の空間チェックで、敵カプセルから差し引く余裕(cm)。
+	// 壁/床にカプセルがわずかに触れただけで「埋まり」と誤判定して全 Spawner を弾くのを防ぐ。
+	// 大きくすると判定が甘く（埋まり気味でも置く）、小さくすると厳しく（クリアな点だけ置く）なる。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	float SpawnFitClearance = 5.0f;
+
 	// デバッグ用: 敵が歩ける範囲（NavMesh）を毎フレーム描画して目視確認する。
 	// 実行中に BP から ON/OFF できる（SetDebugDrawNavMesh / 直接書き込み）。本番では false に。
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Debug")
@@ -153,10 +186,17 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Debug")
 	bool bDebugDrawSpawners = false;
 
-	// 接地用の見えないコリジョン床を生成するか。パススルー空間には物理床が無いため、
-	// これが無いと敵(Character)は重力で落下し続ける。
-	// ※ 既定で OFF。床に敵が湧いて困るため一旦無効化。必要になったら BP_GM のディテールで true に戻す。
-	//    （true にすると床と一緒に NavigationInvoker も生成され NavMesh が作られる。）
+	// デバッグ用: 生成した固定コリジョン床(GroundActor)の範囲をワイヤーフレームで描画する。
+	// 「地面外に敵が湧く」時に、床の大きさ・位置が意図通りか目視確認するため。本番では false に。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Debug")
+	bool bDebugDrawGround = true;
+
+	// 接地用の見えないコリジョン床を生成するか。床アンカーの位置・サイズに合わせた固定平面を1枚敷き、
+	// それを敵の接地＋NavMesh土台にする。
+	// ※2026-06-25: 固定床方式は GetFloorRect の4隅min/max計算で床がX=30cm幅に潰れ、NavMesh verts=0で
+	//   敵が一切湧かない不具合があったためロールバック。MRUK床メッシュを Nav 土台に戻す（実績ある方式）。
+	//   false にすると HandleSceneReady で bFloorMeshAffectsNavigation=true に上書きされ、MRUK床がNav面になる。
+	//   床メッシュ自体は bSceneMeshVisualOcclusion=false により不可視のまま（World Lock上下りは見えない）。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
 	bool bSpawnGroundCollision = false;
 
@@ -202,13 +242,24 @@ private:
 	void MaintainDesiredAliveCount();
 
 	// 最遠壁沿いに Spawner を SpawnerCount 個生成する。
+	// ただし NavMesh に乗らない／敵カプセルが埋まる点には置かない（湧かせない置物 Spawner を作らない）。
 	void SpawnWallSpawners();
+
+	// 実際に湧かす敵クラス(EnemyClasses)の CDO からカプセル半径/半高さを取る。配置検証に使う。
+	float GetEnemyCapsuleRadius() const;
+	float GetEnemyCapsuleHalfHeight() const;
+
+	// 指定位置(カプセル中心)に敵カプセルが壁/家具(WorldStatic)に埋まらず収まるかを返す。
+	bool CanEnemyFitAt(const FVector& CapsuleCenter, float Radius, float HalfHeight) const;
 
 	// デバッグ用: 敵が歩ける範囲（NavMesh）の境界をワイヤーフレームで描画する。
 	void DebugDrawNavMesh() const;
 
 	// デバッグ用: 壁沿い Spawner の位置・向きを描画して、設置されているか目視確認する。
 	void DebugDrawSpawners() const;
+
+	// デバッグ用: 生成した固定コリジョン床(GroundActor)の範囲をワイヤーボックスで描画する。
+	void DebugDrawGround() const;
 
 	// 診断用: 現在の NavMesh の頂点数を返す。0=未生成/空、>0=生成済み、負値=NavSys/RecastNav取得失敗。
 	int32 GetNavMeshVertCount() const;
@@ -242,6 +293,9 @@ private:
 	// ロード完了待ちのフォールバックタイマー。
 	FTimerHandle SceneLoadFallbackTimerHandle;
 
+	// Depth API 起動は非同期なので、少し遅らせて状態をログに出す。
+	void LogDepthOcclusionStatus();
+
 	// MR空間の Runtime NavMesh は Invoker 起動から生成まで遅延するため、湧きが充足するまで
 	// この間隔(秒)で MaintainDesiredAliveCount を再試行する。NavMesh生成を待って敵を出す。
 	UPROPERTY(EditAnywhere, Category = "Spawn")
@@ -249,5 +303,14 @@ private:
 
 	// 湧き再試行タイマー。充足したら停止する。
 	FTimerHandle SpawnRetryTimerHandle;
+
+	// 壁沿い Spawner の配置が 0 個だった時（NavMesh 未生成等）の再試行タイマーと回数。
+	FTimerHandle WallSpawnerRetryTimerHandle;
+	int32 WallSpawnerRetryCount = 0;
+
+	// 壁沿い Spawner 配置の最大リトライ回数（SpawnRetryInterval 間隔）。
+	// 0 個のまま諦めるまでの上限。NavMesh 生成遅延を吸収できる程度に確保する。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	int32 MaxWallSpawnerRetries = 20;
 
 };

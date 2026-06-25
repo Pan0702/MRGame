@@ -69,8 +69,8 @@ void ACuttingButton::OnOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor*
 	ASword* Sword = Cast<ASword>(OtherActor);
 	if (!Sword) return; // 剣以外は無視//
 
-	const FVector Velocity = Sword->GetBladeVelocity();
-	if (Velocity.Size() < CuttingSpeedThreshold) return; // 速度不足は切れない//
+	 const FVector Velocity = Sword->GetBladeVelocity();
+	// if (Velocity.Size() < 100.0f) return; // 速度不足は切れない//
 
 	const ECutDirection Type = JudgeCutType(Velocity.GetSafeNormal());
 	DoCut(Type);

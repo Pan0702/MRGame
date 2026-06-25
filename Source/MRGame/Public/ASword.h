@@ -10,6 +10,7 @@ class UArrowComponent;
 class UStaticMeshComponent;
 class UBoxComponent;
 class UPrimitiveComponent;
+class USoundBase;
 
 UCLASS()
 class MRGAME_API ASword : public AActor
@@ -49,6 +50,10 @@ public:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Sword")
 	TObjectPtr<UBoxComponent> SwordColl;
+
+	// 敵 or CuttingButton に当たったときに鳴らす斬撃音(BPで指定)
+	UPROPERTY(EditAnywhere, Category = "Sword|Feedback")
+	TObjectPtr<USoundBase> CutSound;
 
 	UPROPERTY(EditAnywhere, Category = "Sword|Haptics")
 	float HapticIntensity = 1.0f;

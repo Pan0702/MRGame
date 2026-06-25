@@ -3,6 +3,8 @@
 
 #include "ASword.h"
 #include "CombatDirectorSubsystem.h"
+#include "CuttingButton.h"
+#include "Enemy.h"
 #include "Components/ArrowComponent.h"
 #include "Components/BoxComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -19,6 +21,7 @@ ASword::ASword()
 	//柄
 	Root = CreateDefaultSubobject<UArrowComponent>(TEXT("Root"));
 	SetRootComponent(Root);
+	Root->SetVisibility(false);
 	//モデル
 	BladeMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("BladeMesh"));
 	BladeMesh->SetupAttachment(Root);
@@ -70,6 +73,14 @@ void ASword::OnHitBoxBeginOverlap(UPrimitiveComponent* OVerlappedComp, AActor* O
 		/*bAffectsRightLarge=*/ !bLeftHand,
 		/*bAffectsRightSmall=*/ !bLeftHand,
 		EDynamicForceFeedbackAction::Start);
+
+	// 敵 or CuttingButton に当たったら斬撃音を鳴らす。
+	// SwordColl は振っている間(=しきい値超え)だけ Overlap 有効なので、
+	// ここに来た時点で十分な速度は満たしている。
+	if (CutSound && (OtherActor->IsA<AEnemy>() || OtherActor->IsA<ACuttingButton>()))
+	{
+		UGameplayStatics::PlaySoundAtLocation(this, CutSound, GetActorLocation());
+	}
 }
 
 void ASword::UpdateSwing(float DeltaTime)

@@ -114,6 +114,17 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "MR|Spatial|NoScan")
 	bool MeasureFloorHeight(const FVector& FromLocation, float& OutFloorZ);
 
+	/**
+	 * 採用中の床アンカー（最も高い FLOOR）の PlaneBounds 4隅をワールド変換し、
+	 * その XY の min/max から「ワールド軸に揃った（無回転の）床矩形」の中心と半サイズを返す。
+	 * アンカーの回転を考慮せず4隅を全部カバーするので、自前の固定NavMesh土台を傾きなしで床に敷ける。
+	 * @param OutCenter   床矩形の中心ワールド座標（Zは床面高さ）
+	 * @param OutHalfXY   床矩形の水平半サイズ(cm)。ワールド軸基準（無回転Box用）。
+	 * @return 床アンカーが取得できたら true
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MR|Spatial|NoScan")
+	bool GetFloorRect(FVector& OutCenter, FVector2D& OutHalfXY) const;
+
 	/** 床を測るレイの最大距離(cm)。起点から真下にこの距離まで探す。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|NoScan")
 	float FloorScanMaxDistance = 300.0f;
@@ -193,9 +204,42 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
 	bool bAutoBuildOcclusionOnSceneLoaded = true;
 
+	/**
+	 * Scene メッシュを「見た目のオクルージョン」に使うか（深度パスに描画して現実物体で敵を隠す）。
+	 * false（推奨・既定）: 部屋メッシュを完全不可視にし、NavMesh土台・衝突専用にする。
+	 *   Scene メッシュは World Lock のトラッキング補正で実行中に上下ドリフトし、深度パス描画だと
+	 *   「現実の床/壁が上下して見える」原因になるため。現実物体での敵オクルージョンが必要なら
+	 *   Depth API(SetXROcclusionsMode)側で行う（Meta も Scene メッシュの visual 用途は非推奨）。
+	 * true: 旧挙動（深度パスに描画してオクルージョンする＝床がドリフトして見える可能性あり）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
+	bool bSceneMeshVisualOcclusion = false;
+
+	/**
+	 * オクルージョンメッシュを生成時点のワールド位置に固定するか。
+	 * true: 生成直後にアンカーからデタッチして固定を試みる。
+	 *   ※ 実機検証では MRUK がアンカーアクター自体を毎フレーム動かすため、コンポーネントを
+	 *      デタッチしてもドリフトは止まらなかった（効果なし）。さらに床メッシュをデタッチすると
+	 *      接地コリジョンに副作用が出る恐れがあるため、既定は false（無効）。
+	 * false: アンカーの子のまま（MRUK標準の追従挙動）。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
+	bool bFreezeOcclusionMeshTransform = false;
+
 	/** 床アンカーにもオクルージョンメッシュを生成するか（敵の接地にも使える）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
 	bool bIncludeFloorInOcclusion = true;
+
+	/**
+	 * MRUK の床メッシュを NavMesh の歩行面にするか。
+	 * false（GMが固定床 SpawnGroundCollision を使う場合）: MRUK床メッシュは Nav 非対象にする。
+	 *   MRUK床メッシュは World Lock で上下ドリフトするため、これを Nav 面にすると NavMesh も
+	 *   一緒に揺れる。代わりに GM 側の固定コリジョン床を Nav 土台にする（二重生成も防ぐ）。
+	 * true（単体利用時の従来挙動 / 2026-06-25 ロールバック後の既定）: MRUK床メッシュを Nav 面にする。
+	 *   ※GM の bSpawnGroundCollision=false に合わせて既定 true。HandleSceneReady でも !bSpawnGroundCollision で上書きされる。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Navigation")
+	bool bFloorMeshAffectsNavigation = true;
 
 	/** 天井アンカーをオクルージョンに含めるか（見上げた時に敵を隠したくなければ false）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")
@@ -298,5 +342,7 @@ private:
 	FVector CachedWallPoint = FVector::ZeroVector;
 	/** その壁の内向き法線（MRUK壁アンカーの ForwardVector＝部屋内側向き）。 */
 	FVector CachedWallNormal = FVector::ZeroVector;
+	/** その壁の水平方向の半幅(cm)。Spawnerを壁端から飛び出さないようクランプするのに使う。0なら未取得。 */
+	float CachedWallHalfWidth = 0.0f;
 	bool bWallBaseValid = false;
 };

@@ -35,6 +35,19 @@ public:
 	UFUNCTION(BlueprintPure, Category="Enemy")
 	bool GetDyFlag();
 
+	// 戦闘終了(時間切れ等)で呼ばれる。AIの追跡を止め、その場に立たせる。
+	// CombatDirectorSubsystem::EndCombat から全敵に対して呼ばれる。
+	void StopForCombatEnd();
+
+
+protected:
+	// 死亡演出を開始する（当たり判定・移動を止めて Death アニメに任せる）
+	void StartDeath();
+
+	// Death アニメ末尾の AnimNotify から呼ぶ。実際にアクターを消す。
+	UFUNCTION(BlueprintCallable, Category="Enemy")
+	void FinishDeath();
+
 
 private:
 

@@ -21,6 +21,45 @@ AEnemySpawner::AEnemySpawner()
 	SpawnVolume->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 }
 
+bool AEnemySpawner::CanEnemyFitAt(const TSubclassOf<AEnemy>& EnemyType, const FVector& FloorLocation) const
+{
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return false;
+	}
+
+	// 湧かす敵クラスの CDO からカプセル寸法を取る（BPごとに違うため）。
+	float Radius = 34.0f;        // ACharacter 既定値（CDOから取れない場合の保険）。
+	float HalfHeight = 88.0f;
+	if (const AEnemy* CDO = EnemyType ? EnemyType->GetDefaultObject<AEnemy>() : nullptr)
+	{
+		if (const UCapsuleComponent* Capsule = CDO->GetCapsuleComponent())
+		{
+			Radius = Capsule->GetScaledCapsuleRadius();
+			HalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+		}
+	}
+
+	// カプセル中心は床から HalfHeight 上。床にわずかに触れただけで弾かないよう SpawnFitClearance ぶん縮める。
+	const FVector CapsuleCenter = FloorLocation + FVector(0.0f, 0.0f, HalfHeight);
+	const FCollisionShape Capsule = FCollisionShape::MakeCapsule(
+		FMath::Max(1.0f, Radius - SpawnFitClearance),
+		FMath::Max(1.0f, HalfHeight - SpawnFitClearance));
+
+	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(SpawnerFitTest), /*bTraceComplex=*/false);
+
+	// 壁/床/家具のオクルージョンメッシュ(WorldStatic)に埋まらなければ収まる。
+	const bool bBlocked = World->OverlapBlockingTestByChannel(
+		CapsuleCenter,
+		FQuat::Identity,
+		ECC_WorldStatic,
+		Capsule,
+		QueryParams);
+
+	return !bBlocked;
+}
+
 bool AEnemySpawner::IsTooCloseToExistingEnemy(const FVector& Location) const
 {
 	const UWorld* World = GetWorld();
@@ -125,8 +164,18 @@ AEnemy* AEnemySpawner::SpawnOne()
 			}
 		}
 
-		// 既に居る敵と近すぎる点は弾く（重なって貫通するのを防ぐ）。最後の試行では妥協して受け入れる。
-		if (Attempt < Attempts - 1 && IsTooCloseToExistingEnemy(ProjectedLoc.Location))
+		// 既に居る敵と近すぎる点は弾く（重なって貫通し、互いに押し合って動けなくなるのを防ぐ）。
+		// bStrictSeparation=true の場合は最後の試行でも妥協せず弾く（離れた点が無ければこの回は湧かさない）。
+		// false の場合のみ、従来どおり最後の試行で妥協して受け入れる。
+		const bool bLastAttempt = (Attempt == Attempts - 1);
+		if ((bStrictSeparation || !bLastAttempt) && IsTooCloseToExistingEnemy(ProjectedLoc.Location))
+		{
+			continue;
+		}
+
+		// 敵カプセルが壁/家具に埋まらず収まる点か確認する（空間不足でMeshに埋まる/動けないのを防ぐ）。
+		// こちらは最後の試行では妥協して受け入れる（どこにも収まらないなら巡回元のGMが別Spawnerを試す）。
+		if (!bLastAttempt && !CanEnemyFitAt(PickedClass, ProjectedLoc.Location))
 		{
 			continue;
 		}
@@ -203,6 +252,14 @@ AEnemy* AEnemySpawner::SpawnOne()
 		FinalLoc.Z = SpawnLoc.Z + Capsule->GetScaledCapsuleHalfHeight();
 	}
 	SpawnedEnemy->SetActorLocation(FinalLoc, false, nullptr, ETeleportType::TeleportPhysics);
+	UE_LOG(LogActor, Log,
+		TEXT("EnemySpawner: spawned enemy. Spawner=%s Enemy=%s Class=%s SpawnLoc=%s FinalLoc=%s SpawnHeightOffset=%.1f"),
+		*GetName(),
+		*GetNameSafe(SpawnedEnemy),
+		*GetNameSafe(PickedClass.Get()),
+		*SpawnLoc.ToCompactString(),
+		*FinalLoc.ToCompactString(),
+		SpawnHeightOffset);
 
 	return SpawnedEnemy;
 }

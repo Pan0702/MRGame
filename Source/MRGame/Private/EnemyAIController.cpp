@@ -67,9 +67,12 @@ void AEnemyAIController::UpdateChase()
 	// 一定時間続いたら下の再発行ガードを無視して経路を引き直し、別ルートで復帰させる。
 	const bool bMoving = (GetMoveStatus() == EPathFollowingStatus::Moving);
 	bool bStuck = false;
+	float Moved2D = 0.0f;
 	{
 		const FVector SelfLoc = GetPawn()->GetActorLocation();
-		const float MovedSq = FVector::DistSquared2D(SelfLoc, LastSelfLocation);
+		const bool bHasLastSelfLocation = LastSelfLocation.X < FLT_MAX * 0.5f;
+		const float MovedSq = bHasLastSelfLocation ? FVector::DistSquared2D(SelfLoc, LastSelfLocation) : TNumericLimits<float>::Max();
+		Moved2D = bHasLastSelfLocation ? FMath::Sqrt(MovedSq) : -1.0f;
 		if (bMoving && MovedSq < FMath::Square(StuckMoveThreshold))
 		{
 			StuckAccumTime += FMath::Max(0.05f, ChaseUpdateInterval);
@@ -101,6 +104,15 @@ void AEnemyAIController::UpdateChase()
 		// 引っかかりからの復帰。プレイヤーへ同じ経路を引き直すだけでは同じ角に戻るので、
 		// まず近くの歩ける点へ少しだけ「ずらし移動」して物理的な引っかかりを外す。
 		// 次回 UpdateChase で通常のプレイヤー追従に戻る（LastChaseGoal をリセットして必ず再発行）。
+		UE_LOG(LogTemp, Warning,
+			TEXT("EnemyChaseStuck: pawn=%s controller=%s loc=%s moved2D=%.1f speed2D=%.1f stuckTime=%.2f"),
+			*GetNameSafe(GetPawn()),
+			*GetNameSafe(this),
+			*GetPawn()->GetActorLocation().ToCompactString(),
+			Moved2D,
+			GetPawn()->GetVelocity().Size2D(),
+			StuckAccumTime);
+
 		StopMovement();
 		StuckAccumTime = 0.0f;
 		LastChaseGoal = FVector(FLT_MAX);
@@ -123,11 +135,31 @@ void AEnemyAIController::UpdateChase()
 	// bUsePathfinding=true で机/壁を回り込む。
 	// bAllowPartialPath=false: 完全経路が引けない時は部分経路で「途中の空間」まで歩いて
 	// その終端で恒久停止するのを防ぐ。完全経路が出ない間は下のリトライで生成/位置変化を待つ。
-	const EPathFollowingRequestResult::Type MoveResult = MoveToActor(
-		TargetPawn,
+	FVector ChaseGoal = TargetPawn->GetActorLocation();
+	bool bPlayerOnNav = false;
+	bool bEnemyOnNav = false;
+	FVector PlayerProj = FVector::ZeroVector;
+	if (UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld()))
+	{
+		const FVector ProjExtent(150.0f, 150.0f, 300.0f);
+		FNavLocation Loc;
+		if (NavSys->ProjectPointToNavigation(TargetPawn->GetActorLocation(), Loc, ProjExtent))
+		{
+			bPlayerOnNav = true;
+			PlayerProj = Loc.Location;
+			ChaseGoal = PlayerProj;
+		}
+
+		FNavLocation EnemyLoc;
+		bEnemyOnNav = NavSys->ProjectPointToNavigation(GetPawn()->GetActorLocation(), EnemyLoc, ProjExtent);
+	}
+
+	const EPathFollowingRequestResult::Type MoveResult = MoveToLocation(
+		ChaseGoal,
 		StopDistance,
-		/*bStopOnOverlap=*/true,
+		/*bStopOnOverlap=*/false,
 		/*bUsePathfinding=*/true,
+		/*bProjectDestinationToNavigation=*/!bPlayerOnNav,
 		/*bCanStrafe=*/false,
 		/*FilterClass=*/nullptr,
 		/*bAllowPartialPath=*/false);
@@ -147,35 +179,35 @@ void AEnemyAIController::UpdateChase()
 	// これで「経路が出てない(=プレイヤーがNav外でFailed)」のか「経路は出る(Successful)が机で物理ブロックされて来ない」のかを切り分ける。
 	// 0.3秒ごとの洪水を避けるため、状態が前回と変わった時だけ出す。
 	{
-		bool bPlayerOnNav = false;
-		bool bEnemyOnNav = false;
-		FVector PlayerProj = FVector::ZeroVector;
-		if (UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld()))
-		{
-			const FVector ProjExtent(150.0f, 150.0f, 300.0f);
-			FNavLocation Loc;
-			if (NavSys->ProjectPointToNavigation(TargetPawn->GetActorLocation(), Loc, ProjExtent))
-			{
-				bPlayerOnNav = true;
-				PlayerProj = Loc.Location;
-			}
-			FNavLocation EnemyLoc;
-			bEnemyOnNav = NavSys->ProjectPointToNavigation(GetPawn()->GetActorLocation(), EnemyLoc, ProjExtent);
-		}
-
-		const int32 DiagKey = (int32)MoveResult * 10 + (bPlayerOnNav ? 2 : 0) + (bEnemyOnNav ? 1 : 0);
-		if (DiagKey != LastChaseDiagKey)
+		const EPathFollowingStatus::Type MoveStatus = GetMoveStatus();
+		const FVector EnemyLoc = GetPawn()->GetActorLocation();
+		const FVector EnemyVelocity = GetPawn()->GetVelocity();
+		const float EnemySpeed2D = EnemyVelocity.Size2D();
+		const float DistanceToPlayer = FVector::Dist(EnemyLoc, TargetPawn->GetActorLocation());
+		const int32 DiagKey = (int32)MoveResult * 100 + (int32)MoveStatus * 10 + (bPlayerOnNav ? 2 : 0) + (bEnemyOnNav ? 1 : 0);
+		const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+		const bool bIntervalElapsed = bLogChaseDiagnostics &&
+			(Now - LastChaseDiagLogTime >= FMath::Max(0.1f, ChaseDiagnosticsInterval));
+		if (bLogChaseDiagnostics && (DiagKey != LastChaseDiagKey || bIntervalElapsed || bStuck))
 		{
 			LastChaseDiagKey = DiagKey;
+			LastChaseDiagLogTime = Now;
 			UE_LOG(LogTemp, Warning,
-				TEXT("EnemyChase: MoveResult=%d playerOnNav=%d enemyOnNav=%d enemyLoc=%s playerLoc=%s playerProj=%s dist=%.0f"),
+				TEXT("EnemyChase: pawn=%s controller=%s MoveResult=%d MoveStatus=%d playerOnNav=%d enemyOnNav=%d stuck=%d stuckTime=%.2f moved2D=%.1f speed2D=%.1f enemyLoc=%s playerLoc=%s playerProj=%s dist=%.0f"),
+				*GetNameSafe(GetPawn()),
+				*GetNameSafe(this),
 				(int32)MoveResult,
+				(int32)MoveStatus,
 				bPlayerOnNav ? 1 : 0,
 				bEnemyOnNav ? 1 : 0,
-				*GetPawn()->GetActorLocation().ToCompactString(),
+				bStuck ? 1 : 0,
+				StuckAccumTime,
+				Moved2D,
+				EnemySpeed2D,
+				*EnemyLoc.ToCompactString(),
 				*TargetPawn->GetActorLocation().ToCompactString(),
 				bPlayerOnNav ? *PlayerProj.ToCompactString() : TEXT("(none)"),
-				FVector::Dist(GetPawn()->GetActorLocation(), TargetPawn->GetActorLocation()));
+				DistanceToPlayer);
 		}
 	}
 }

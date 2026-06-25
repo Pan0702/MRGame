@@ -500,17 +500,53 @@ bool UMRSpatialRecognitionSubsystem::GetFloorRect(FVector& OutCenter, FVector2D&
 		return false;
 	}
 
-	OutCenter = BestFloor->GetActorLocation();
+	const FVector AnchorLoc = BestFloor->GetActorLocation();
 
-	// 水平半サイズ。床面アンカーは PlaneBounds（面ローカル2D矩形）を持つのでそれを優先。
+	// PlaneBounds（面ローカルの2D矩形）の4隅を、アンカーのワールドTransformで変換し、
+	// その XY の min/max から「ワールド軸に揃った床矩形」を求める。
+	// これにより床アンカーの回転(Pitch=-90/Yaw)を一切考慮せず、4隅を全部カバーする無回転Boxになる
+	// → 生成床が傾く/ズレる問題が原理的に消える。
 	if (BestFloor->PlaneBounds.bIsValid)
 	{
-		OutHalfXY = BestFloor->PlaneBounds.GetExtent();
+		const FVector2D PMin = BestFloor->PlaneBounds.Min;
+		const FVector2D PMax = BestFloor->PlaneBounds.Max;
+		// 面ローカル2D(X,Y)。MRUK床アンカーは Pitch=-90 で寝ているので、面ローカルの (X,Y) は
+		// アクターTransform上は (X, Z) 平面に乗る。ローカル点は (X, Y, 0) として変換すれば、
+		// アクターの回転がそのまま適用されてワールドXYに落ちる。
+		const FVector LocalCorners[4] = {
+			FVector(PMin.X, PMin.Y, 0.0f),
+			FVector(PMax.X, PMin.Y, 0.0f),
+			FVector(PMax.X, PMax.Y, 0.0f),
+			FVector(PMin.X, PMax.Y, 0.0f)
+		};
+		const FTransform& Xform = BestFloor->GetActorTransform();
+		float MinX = TNumericLimits<float>::Max();
+		float MinY = TNumericLimits<float>::Max();
+		float MaxX = -TNumericLimits<float>::Max();
+		float MaxY = -TNumericLimits<float>::Max();
+		for (const FVector& LC : LocalCorners)
+		{
+			const FVector WC = Xform.TransformPosition(LC);
+			MinX = FMath::Min(MinX, WC.X);
+			MinY = FMath::Min(MinY, WC.Y);
+			MaxX = FMath::Max(MaxX, WC.X);
+			MaxY = FMath::Max(MaxY, WC.Y);
+		}
+		OutCenter = FVector((MinX + MaxX) * 0.5f, (MinY + MaxY) * 0.5f, AnchorLoc.Z);
+		OutHalfXY = FVector2D((MaxX - MinX) * 0.5f, (MaxY - MinY) * 0.5f);
+
+		UE_LOG(LogTemp, Warning,
+			TEXT("GetFloorRect: worldRect center=%s halfXY=(%.1f,%.1f) [from 4 corners, no rotation]"),
+			*OutCenter.ToCompactString(), OutHalfXY.X, OutHalfXY.Y);
+		return true;
 	}
-	else if (BestFloor->VolumeBounds.IsValid)
+
+	// PlaneBounds が無ければ VolumeBounds → それも無ければ広めフォールバック。
+	OutCenter = AnchorLoc;
+	if (BestFloor->VolumeBounds.IsValid)
 	{
 		const FVector Ext = BestFloor->VolumeBounds.GetExtent();
-		OutHalfXY = FVector2D(Ext.X, Ext.Y);
+		OutHalfXY = FVector2D(FMath::Abs(Ext.X), FMath::Abs(Ext.Y));
 	}
 	else
 	{

@@ -115,10 +115,11 @@ public:
 	bool MeasureFloorHeight(const FVector& FromLocation, float& OutFloorZ);
 
 	/**
-	 * 採用中の床アンカー（最も高い FLOOR）の中心ワールド座標と水平半サイズ(XY)を返す。
-	 * 自前の固定NavMesh土台（見えないコリジョン床）を床ぴったりに敷くのに使う。
-	 * @param OutCenter   床アンカーの中心ワールド座標（Zは床面高さ）
-	 * @param OutHalfXY   床の水平半サイズ(cm)。PlaneBounds優先、無ければVolumeBounds。
+	 * 採用中の床アンカー（最も高い FLOOR）の PlaneBounds 4隅をワールド変換し、
+	 * その XY の min/max から「ワールド軸に揃った（無回転の）床矩形」の中心と半サイズを返す。
+	 * アンカーの回転を考慮せず4隅を全部カバーするので、自前の固定NavMesh土台を傾きなしで床に敷ける。
+	 * @param OutCenter   床矩形の中心ワールド座標（Zは床面高さ）
+	 * @param OutHalfXY   床矩形の水平半サイズ(cm)。ワールド軸基準（無回転Box用）。
 	 * @return 床アンカーが取得できたら true
 	 */
 	UFUNCTION(BlueprintCallable, Category = "MR|Spatial|NoScan")
@@ -234,10 +235,11 @@ public:
 	 * false（GMが固定床 SpawnGroundCollision を使う場合）: MRUK床メッシュは Nav 非対象にする。
 	 *   MRUK床メッシュは World Lock で上下ドリフトするため、これを Nav 面にすると NavMesh も
 	 *   一緒に揺れる。代わりに GM 側の固定コリジョン床を Nav 土台にする（二重生成も防ぐ）。
-	 * true（単体利用時の従来挙動）: MRUK床メッシュを Nav 面にする。
+	 * true（単体利用時の従来挙動 / 2026-06-25 ロールバック後の既定）: MRUK床メッシュを Nav 面にする。
+	 *   ※GM の bSpawnGroundCollision=false に合わせて既定 true。HandleSceneReady でも !bSpawnGroundCollision で上書きされる。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Navigation")
-	bool bFloorMeshAffectsNavigation = false;
+	bool bFloorMeshAffectsNavigation = true;
 
 	/** 天井アンカーをオクルージョンに含めるか（見上げた時に敵を隠したくなければ false）。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Occlusion")

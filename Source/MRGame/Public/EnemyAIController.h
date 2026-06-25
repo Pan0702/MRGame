@@ -52,6 +52,12 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "AI|Steering")
 	float StuckNudgeRadius = 100.0f;
 
+	UPROPERTY(EditAnywhere, Category = "AI|Debug")
+	bool bLogChaseDiagnostics = true;
+
+	UPROPERTY(EditAnywhere, Category = "AI|Debug", meta = (ClampMin = "0.1"))
+	float ChaseDiagnosticsInterval = 1.0f;
+
 	UPROPERTY()
 	TObjectPtr<APawn> TargetPawn;
 
@@ -70,4 +76,5 @@ private:
 	// 0.3秒ごとのログ洪水を避けるため、状態が前回と変わった時だけログする。
 	// 値: -1=未ログ, それ以外は (MoveResult*10 + (playerOnNav?1:0)) のような複合キー。
 	int32 LastChaseDiagKey = -1;
+	float LastChaseDiagLogTime = -FLT_MAX;
 };

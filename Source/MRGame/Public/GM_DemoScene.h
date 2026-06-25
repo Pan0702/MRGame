@@ -45,6 +45,14 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Spawn|Debug")
 	void ToggleDebugDrawSpawners() { bDebugDrawSpawners = !bDebugDrawSpawners; }
 
+	// 固定コリジョン床の範囲可視化を ON/OFF する。
+	UFUNCTION(BlueprintCallable, Category = "Spawn|Debug")
+	void SetDebugDrawGround(bool bEnabled) { bDebugDrawGround = bEnabled; }
+
+	// 固定コリジョン床の範囲可視化をトグルする。
+	UFUNCTION(BlueprintCallable, Category = "Spawn|Debug")
+	void ToggleDebugDrawGround() { bDebugDrawGround = !bDebugDrawGround; }
+
 	// 部屋スキャン/ロード完了(OnSceneLoaded)で呼ばれる。壁を測ってループを開始する。
 	UFUNCTION()
 	void HandleSceneReady(bool bSuccess);
@@ -168,11 +176,19 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Debug")
 	bool bDebugDrawSpawners = false;
 
+	// デバッグ用: 生成した固定コリジョン床(GroundActor)の範囲をワイヤーフレームで描画する。
+	// 「地面外に敵が湧く」時に、床の大きさ・位置が意図通りか目視確認するため。本番では false に。
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Debug")
+	bool bDebugDrawGround = true;
+
 	// 接地用の見えないコリジョン床を生成するか。床アンカーの位置・サイズに合わせた固定平面を1枚敷き、
-	// それを敵の接地＋NavMesh土台にする。MRUK床メッシュ(World Lockで上下ドリフトする)に頼らないため
-	// 既定で ON。これと組で MRUK床メッシュ側は Nav 非対象にして二重生成を避ける（下の bFloorMeshAffectsNav）。
+	// それを敵の接地＋NavMesh土台にする。
+	// ※2026-06-25: 固定床方式は GetFloorRect の4隅min/max計算で床がX=30cm幅に潰れ、NavMesh verts=0で
+	//   敵が一切湧かない不具合があったためロールバック。MRUK床メッシュを Nav 土台に戻す（実績ある方式）。
+	//   false にすると HandleSceneReady で bFloorMeshAffectsNavigation=true に上書きされ、MRUK床がNav面になる。
+	//   床メッシュ自体は bSceneMeshVisualOcclusion=false により不可視のまま（World Lock上下りは見えない）。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
-	bool bSpawnGroundCollision = true;
+	bool bSpawnGroundCollision = false;
 
 	// 生成する見えない床の一辺の半分(cm)。プレイヤー中心にこの範囲を覆う。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
@@ -231,6 +247,9 @@ private:
 
 	// デバッグ用: 壁沿い Spawner の位置・向きを描画して、設置されているか目視確認する。
 	void DebugDrawSpawners() const;
+
+	// デバッグ用: 生成した固定コリジョン床(GroundActor)の範囲をワイヤーボックスで描画する。
+	void DebugDrawGround() const;
 
 	// 診断用: 現在の NavMesh の頂点数を返す。0=未生成/空、>0=生成済み、負値=NavSys/RecastNav取得失敗。
 	int32 GetNavMeshVertCount() const;

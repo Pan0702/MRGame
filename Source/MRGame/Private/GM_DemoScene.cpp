@@ -41,6 +41,11 @@ void AGM_DemoScene::Tick(float DeltaSeconds)
 	{
 		DebugDrawSpawners();
 	}
+
+	if (bDebugDrawGround)
+	{
+		DebugDrawGround();
+	}
 }
 
 void AGM_DemoScene::BeginPlay()
@@ -408,11 +413,10 @@ void AGM_DemoScene::NotifyEnemyKilled()
 	AliveCount = FMath::Max(0, AliveCount - 1);
 	++TotalKills;
 
-	// 1体死んだら1体だけ補充する（DesiredAliveCount を超えない範囲で）。
-	// MaintainDesiredAliveCount だと不足ぶんを一気に湧かせてしまうため、ここでは使わない。
+	// Spawn can fail transiently while NavMesh/spawner candidates settle, so use the same retry path as initial fill.
 	if (AliveCount < DesiredAliveCount)
 	{
-		CreateEnemies();
+		MaintainDesiredAliveCount();
 	}
 }
 
@@ -874,6 +878,43 @@ void AGM_DemoScene::DebugDrawSpawners() const
 	}
 }
 
+void AGM_DemoScene::DebugDrawGround() const
+{
+	const UWorld* World = GetWorld();
+	if (!World || !GroundActor)
+	{
+		return;
+	}
+
+	const UBoxComponent* Box = Cast<UBoxComponent>(GroundActor->GetRootComponent());
+	if (!Box)
+	{
+		return;
+	}
+
+	const FVector Center = Box->GetComponentLocation();
+	const FVector Extent = Box->GetScaledBoxExtent();
+
+	// 床コリジョンBox全体を水色のワイヤーで描く（厚みも見える）。
+	DrawDebugBox(World, Center, Extent, FQuat::Identity, FColor::Cyan, false, -1.0f, 0, 1.0f);
+
+	// 敵が立つ「床天面」を緑の矩形で強調する（中心Z + 厚み半分）。
+	const float TopZ = Center.Z + Extent.Z;
+	const FVector C0(Center.X - Extent.X, Center.Y - Extent.Y, TopZ);
+	const FVector C1(Center.X + Extent.X, Center.Y - Extent.Y, TopZ);
+	const FVector C2(Center.X + Extent.X, Center.Y + Extent.Y, TopZ);
+	const FVector C3(Center.X - Extent.X, Center.Y + Extent.Y, TopZ);
+	DrawDebugLine(World, C0, C1, FColor::Green, false, -1.0f, 0, 2.0f);
+	DrawDebugLine(World, C1, C2, FColor::Green, false, -1.0f, 0, 2.0f);
+	DrawDebugLine(World, C2, C3, FColor::Green, false, -1.0f, 0, 2.0f);
+	DrawDebugLine(World, C3, C0, FColor::Green, false, -1.0f, 0, 2.0f);
+
+	// サイズ・位置を文字で出す（HMDで読める高さに）。
+	const FString Msg = FString::Printf(TEXT("Ground top=%.0f size=%.0fx%.0fcm center=(%.0f,%.0f)"),
+		TopZ, Extent.X * 2.0f, Extent.Y * 2.0f, Center.X, Center.Y);
+	DrawDebugString(World, FVector(Center.X, Center.Y, TopZ + 20.0f), Msg, nullptr, FColor::Cyan, 0.0f, false);
+}
+
 bool AGM_DemoScene::CalibrateFrontWallFromPlayer()
 {
 	UWorld* World = GetWorld();
@@ -947,6 +988,7 @@ void AGM_DemoScene::SpawnGroundCollision()
 	// 床天面が FloorZ に来るよう、中心を厚みの半分だけ下げる。
 	const FVector GroundCenter(GroundCenterXY.X, GroundCenterXY.Y, FloorZ - GroundThickness);
 
+	// GetFloorRect が4隅のワールドXY min/max から無回転の矩形を返すので、Boxも無回転で置く。
 	FActorSpawnParameters Params;
 	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 	GroundActor = World->SpawnActor<AActor>(AActor::StaticClass(), GroundCenter, FRotator::ZeroRotator, Params);
@@ -957,13 +999,18 @@ void AGM_DemoScene::SpawnGroundCollision()
 	}
 
 	// 見えないコリジョンBoxを付ける（描画なし・コリジョンのみ）。サイズは床アンカー実寸に合わせる。
+	// ※ プロパティは RegisterComponent の「前」に設定する。RegisterComponent 時点で
+	//    NavMesh への登録(エクスポート)が行われるため、後から SetBoxExtent や
+	//    SetCanEverAffectNavigation を変えても NavMesh に反映されず、NavMesh が生成されない
+	//    （実機ログで verts=0 のままだった原因）。
 	UBoxComponent* Box = NewObject<UBoxComponent>(GroundActor);
 	if (!Box)
 	{
 		return;
 	}
 	GroundActor->SetRootComponent(Box);
-	Box->RegisterComponent();
+	// 静的配置（動かさない）として登録する。
+	Box->SetMobility(EComponentMobility::Static);
 	Box->SetBoxExtent(FVector(FMath::Max(10.0f, HalfXY.X), FMath::Max(10.0f, HalfXY.Y), GroundThickness));
 	Box->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
 	Box->SetCollisionObjectType(ECC_WorldStatic);
@@ -971,8 +1018,16 @@ void AGM_DemoScene::SpawnGroundCollision()
 	// この固定床を NavMesh の歩行可能面にする。MRUK 床メッシュ側は Nav 非対象にして二重を避ける。
 	Box->SetCanEverAffectNavigation(true);
 	Box->SetHiddenInGame(true); // 見せない（パススルーの現実床が見えている）。
+	// プロパティ設定後に登録 → この時点の正しい extent/nav設定で NavMesh にエクスポートされる。
+	Box->RegisterComponent();
 
-	UE_LOG(LogTemp, Log, TEXT("SpawnGroundCollision: fixed ground at center=%s halfXY=(%.1f,%.1f) Z=%.1f"),
+	// 明示的に NavMesh の再生成を促す（床Boxを歩行面として焼き直す）。
+	if (UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(World))
+	{
+		NavSys->UpdateComponentInNavOctree(*Box);
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("SpawnGroundCollision: fixed ground at center=%s halfXY=(%.1f,%.1f) Z=%.1f (no rotation)"),
 	       *GroundCenter.ToCompactString(), HalfXY.X, HalfXY.Y, FloorZ);
 }
 

@@ -252,6 +252,14 @@ AEnemy* AEnemySpawner::SpawnOne()
 		FinalLoc.Z = SpawnLoc.Z + Capsule->GetScaledCapsuleHalfHeight();
 	}
 	SpawnedEnemy->SetActorLocation(FinalLoc, false, nullptr, ETeleportType::TeleportPhysics);
+	UE_LOG(LogActor, Log,
+		TEXT("EnemySpawner: spawned enemy. Spawner=%s Enemy=%s Class=%s SpawnLoc=%s FinalLoc=%s SpawnHeightOffset=%.1f"),
+		*GetName(),
+		*GetNameSafe(SpawnedEnemy),
+		*GetNameSafe(PickedClass.Get()),
+		*SpawnLoc.ToCompactString(),
+		*FinalLoc.ToCompactString(),
+		SpawnHeightOffset);
 
 	return SpawnedEnemy;
 }

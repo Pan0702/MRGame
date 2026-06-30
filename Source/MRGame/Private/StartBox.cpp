@@ -128,6 +128,12 @@ void AStartBox::OnHitBoxBeginOverlap(UPrimitiveComponent* OverlappedComp, AActor
 	UE_LOG(LogTemp, Warning, TEXT("AStartBox: CUT! -> transition to next level in %.1fs"), TravelDelay);
 	bCut = true;
 
+	// 斬撃音（BP_StartBox の CutSound に割り当て）を切断位置で再生。
+	if (CutSound)
+	{
+		UGameplayStatics::PlaySoundAtLocation(this, CutSound, GetActorLocation());
+	}
+
 	const ECutType CutType = ResolveCutType(SwingVelocity);
 	PerformCut(CutType);
 

@@ -223,6 +223,13 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
 	float GroundRealignCheckInterval = 1.0f;
 
+	// 机などの家具をNavMeshの穴(歩行不可)にするか。InitializeOcclusion で Subsystem に流し込む。
+	// 机が多い部屋（テスト部屋=机23台のオフィス）では穴だらけでNavMeshが寸断され、
+	// 敵がプレイヤーに到達できなくなるため既定は false（接続性優先。敵は机をすり抜ける）。
+	// ※BP側でこのプロパティを上書きしている場合はBPの値が勝つ点に注意。
+	UPROPERTY(EditAnywhere, Category = "MR|Floor")
+	bool bFurnitureBlocksNavigation = false;
+
 	// NavMesh 生成用 Invoker の生成半径(cm)。プレイヤー足元中心に、この半径ぶんだけ
 	// MRUK 床メッシュ上に NavMesh タイルを張る。最遠壁まで届くよう十分に大きく取る。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")

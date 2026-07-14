@@ -258,9 +258,11 @@ public:
 	 * 床に立つ家具(机/椅子/収納/ベッド/画面/植物/照明)を NavMesh の障害物(穴)にするか。
 	 * true: 家具ごとに「足元の薄い矩形」を Null エリアにして、敵が机を回り込むようにする。
 	 * false: 家具を Nav 関与させない（床のみ歩行可能）。問題が出たら false で即無効化できる保険。
+	 * 机が多い部屋では穴でNavMeshが寸断され敵が到達不能になるため既定 false。
+	 * 実際の値は GM_DemoScene::InitializeOcclusion が GM側プロパティの値で毎回上書きする。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Navigation")
-	bool bFurnitureBlocksNavigation = true;
+	bool bFurnitureBlocksNavigation = false;
 
 	/**
 	 * 家具の NavMesh 障害物(Null板)の高さの半分(cm)。床面付近だけを薄く削るための値。

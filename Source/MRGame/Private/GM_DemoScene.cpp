@@ -552,6 +552,11 @@ void AGM_DemoScene::InitializeOcclusion()
 			// 固定床を使わない場合のみ MRUK床メッシュを Nav 面にする。
 			Spatial->bFloorMeshAffectsNavigation = !bSpawnGroundCollision;
 
+			// 家具をNavMeshの穴にするかをBP(GameMode)から制御できるようにSubsystemへ流し込む。
+			// 机だらけの部屋では穴でNavMeshが寸断され敵がプレイヤーへ到達できなくなるため、
+			// まずは無効化して接続性を確認できるようにする。
+			Spatial->bFurnitureBlocksNavigation = bFurnitureBlocksNavigation;
+
 			if (bScanRoomOnStart)
 			{
 				// 起動毎にアプリ内から部屋スキャン（スペース設定）を起動する。

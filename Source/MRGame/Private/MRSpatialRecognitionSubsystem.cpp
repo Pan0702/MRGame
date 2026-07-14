@@ -450,11 +450,29 @@ bool UMRSpatialRecognitionSubsystem::GetSpawnPointsAlongFarthestWall(int32 NumPo
 	// クランプ後の実効間隔（NumPoints==1 のときは 0）。
 	const float EffectiveSpacing = (NumPoints > 1) ? (HalfRange * 2.0f / (NumPoints - 1)) : 0.0f;
 
+	// 床矩形を取っておく（候補点を床の内側へクランプするため）。
+	// スキャンによっては壁アンカーが床アンカーの範囲より外側に来ることがあり
+	// （実測で壁中心が床端より80cm外）、壁前オフセットの点が床＝NavMesh床の外に落ちて
+	// 全候補が off-NavMesh で棄却される。床矩形内へ寄せれば「壁に最も近い床の上」に必ず乗る。
+	FVector FloorRectCenter = FVector::ZeroVector;
+	FVector2D FloorRectHalf = FVector2D::ZeroVector;
+	const bool bHasFloorRect = GetFloorRect(FloorRectCenter, FloorRectHalf);
+	const float ClampMargin = EnemyRadius + 5.0f;
+
 	OutPoints.Reserve(NumPoints);
 	for (int32 i = 0; i < NumPoints; ++i)
 	{
 		const float Side = -HalfRange + EffectiveSpacing * i;
 		FVector P = Base + RightDir * Side;
+		if (bHasFloorRect)
+		{
+			P.X = FMath::Clamp(P.X,
+				FloorRectCenter.X - FloorRectHalf.X + ClampMargin,
+				FloorRectCenter.X + FloorRectHalf.X - ClampMargin);
+			P.Y = FMath::Clamp(P.Y,
+				FloorRectCenter.Y - FloorRectHalf.Y + ClampMargin,
+				FloorRectCenter.Y + FloorRectHalf.Y - ClampMargin);
+		}
 		// 床高さに合わせる（取れなければ CachedWallPoint.Z のままにしておく）。
 		float FloorZ = 0.0f;
 		// 非const内部実装にアクセスするため、ここだけ const を外して呼ぶ。
@@ -480,15 +498,16 @@ float UMRSpatialRecognitionSubsystem::GetFloorSurfaceZ(const AMRUKAnchor* FloorA
 
 	// 床アンカーは Pitch=-90 で寝ているため、GetActorLocation().Z（原点）は実床面とズレる
 	// （実機で原点90 / 実床162）。PlaneBounds の4隅をワールド変換し、その Z 平均を実床面とする。
+	// ※MRUKの平面はローカルY-Z平面（ローカルX=法線）なので4隅は (0, X, Y) として変換する（GetFloorRect と同じ規約）。
 	if (bUsePlaneBoundsForFloorHeight && FloorAnchor->PlaneBounds.bIsValid)
 	{
 		const FVector2D PMin = FloorAnchor->PlaneBounds.Min;
 		const FVector2D PMax = FloorAnchor->PlaneBounds.Max;
 		const FVector LocalCorners[4] = {
-			FVector(PMin.X, PMin.Y, 0.0f),
-			FVector(PMax.X, PMin.Y, 0.0f),
-			FVector(PMax.X, PMax.Y, 0.0f),
-			FVector(PMin.X, PMax.Y, 0.0f)
+			FVector(0.0f, PMin.X, PMin.Y),
+			FVector(0.0f, PMax.X, PMin.Y),
+			FVector(0.0f, PMax.X, PMax.Y),
+			FVector(0.0f, PMin.X, PMax.Y)
 		};
 		const FTransform& Xform = FloorAnchor->GetActorTransform();
 		float SumZ = 0.0f;
@@ -562,14 +581,17 @@ bool UMRSpatialRecognitionSubsystem::GetFloorRect(FVector& OutCenter, FVector2D&
 	{
 		const FVector2D PMin = BestFloor->PlaneBounds.Min;
 		const FVector2D PMax = BestFloor->PlaneBounds.Max;
-		// 面ローカル2D(X,Y)。MRUK床アンカーは Pitch=-90 で寝ているので、面ローカルの (X,Y) は
-		// アクターTransform上は (X, Z) 平面に乗る。ローカル点は (X, Y, 0) として変換すれば、
-		// アクターの回転がそのまま適用されてワールドXYに落ちる。
+		// MRUK の平面はアンカーローカルの「Y-Z平面」に乗っており、ローカルXは法線（床なら真上）。
+		// 本家実装が PlaneBounds をローカル (Y,Z) と対応付けている:
+		//   MRUtilityKitAnchor.cpp GetClosestSurfacePosition → FVector2D(TestPositionLocal.Y, TestPositionLocal.Z)
+		//   MRUtilityKitRoom.cpp  壁エッジ計算 → FVector(0, PlaneBounds.Max.X, 0)
+		// よって4隅は (0, X, Y) として変換する。以前の (X, Y, 0) だと第1軸が法線＝ワールドZに化けて
+		// 水平成分が消え、床矩形が「対角線1本のAABB」（例: 8.6m×1.6mの細帯）に潰れていた。
 		const FVector LocalCorners[4] = {
-			FVector(PMin.X, PMin.Y, 0.0f),
-			FVector(PMax.X, PMin.Y, 0.0f),
-			FVector(PMax.X, PMax.Y, 0.0f),
-			FVector(PMin.X, PMax.Y, 0.0f)
+			FVector(0.0f, PMin.X, PMin.Y),
+			FVector(0.0f, PMax.X, PMin.Y),
+			FVector(0.0f, PMax.X, PMax.Y),
+			FVector(0.0f, PMin.X, PMax.Y)
 		};
 		const FTransform& Xform = BestFloor->GetActorTransform();
 		float MinX = TNumericLimits<float>::Max();
@@ -1047,11 +1069,37 @@ void UMRSpatialRecognitionSubsystem::SpawnFurnitureNavBlocker(AMRUKAnchor* Ancho
 		return;
 	}
 
+	// 机の足元矩形の「向き」をアンカーTransformから取る。
+	// UNavModifierComponent の FailsafeExtent はオーナーActorの回転(Quat)を反映した回転Boxとして
+	// 焼かれる（CalculateBounds の FRotatedBox(Bounds, GetActorQuat()) 参照）ため、
+	// ブロッカーActorに机のYawを与えれば穴が机の実際の向きに揃う。
+	// （以前は ZeroRotator 固定＝軸平行AABBで、回転した机とズレて通路まで塞いでいた。）
+	// アンカーは Pitch=-90 で寝ているので、面ローカルX/Y軸をワールドへ変換して水平に潰した方向が
+	// 矩形の辺方向。ローカルXが水平で長く出る方をActorのX軸に採用し、extentもそれに合わせる。
+	const FTransform& AnchorXform = Anchor->GetActorTransform();
+	FVector WorldU = AnchorXform.TransformVectorNoScale(FVector::XAxisVector);
+	FVector WorldV = AnchorXform.TransformVectorNoScale(FVector::YAxisVector);
+	WorldU.Z = 0.0f;
+	WorldV.Z = 0.0f;
+	float FootprintYaw = 0.0f;
+	FVector2D LocalHalf = HalfXY;
+	if (WorldU.SizeSquared() >= WorldV.SizeSquared() && !WorldU.IsNearlyZero())
+	{
+		FootprintYaw = WorldU.Rotation().Yaw;
+	}
+	else if (!WorldV.IsNearlyZero())
+	{
+		// ローカルXがほぼ垂直（面が立っている等）ならローカルYを基準にし、辺の長さを入れ替える。
+		FootprintYaw = WorldV.Rotation().Yaw;
+		LocalHalf = FVector2D(HalfXY.Y, HalfXY.X);
+	}
+	const FRotator BlockerRot(0.0f, FootprintYaw, 0.0f);
+
 	// 薄い板にする: XY は机サイズ、Z は床面付近だけ（FurnitureBlockerHalfHeight）。
 	// これにより NavMesh は机の足元だけ削れ、天板の高さや隣の机まで広がらない。
 	const FVector Failsafe(
-		FMath::Max(5.0f, HalfXY.X),
-		FMath::Max(5.0f, HalfXY.Y),
+		FMath::Max(5.0f, LocalHalf.X),
+		FMath::Max(5.0f, LocalHalf.Y),
 		FMath::Max(2.0f, FurnitureBlockerHalfHeight));
 
 	// 障害物アクターを机の位置(床高さ)に置く。アンカーの XY を使い、Z は床面に合わせる。
@@ -1074,7 +1122,7 @@ void UMRSpatialRecognitionSubsystem::SpawnFurnitureNavBlocker(AMRUKAnchor* Ancho
 	       *FString::Join(Anchor->SemanticClassifications, TEXT(",")),
 	       *AnchorLoc.ToString(),
 	       *Anchor->GetActorRotation().ToString(),
-	       *FRotator::ZeroRotator.ToString(),
+	       *BlockerRot.ToString(),
 	       Anchor->VolumeBounds.IsValid ? 1 : 0,
 	       *Anchor->VolumeBounds.Min.ToString(),
 	       *Anchor->VolumeBounds.Max.ToString(),
@@ -1093,7 +1141,7 @@ void UMRSpatialRecognitionSubsystem::SpawnFurnitureNavBlocker(AMRUKAnchor* Ancho
 
 	FActorSpawnParameters Params;
 	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-	AActor* Blocker = World->SpawnActor<AActor>(AActor::StaticClass(), BlockerLoc, FRotator::ZeroRotator, Params);
+	AActor* Blocker = World->SpawnActor<AActor>(AActor::StaticClass(), BlockerLoc, BlockerRot, Params);
 	if (!Blocker)
 	{
 		return;
@@ -1102,9 +1150,10 @@ void UMRSpatialRecognitionSubsystem::SpawnFurnitureNavBlocker(AMRUKAnchor* Ancho
 	// ルートを付けて NavModifier を載せる。NavModifier はコリジョンが無いので FailsafeExtent を使う。
 	USceneComponent* Root = NewObject<USceneComponent>(Blocker);
 	Blocker->SetRootComponent(Root);
-	// SpawnActor に渡した座標はルート無しの空アクターでは適用されないため、後付けルートを明示的に置く。
-	// （これを怠ると NavModifier の穴が家具の位置ではなくワールド原点に開く。）
+	// SpawnActor に渡した座標・回転はルート無しの空アクターでは適用されないため、後付けルートに明示的に設定する。
+	// （位置を怠ると穴がワールド原点に開き、回転を怠ると穴が軸平行AABBになり机の向きとズレる。）
 	Root->SetRelativeLocation(BlockerLoc);
+	Root->SetRelativeRotation(BlockerRot);
 	Root->RegisterComponent();
 
 	UNavModifierComponent* NavMod = NewObject<UNavModifierComponent>(Blocker);

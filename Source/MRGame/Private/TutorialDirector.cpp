@@ -26,16 +26,19 @@ void ATutorialDirector::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
-	// 振って倒すステップ中、練習敵が倒されたら次へ
-	if (Step == ETutorialStep::Swing && IsPracticeEnemyDefeated())
+	// 振って倒すステップ中、練習敵が倒されたら撃破処理へ
+	//（再スポーン待機中は PracticeEnemy が無効なので、二重カウントしないようフラグで抑止）
+	if (Step == ETutorialStep::Swing && !bRespawnPending && IsPracticeEnemyDefeated())
 	{
-		BeginTimeLimitStep();
+		HandlePracticeEnemyDefeated();
 	}
 }
 
 void ATutorialDirector::BeginSwingStep()
 {
 	Step = ETutorialStep::Swing;
+	PracticeKills = 0;
+	bRespawnPending = false;
 	ShowInstruction(SwingText);
 	SpawnPracticeEnemy();
 
@@ -97,6 +100,44 @@ void ATutorialDirector::SpawnPracticeEnemy()
 	}
 }
 
+void ATutorialDirector::HandlePracticeEnemyDefeated()
+{
+	++PracticeKills;
+	OnPracticeEnemyKilled(PracticeKills);
+
+	// 規定数に達したら次のステップへ。RequiredKills=0 は無限リスポーンモード。
+	if (RequiredKills > 0 && PracticeKills >= RequiredKills)
+	{
+		BeginTimeLimitStep();
+		return;
+	}
+
+	bRespawnPending = true;
+	GetWorldTimerManager().SetTimer(
+		RespawnTimerHandle, this, &ATutorialDirector::RespawnPracticeEnemy,
+		FMath::Max(0.1f, RespawnDelay), false);
+}
+
+void ATutorialDirector::RespawnPracticeEnemy()
+{
+	bRespawnPending = false;
+
+	if (Step != ETutorialStep::Swing)
+	{
+		return;
+	}
+
+	// その時点のプレイヤー位置・カメラ向き基準で改めて前方リーチ内に出す
+	SpawnPracticeEnemy();
+
+	// 出せなかった場合は止まらないよう次へ進める（初回スポーン失敗時と同じ扱い）
+	if (!PracticeEnemy)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("TutorialDirector: 練習敵を再スポーンできませんでした。次のステップへ進みます。"));
+		BeginTimeLimitStep();
+	}
+}
+
 bool ATutorialDirector::IsPracticeEnemyDefeated() const
 {
 	// 倒されると Destroy される → 無効、もしくは死亡フラグが立つ
@@ -128,12 +169,12 @@ void ATutorialDirector::FinishTutorial()
 	Step = ETutorialStep::Done;
 	HideInstruction();
 
-	if (!NextLevelName.IsNone())
+	if (!NextLevel.IsNull())
 	{
-		UGameplayStatics::OpenLevel(this, NextLevelName);
+		UGameplayStatics::OpenLevelBySoftObjectPtr(this, NextLevel);
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("TutorialDirector: NextLevelName 未設定。本編へ遷移しません。"));
+		UE_LOG(LogTemp, Warning, TEXT("TutorialDirector: NextLevel 未設定。本編へ遷移しません。"));
 	}
 }

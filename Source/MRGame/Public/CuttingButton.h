@@ -6,6 +6,8 @@
 #include "GameFramework/Actor.h"
 #include "CuttingButton.generated.h"
 
+class ASword;
+
 // 切られ方（切断線の向き）//
 UENUM(BlueprintType)
 enum class ECutDirection : uint8
@@ -66,6 +68,14 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Button|BackSlash")
 	TObjectPtr<UStaticMeshComponent> AfterBackSlashB;    // 半身B
 
+	// 切った後に遷移するレベル。インスタンスごとに詳細パネルで設定する
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Button|Level")
+	TSoftObjectPtr<UWorld> TargetLevel;
+
+	// TargetLevelのアセット名(例: "Play")。Widgetの表示テキストに使う
+	UFUNCTION(BlueprintPure, Category = "Button|Level")
+	FText GetTargetLevelDisplayName() const;
+
 	// 切れる最低スピード(cm/s)。これ未満の速度では切れない
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Button")
 	float CuttingSpeedThreshold = 200.0f;
@@ -78,7 +88,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Button")
 	float DisappearDelay = 3.0f;
 
+	// Debug用: 切断判定ボックスを常時描画する(緑=未切断、赤=切断済み)
+	UPROPERTY(EditAnywhere, Category = "Button|Debug")
+	bool bDebugDrawCutVolume = true;
+
 private:
+	// 振り判定ONの瞬間に既に剣が重なっているケースをTickで拾うための剣キャッシュ
+	TWeakObjectPtr<ASword> CachedSword;
+
 	bool bIsCut = false;
 	bool bFinished = false;   // 完了処理が走ったか（着地 or タイムアウトで1回だけ）
 	FTimerHandle DisappearTimerHandle;

@@ -126,6 +126,17 @@ public:
 	bool GetFloorRect(FVector& OutCenter, FVector2D& OutHalfXY) const;
 
 	/**
+	 * 点がプレイヤーのいる部屋（PrimaryRoom）の壁ポリゴンの内側にあるか。
+	 * GetFloorRect は部屋の「外接矩形」なので、部屋がワールド軸に対して回転している・
+	 * L字/くぼみがある場合は「矩形内だが壁の外」の領域が存在する。壁メッシュは NavMesh を
+	 * 寸断しない（Nav非対象）ため、そこはNavMesh上つながっており、敵が湧くと壁の裏で
+	 * 「経路は引けるのに物理的に壁で進めず、NavMesh端で足踏みして止まる」個体になる。
+	 * スポーン点の最終検証に使う。部屋が取れない場合は true（弾きすぎて湧き全滅を防ぐ）。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MR|Spatial|NoScan")
+	bool IsPointInsidePrimaryRoom(const FVector& Point) const;
+
+	/**
 	 * 床アンカーの「実際の床面の高さ(Z)」を返す。
 	 * 床アンカーは Pitch=-90 で寝ており、GetActorLocation().Z（アンカー原点）は
 	 * 実際にプレイヤー/敵が立つ床面より約70cm低いことがある（実機で原点90 / 実床162）。

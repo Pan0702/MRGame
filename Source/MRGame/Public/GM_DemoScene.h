@@ -153,6 +153,11 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
 	int32 WallSpawnerMaxInwardSearchSteps = 4;
 
+	// If the far-wall candidates are on a disconnected NavMesh island, sample the player's reachable
+	// NavMesh region and choose the safe point closest to the requested wall position.
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "1"))
+	int32 WallSpawnerReachableFallbackAttempts = 64;
+
 	// 壁沿いに配置する Spawner のクラス（未指定なら AEnemySpawner を使う）。
 	UPROPERTY(EditAnywhere, Category = "Spawn")
 	TSubclassOf<class AEnemySpawner> SpawnerClass;
@@ -190,7 +195,15 @@ protected:
 	// 壁/床にカプセルがわずかに触れただけで「埋まり」と誤判定して全 Spawner を弾くのを防ぐ。
 	// 大きくすると判定が甘く（埋まり気味でも置く）、小さくすると厳しく（クリアな点だけ置く）なる。
 	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
-	float SpawnFitClearance = 5.0f;
+	float SpawnFitClearance = 1.0f;
+
+	// Extra horizontal clearance used when choosing a wall spawner location.
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	float SpawnFitRadiusPadding = 10.0f;
+
+	// Additional inset from the scanned floor boundary when placing wall spawners.
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	float SpawnFloorEdgeMargin = 5.0f;
 
 	// デバッグ用: 敵が歩ける範囲（NavMesh）を毎フレーム描画して目視確認する。
 	// 実行中に BP から ON/OFF できる（SetDebugDrawNavMesh / 直接書き込み）。本番では false に。
@@ -254,7 +267,7 @@ protected:
 	// NavMesh 生成時のエージェント半径(cm)。敵カプセル(≈15cm)に合わせて細くすると、
 	// 細い隙間も歩行可能領域になり「通れそうな隙間を通らない」が解消する。既定35は太すぎる。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
-	float NavAgentRadius = 20.0f;
+	float NavAgentRadius = 7.5f;
 
 	// NavMesh 生成時の最大ステップ高さ(cm)。既定8だと急斜面でNavMeshに穴が空く警告が出るため少し上げる。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
@@ -262,6 +275,10 @@ protected:
 
 	int32 AliveCount = 0;
 	bool bLoopActive = false;
+	mutable bool bSpawnFloorBoundsCached = false;
+	mutable bool bHasSpawnFloorBounds = false;
+	mutable FVector CachedSpawnFloorCenter = FVector::ZeroVector;
+	mutable FVector2D CachedSpawnFloorHalfXY = FVector2D::ZeroVector;
 
 	// 部屋ロード時に生成した壁沿い Spawner たち。
 	UPROPERTY()

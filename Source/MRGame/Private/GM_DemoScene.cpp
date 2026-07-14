@@ -724,6 +724,32 @@ void AGM_DemoScene::SpawnWallSpawners()
 		return;
 	}
 
+	FNavLocation PlayerNavLoc;
+	const ANavigationData* PathNavData = nullptr;
+	if (NavSys)
+	{
+		const APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0);
+		PathNavData = NavSys->GetDefaultNavDataInstance();
+		if (!PlayerPawn || !PathNavData ||
+			!NavSys->ProjectPointToNavigation(PlayerPawn->GetActorLocation(), PlayerNavLoc, NavProjectExtent))
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("SpawnWallSpawners: player is not on NavMesh yet. Player=%s NavData=%s"),
+				*GetNameSafe(PlayerPawn), *GetNameSafe(PathNavData));
+			++WallSpawnerRetryCount;
+			if (WallSpawnerRetryCount <= MaxWallSpawnerRetries)
+			{
+				World->GetTimerManager().SetTimer(
+					WallSpawnerRetryTimerHandle,
+					this,
+					&AGM_DemoScene::SpawnWallSpawners,
+					SpawnRetryInterval,
+					false);
+			}
+			return;
+		}
+	}
+
 	// 検証に使う敵カプセル寸法を、実際に湧かす敵クラスの CDO から取る（BPごとに違うため）。
 	const float CapsuleRadius = GetEnemyCapsuleRadius();
 	const float CapsuleHalfHeight = GetEnemyCapsuleHalfHeight();
@@ -731,7 +757,9 @@ void AGM_DemoScene::SpawnWallSpawners()
 
 	int32 NumRejectedOffNav = 0;
 	int32 NumRejectedBlocked = 0;
+	int32 NumRejectedUnreachable = 0;
 	int32 NumRelocatedToClearSpace = 0;
+	int32 NumResolvedByReachableFallback = 0;
 	for (const FVector& P : Points)
 	{
 		FVector SpawnPoint = P + FVector(0.0f, 0.0f, SpawnHeightOffset);
@@ -742,6 +770,7 @@ void AGM_DemoScene::SpawnWallSpawners()
 			// 基準点を最優先に「壁沿いの左右 → 少し室内側」の順で空き地点を探す。
 			// 各候補は必ず NavMesh 投影と敵カプセルの空間チェックを通すため、床外や家具内には置かない。
 			bool bFoundClearPoint = false;
+			bool bUsedReachableFallback = false;
 			int32 ResolvedSideStep = 0;
 			int32 ResolvedInwardStep = 0;
 			FNavLocation ResolvedNavLoc;
@@ -758,10 +787,27 @@ void AGM_DemoScene::SpawnWallSpawners()
 					return false;
 				}
 
+				// 部屋ポリゴンの内側か。床矩形は部屋の外接矩形なので、部屋が回転している/くぼみがあると
+				// 「NavMesh上だが壁の外」の点が存在する。壁はNavMeshを寸断しないため経路チェック
+				// (TestPathSync)も壁を素通しで合格してしまい、壁の裏に湧いてNavMesh端で足踏みする。
+				if (!Spatial->IsPointInsidePrimaryRoom(ProjectedLoc.Location))
+				{
+					++NumRejectedOffNav;
+					return false;
+				}
+
 				const FVector CapsuleCenter = ProjectedLoc.Location + FVector(0.0f, 0.0f, CapsuleHalfHeight);
 				if (!CanEnemyFitAt(CapsuleCenter, CapsuleRadius, CapsuleHalfHeight))
 				{
 					++NumRejectedBlocked;
+					return false;
+				}
+
+				FPathFindingQuery PathQuery(this, *PathNavData, ProjectedLoc.Location, PlayerNavLoc.Location);
+				PathQuery.SetAllowPartialPaths(false);
+				if (!NavSys->TestPathSync(PathQuery, EPathFindingMode::Regular))
+				{
+					++NumRejectedUnreachable;
 					return false;
 				}
 
@@ -792,20 +838,77 @@ void AGM_DemoScene::SpawnWallSpawners()
 				}
 			}
 
+			// The far wall can be separated from the player by furniture-generated NavMesh holes. In that case,
+			// sample only the player's connected NavMesh region and keep the safe point closest to the wall target.
+			if (!bFoundClearPoint)
+			{
+				float BestScore = TNumericLimits<float>::Max();
+				FNavLocation BestReachableLoc;
+				const float ReachableRadius = FMath::Max(NavFallbackSearchRadius, NavInvokerGenerationRadius);
+				const int32 FallbackAttempts = FMath::Max(1, WallSpawnerReachableFallbackAttempts);
+				for (int32 Attempt = 0; Attempt < FallbackAttempts; ++Attempt)
+				{
+					FNavLocation ReachableLoc;
+					if (!NavSys->GetRandomReachablePointInRadius(PlayerNavLoc.Location, ReachableRadius, ReachableLoc))
+					{
+						continue;
+					}
+
+					// 到達可能サンプルも「壁の外のNavMesh」に落ちることがあるので部屋内に限定する。
+					if (!Spatial->IsPointInsidePrimaryRoom(ReachableLoc.Location))
+					{
+						continue;
+					}
+
+					const FVector CapsuleCenter = ReachableLoc.Location + FVector(0.0f, 0.0f, CapsuleHalfHeight);
+					if (!CanEnemyFitAt(CapsuleCenter, CapsuleRadius, CapsuleHalfHeight))
+					{
+						++NumRejectedBlocked;
+						continue;
+					}
+
+					FPathFindingQuery PathQuery(this, *PathNavData, ReachableLoc.Location, PlayerNavLoc.Location);
+					PathQuery.SetAllowPartialPaths(false);
+					if (!NavSys->TestPathSync(PathQuery, EPathFindingMode::Regular))
+					{
+						++NumRejectedUnreachable;
+						continue;
+					}
+
+					const float PlayerDistance = FVector::Dist2D(PlayerNavLoc.Location, ReachableLoc.Location);
+					const float TooClosePenalty = FMath::Max(0.0f, FallbackSpawnDistance - PlayerDistance) * 4.0f;
+					const float Score = FVector::Dist2D(P, ReachableLoc.Location) + TooClosePenalty;
+					if (Score < BestScore)
+					{
+						BestScore = Score;
+						BestReachableLoc = ReachableLoc;
+					}
+				}
+
+				if (BestScore < TNumericLimits<float>::Max())
+				{
+					ResolvedNavLoc = BestReachableLoc;
+					bFoundClearPoint = true;
+					bUsedReachableFallback = true;
+					++NumResolvedByReachableFallback;
+				}
+			}
+
 			if (!bFoundClearPoint)
 			{
 				continue;
 			}
 
-			if (ResolvedSideStep != 0 || ResolvedInwardStep != 0)
+			if (ResolvedSideStep != 0 || ResolvedInwardStep != 0 || bUsedReachableFallback)
 			{
 				++NumRelocatedToClearSpace;
 				UE_LOG(LogTemp, Log,
-					TEXT("SpawnWallSpawners: moved blocked base point to clear NavMesh point. Base=%s Resolved=%s SideStep=%d InwardStep=%d"),
+					TEXT("SpawnWallSpawners: moved blocked base point to clear NavMesh point. Base=%s Resolved=%s SideStep=%d InwardStep=%d ReachableFallback=%s"),
 					*P.ToCompactString(),
 					*ResolvedNavLoc.Location.ToCompactString(),
 					ResolvedSideStep,
-					ResolvedInwardStep);
+					ResolvedInwardStep,
+					bUsedReachableFallback ? TEXT("true") : TEXT("false"));
 			}
 
 			SpawnPoint = ResolvedNavLoc.Location + FVector(0.0f, 0.0f, SpawnHeightOffset);
@@ -820,8 +923,8 @@ void AGM_DemoScene::SpawnWallSpawners()
 		}
 	}
 	UE_LOG(LogTemp, Log,
-		TEXT("SpawnWallSpawners: placed %d/%d valid spawners along farthest wall (relocated-to-clear-space=%d, rejected candidates: off-NavMesh=%d, blocked/no-space=%d)"),
-		WallSpawners.Num(), Points.Num(), NumRelocatedToClearSpace, NumRejectedOffNav, NumRejectedBlocked);
+		TEXT("SpawnWallSpawners: placed %d/%d valid spawners along farthest wall (relocated-to-clear-space=%d, reachable-fallback=%d, rejected candidates: off-NavMesh=%d, blocked/no-space=%d, unreachable-to-player=%d)"),
+		WallSpawners.Num(), Points.Num(), NumRelocatedToClearSpace, NumResolvedByReachableFallback, NumRejectedOffNav, NumRejectedBlocked, NumRejectedUnreachable);
 
 	// 検証で全候補を弾いて 0 個になった場合 = この瞬間はまだ NavMesh タイルが生成されていない
 	// （Invoker 起動から生成まで数フレーム〜数百ms遅れる）か、壁前に空間が無い可能性が高い。
@@ -898,8 +1001,29 @@ bool AGM_DemoScene::CanEnemyFitAt(const FVector& CapsuleCenter, float Radius, fl
 	// 壁/床/家具のオクルージョンメッシュ（WorldStatic）に敵カプセルが重ならないか調べる。
 	// 重なる＝その点では敵がメッシュに埋まる → Spawner を置かない。
 	// 床自体(WorldStatic)に半径ぶん触れても埋まり扱いにならないよう、底面を少し上げて判定する。
+	// Reject the synthetic ground padding outside the measured room floor.
+	if (!bSpawnFloorBoundsCached)
+	{
+		bSpawnFloorBoundsCached = true;
+		if (const UMRSpatialRecognitionSubsystem* Spatial = World->GetSubsystem<UMRSpatialRecognitionSubsystem>())
+		{
+			bHasSpawnFloorBounds = Spatial->GetFloorRect(CachedSpawnFloorCenter, CachedSpawnFloorHalfXY);
+		}
+	}
+	if (bHasSpawnFloorBounds)
+	{
+		const float RequiredInset = Radius + SpawnFitRadiusPadding + SpawnFloorEdgeMargin;
+		const bool bInsideFloor =
+			FMath::Abs(CapsuleCenter.X - CachedSpawnFloorCenter.X) <= FMath::Max(0.0f, CachedSpawnFloorHalfXY.X - RequiredInset) &&
+			FMath::Abs(CapsuleCenter.Y - CachedSpawnFloorCenter.Y) <= FMath::Max(0.0f, CachedSpawnFloorHalfXY.Y - RequiredInset);
+		if (!bInsideFloor)
+		{
+			return false;
+		}
+	}
+
 	const FCollisionShape Capsule = FCollisionShape::MakeCapsule(
-		FMath::Max(1.0f, Radius - SpawnFitClearance),
+		FMath::Max(1.0f, Radius + SpawnFitRadiusPadding),
 		FMath::Max(1.0f, HalfHeight - SpawnFitClearance));
 
 	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(SpawnFitTest), /*bTraceComplex=*/false);
@@ -907,7 +1031,7 @@ bool AGM_DemoScene::CanEnemyFitAt(const FVector& CapsuleCenter, float Radius, fl
 	const bool bBlocked = World->OverlapBlockingTestByChannel(
 		CapsuleCenter,
 		FQuat::Identity,
-		ECC_WorldStatic,
+		ECC_Pawn,
 		Capsule,
 		QueryParams);
 

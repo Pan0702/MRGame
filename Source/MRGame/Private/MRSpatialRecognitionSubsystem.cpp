@@ -633,6 +633,20 @@ bool UMRSpatialRecognitionSubsystem::GetFloorRect(FVector& OutCenter, FVector2D&
 	return true;
 }
 
+bool UMRSpatialRecognitionSubsystem::IsPointInsidePrimaryRoom(const FVector& Point) const
+{
+	const AMRUKRoom* PrimaryRoom = GetPrimaryRoom();
+	if (!PrimaryRoom)
+	{
+		// 部屋が取れない段階では判定不能。弾きすぎて湧きが全滅しないよう「内側」とみなす。
+		return true;
+	}
+
+	// MRUK の壁ポリゴン内判定。IsPositionInRoom は非constのBlueprint関数だが内部状態は変えないため
+	// const を外して呼ぶ。垂直方向は World Lock ドリフトで床Zがズレることがあるので水平判定のみ使う。
+	return const_cast<AMRUKRoom*>(PrimaryRoom)->IsPositionInRoom(Point, /*TestVerticalBounds=*/false);
+}
+
 bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocation, float& OutFloorZ)
 {
 	const AMRUKRoom* PrimaryRoom = GetPrimaryRoom();

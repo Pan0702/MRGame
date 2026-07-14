@@ -8,6 +8,8 @@
 #include "GameFramework/Pawn.h"
 #include "Kismet/GameplayStatics.h"
 #include "Kismet/KismetMathLibrary.h"
+#include "MRSpatialRecognitionSubsystem.h"
+#include "NavigationData.h"
 #include "NavigationSystem.h"
 #include "EngineUtils.h"
 
@@ -42,9 +44,31 @@ bool AEnemySpawner::CanEnemyFitAt(const TSubclassOf<AEnemy>& EnemyType, const FV
 	}
 
 	// カプセル中心は床から HalfHeight 上。床にわずかに触れただけで弾かないよう SpawnFitClearance ぶん縮める。
+	// The synthetic ground extends beyond the scanned floor. Keep the complete spawn capsule
+	// inside the measured floor rectangle instead of accepting NavMesh on that outer padding.
+	if (!bSpawnFloorBoundsCached)
+	{
+		bSpawnFloorBoundsCached = true;
+		if (const UMRSpatialRecognitionSubsystem* Spatial = World->GetSubsystem<UMRSpatialRecognitionSubsystem>())
+		{
+			bHasSpawnFloorBounds = Spatial->GetFloorRect(CachedSpawnFloorCenter, CachedSpawnFloorHalfXY);
+		}
+	}
+	if (bHasSpawnFloorBounds)
+	{
+		const float RequiredInset = Radius + SpawnFitRadiusPadding + SpawnFloorEdgeMargin;
+		const bool bInsideFloor =
+			FMath::Abs(FloorLocation.X - CachedSpawnFloorCenter.X) <= FMath::Max(0.0f, CachedSpawnFloorHalfXY.X - RequiredInset) &&
+			FMath::Abs(FloorLocation.Y - CachedSpawnFloorCenter.Y) <= FMath::Max(0.0f, CachedSpawnFloorHalfXY.Y - RequiredInset);
+		if (!bInsideFloor)
+		{
+			return false;
+		}
+	}
+
 	const FVector CapsuleCenter = FloorLocation + FVector(0.0f, 0.0f, HalfHeight);
 	const FCollisionShape Capsule = FCollisionShape::MakeCapsule(
-		FMath::Max(1.0f, Radius - SpawnFitClearance),
+		FMath::Max(1.0f, Radius + SpawnFitRadiusPadding),
 		FMath::Max(1.0f, HalfHeight - SpawnFitClearance));
 
 	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(SpawnerFitTest), /*bTraceComplex=*/false);
@@ -53,7 +77,7 @@ bool AEnemySpawner::CanEnemyFitAt(const TSubclassOf<AEnemy>& EnemyType, const FV
 	const bool bBlocked = World->OverlapBlockingTestByChannel(
 		CapsuleCenter,
 		FQuat::Identity,
-		ECC_WorldStatic,
+		ECC_Pawn,
 		Capsule,
 		QueryParams);
 
@@ -122,9 +146,30 @@ AEnemy* AEnemySpawner::SpawnOne()
 		return nullptr;
 	}
 
+	const APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0);
+	FNavLocation PlayerNavLoc;
+	const ANavigationData* PathNavData = nullptr;
+	if (NavSys)
+	{
+		PathNavData = NavSys->GetDefaultNavDataInstance(FNavigationSystem::DontCreate);
+		if (!PlayerPawn || !PathNavData ||
+			!NavSys->ProjectPointToNavigation(PlayerPawn->GetActorLocation(), PlayerNavLoc, NavProjectExtent))
+		{
+			UE_LOG(LogActor, Verbose,
+				TEXT("EnemySpawner: waiting for a navigable player location. Spawner=%s Player=%s NavData=%s"),
+				*GetName(), *GetNameSafe(PlayerPawn), *GetNameSafe(PathNavData));
+			return nullptr;
+		}
+	}
+
+	// スポーン点が部屋（壁ポリゴン）の内側かを検証するためのSubsystem。取れなければ検証はスキップ。
+	const UMRSpatialRecognitionSubsystem* SpatialForRoomCheck = World->GetSubsystem<UMRSpatialRecognitionSubsystem>();
+
 	const int32 Attempts = FMath::Max(1, SpawnPointAttempts);
 	int32 NumProjectionFailed = 0;
 	int32 NumProjectedTooFar = 0;
+	int32 NumBlocked = 0;
+	int32 NumUnreachable = 0;
 	for (int32 Attempt = 0; Attempt < Attempts; ++Attempt)
 	{
 		// 常に Box 内ランダムにする。以前は Attempt==0 で VolumeCenter 固定だったため、
@@ -164,6 +209,15 @@ AEnemy* AEnemySpawner::SpawnOne()
 			}
 		}
 
+		// 部屋ポリゴンの内側か。床矩形は部屋の外接矩形なので、部屋が回転している/くぼみがあると
+		// 「NavMesh上だが壁の外」の点が存在する。壁はNavMeshを寸断しないため、経路チェックも
+		// 壁を素通しで合格してしまい、壁の裏に湧いた敵がNavMesh端で足踏みして止まる。
+		if (SpatialForRoomCheck && !SpatialForRoomCheck->IsPointInsidePrimaryRoom(ProjectedLoc.Location))
+		{
+			++NumProjectionFailed;
+			continue;
+		}
+
 		// 既に居る敵と近すぎる点は弾く（重なって貫通し、互いに押し合って動けなくなるのを防ぐ）。
 		// bStrictSeparation=true の場合は最後の試行でも妥協せず弾く（離れた点が無ければこの回は湧かさない）。
 		// false の場合のみ、従来どおり最後の試行で妥協して受け入れる。
@@ -175,8 +229,18 @@ AEnemy* AEnemySpawner::SpawnOne()
 
 		// 敵カプセルが壁/家具に埋まらず収まる点か確認する（空間不足でMeshに埋まる/動けないのを防ぐ）。
 		// こちらは最後の試行では妥協して受け入れる（どこにも収まらないなら巡回元のGMが別Spawnerを試す）。
-		if (!bLastAttempt && !CanEnemyFitAt(PickedClass, ProjectedLoc.Location))
+		if (!CanEnemyFitAt(PickedClass, ProjectedLoc.Location))
 		{
+			++NumBlocked;
+			continue;
+		}
+
+		// A projected point may be on a disconnected NavMesh island. Only accept a full path to the player.
+		FPathFindingQuery PathQuery(this, *PathNavData, ProjectedLoc.Location, PlayerNavLoc.Location);
+		PathQuery.SetAllowPartialPaths(false);
+		if (!NavSys->TestPathSync(PathQuery, EPathFindingMode::Regular))
+		{
+			++NumUnreachable;
 			continue;
 		}
 
@@ -195,13 +259,15 @@ AEnemy* AEnemySpawner::SpawnOne()
 		// （GM 側が次の Spawner を試す）。全滅したかは GM 側の Warning で分かるので、
 		// ここは調査時のみ見える Verbose に留めてログ連発を避ける。
 		UE_LOG(LogActor, Verbose,
-			TEXT("EnemySpawner: spawn failed; no valid NavMesh point. Spawner=%s Center=%s Extent=%s Attempts=%d ProjectionFailed=%d ProjectedTooFar=%d NavExtent=%s MaxNavProjectionDistance=%.1f NavFallbackSearchRadius=%.1f"),
+			TEXT("EnemySpawner: spawn failed; no valid NavMesh point. Spawner=%s Center=%s Extent=%s Attempts=%d ProjectionFailed=%d ProjectedTooFar=%d Blocked=%d UnreachableToPlayer=%d NavExtent=%s MaxNavProjectionDistance=%.1f NavFallbackSearchRadius=%.1f"),
 			*GetName(),
 			*VolumeCenter.ToCompactString(),
 			*VolumeExtent.ToCompactString(),
 			Attempts,
 			NumProjectionFailed,
 			NumProjectedTooFar,
+			NumBlocked,
+			NumUnreachable,
 			*NavProjectExtent.ToCompactString(),
 			MaxNavProjectionDistance,
 			NavFallbackSearchRadius);
@@ -209,7 +275,7 @@ AEnemy* AEnemySpawner::SpawnOne()
 	}
 
 	FRotator SpawnRot = GetActorRotation();
-	if (const APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0))
+	if (PlayerPawn)
 	{
 		const FVector ToPlayer = (PlayerPawn->GetActorLocation() - SpawnLoc).GetSafeNormal2D();
 		if (!ToPlayer.IsNearlyZero())

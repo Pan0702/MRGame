@@ -125,6 +125,15 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "MR|Spatial|NoScan")
 	bool GetFloorRect(FVector& OutCenter, FVector2D& OutHalfXY) const;
 
+	/**
+	 * 床アンカーの「実際の床面の高さ(Z)」を返す。
+	 * 床アンカーは Pitch=-90 で寝ており、GetActorLocation().Z（アンカー原点）は
+	 * 実際にプレイヤー/敵が立つ床面より約70cm低いことがある（実機で原点90 / 実床162）。
+	 * そこで PlaneBounds の4隅をアンカーTransformでワールド変換し、その Z 平均＝実床面とする。
+	 * PlaneBounds が無ければアンカー原点Zにフォールバックする。
+	 */
+	float GetFloorSurfaceZ(const AMRUKAnchor* FloorAnchor) const;
+
 	/** 床を測るレイの最大距離(cm)。起点から真下にこの距離まで探す。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|NoScan")
 	float FloorScanMaxDistance = 300.0f;
@@ -296,6 +305,7 @@ private:
 	void PollForRooms();
 
 	UMRUKSubsystem* GetMRUKSubsystem() const;
+	const AMRUKRoom* GetPrimaryRoom() const;
 
 	bool EnsureScenePermissionOrRequest();
 	void RetryLoadSceneFromDevice();

@@ -189,7 +189,7 @@ protected:
 	// デバッグ用: 生成した固定コリジョン床(GroundActor)の範囲をワイヤーフレームで描画する。
 	// 「地面外に敵が湧く」時に、床の大きさ・位置が意図通りか目視確認するため。本番では false に。
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Debug")
-	bool bDebugDrawGround = true;
+	bool bDebugDrawGround = false;
 
 	// 接地用の見えないコリジョン床を生成するか。床アンカーの位置・サイズに合わせた固定平面を1枚敷き、
 	// それを敵の接地＋NavMesh土台にする。
@@ -198,7 +198,7 @@ protected:
 	//   false にすると HandleSceneReady で bFloorMeshAffectsNavigation=true に上書きされ、MRUK床がNav面になる。
 	//   床メッシュ自体は bSceneMeshVisualOcclusion=false により不可視のまま（World Lock上下りは見えない）。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
-	bool bSpawnGroundCollision = false;
+	bool bSpawnGroundCollision = true;
 
 	// 生成する見えない床の一辺の半分(cm)。プレイヤー中心にこの範囲を覆う。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
@@ -207,6 +207,21 @@ protected:
 	// 生成する見えない床の厚みの半分(cm)。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
 	float GroundThickness = 10.0f;
+
+	// 生成後の固定床を床アンカーの高さに追従させるか。
+	// MRUKアンカーはWorld Lockの補正でロード後もジワジワ動くため、ロード直後に一度きりで
+	// 作った固定床が現実の床（＝アンカー追従の床メッシュ）より低く/高く取り残されることがある。
+	// true にすると床アンカーZと固定床天面Zを定期比較し、許容差を超えたら床を作り直す。
+	UPROPERTY(EditAnywhere, Category = "MR|Floor")
+	bool bRealignGroundOnDrift = true;
+
+	// 再整列を発動するZズレの許容差(cm)。これ以下のズレでは作り直さない（NavMesh再生成の抑制）。
+	UPROPERTY(EditAnywhere, Category = "MR|Floor")
+	float GroundRealignToleranceCm = 4.0f;
+
+	// 床アンカーとのズレを確認する間隔(秒)。
+	UPROPERTY(EditAnywhere, Category = "MR|Floor")
+	float GroundRealignCheckInterval = 1.0f;
 
 	// NavMesh 生成用 Invoker の生成半径(cm)。プレイヤー足元中心に、この半径ぶんだけ
 	// MRUK 床メッシュ上に NavMesh タイルを張る。最遠壁まで届くよう十分に大きく取る。
@@ -277,6 +292,13 @@ private:
 	// プレイヤー足元の床高さを測り、その高さに見えないコリジョン床を生成する。
 	// 敵(Character)が落下せず床を歩けるようにするため。
 	void SpawnGroundCollision();
+
+	// 床アンカーの現在高さと固定床天面のZを比較し、GroundRealignToleranceCm を超えて
+	// ズレていたら固定床を作り直す（World Lock補正でアンカーが動いた後の追従）。
+	void RealignGroundCollisionIfDrifted();
+
+	// 固定床の再整列チェック用の繰り返しタイマー。
+	FTimerHandle GroundRealignTimerHandle;
 
 	// プレイヤー足元に NavigationInvoker アクターを置き、MRUK 床メッシュ周囲に
 	// 実行時 NavMesh を生成させる。bProjectSpawnToNavMesh が true の時に使う。

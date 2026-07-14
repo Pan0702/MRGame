@@ -137,6 +137,22 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "1"))
 	float SpawnerSpacing = 120.0f;
 
+	// 壁前の基準点が家具で塞がれている時、壁に沿って左右へ空き地点を探す間隔(cm)。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "1"))
+	float WallSpawnerSideSearchStep = 60.0f;
+
+	// 壁前の基準点から左右それぞれ何段階まで空き地点を探すか。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	int32 WallSpawnerMaxSideSearchSteps = 6;
+
+	// 壁沿いが家具で埋まっている時、追加で部屋内側へ空き地点を探す間隔(cm)。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "1"))
+	float WallSpawnerInwardSearchStep = 60.0f;
+
+	// 壁前の基準点から部屋内側へ何段階まで空き地点を探すか。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	int32 WallSpawnerMaxInwardSearchSteps = 4;
+
 	// 壁沿いに配置する Spawner のクラス（未指定なら AEnemySpawner を使う）。
 	UPROPERTY(EditAnywhere, Category = "Spawn")
 	TSubclassOf<class AEnemySpawner> SpawnerClass;

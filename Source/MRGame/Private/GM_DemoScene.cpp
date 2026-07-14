@@ -727,39 +727,88 @@ void AGM_DemoScene::SpawnWallSpawners()
 	// 検証に使う敵カプセル寸法を、実際に湧かす敵クラスの CDO から取る（BPごとに違うため）。
 	const float CapsuleRadius = GetEnemyCapsuleRadius();
 	const float CapsuleHalfHeight = GetEnemyCapsuleHalfHeight();
+	const FVector WallRight = FVector::CrossProduct(FVector::UpVector, WallInward).GetSafeNormal2D();
 
 	int32 NumRejectedOffNav = 0;
 	int32 NumRejectedBlocked = 0;
-	int32 NumRecoveredToNav = 0;
+	int32 NumRelocatedToClearSpace = 0;
 	for (const FVector& P : Points)
 	{
 		FVector SpawnPoint = P + FVector(0.0f, 0.0f, SpawnHeightOffset);
 
 		if (NavSys)
 		{
-			// 1) NavMesh に乗るか。乗らない／遠すぎる点はその場に Spawner を置かない（捨てる）。
-			//    以前はここで捨てずに置いていたため、NavMesh 外の Spawner が「湧かせないだけの置物」
-			//    として残り、そこから出た敵が NavMesh 外で動けない/埋まる原因になっていた。
-			FNavLocation ProjectedLoc;
-			const bool bProjected = NavSys->ProjectPointToNavigation(P, ProjectedLoc, NavProjectExtent);
-			const bool bProjectedTooFar = bProjected &&
-				FVector::DistSquared2D(P, ProjectedLoc.Location) > FMath::Square(MaxNavProjectionDistance);
-			if (!bProjected || bProjectedTooFar)
+			// 最遠壁の正面が机などで塞がれていても SpawnerCount=1 で詰まらないように、
+			// 基準点を最優先に「壁沿いの左右 → 少し室内側」の順で空き地点を探す。
+			// 各候補は必ず NavMesh 投影と敵カプセルの空間チェックを通すため、床外や家具内には置かない。
+			bool bFoundClearPoint = false;
+			int32 ResolvedSideStep = 0;
+			int32 ResolvedInwardStep = 0;
+			FNavLocation ResolvedNavLoc;
+
+			auto TryCandidate = [&](const FVector& Candidate, int32 SideStep, int32 InwardStep) -> bool
 			{
-				++NumRejectedOffNav;
+				FNavLocation ProjectedLoc;
+				const bool bProjected = NavSys->ProjectPointToNavigation(Candidate, ProjectedLoc, NavProjectExtent);
+				const bool bProjectedTooFar = bProjected &&
+					FVector::DistSquared2D(Candidate, ProjectedLoc.Location) > FMath::Square(MaxNavProjectionDistance);
+				if (!bProjected || bProjectedTooFar)
+				{
+					++NumRejectedOffNav;
+					return false;
+				}
+
+				const FVector CapsuleCenter = ProjectedLoc.Location + FVector(0.0f, 0.0f, CapsuleHalfHeight);
+				if (!CanEnemyFitAt(CapsuleCenter, CapsuleRadius, CapsuleHalfHeight))
+				{
+					++NumRejectedBlocked;
+					return false;
+				}
+
+				ResolvedNavLoc = ProjectedLoc;
+				ResolvedSideStep = SideStep;
+				ResolvedInwardStep = InwardStep;
+				return true;
+			};
+
+			const int32 MaxInwardSteps = FMath::Max(0, WallSpawnerMaxInwardSearchSteps);
+			const int32 MaxSideSteps = WallRight.IsNearlyZero()
+				? 0
+				: FMath::Max(0, WallSpawnerMaxSideSearchSteps);
+			for (int32 InwardStep = 0; InwardStep <= MaxInwardSteps && !bFoundClearPoint; ++InwardStep)
+			{
+				const FVector InwardBase = P + WallInward * (WallSpawnerInwardSearchStep * InwardStep);
+
+				// まず壁前の中央を試し、その後 +右/-左を近い順に交互に試す。
+				bFoundClearPoint = TryCandidate(InwardBase, 0, InwardStep);
+				for (int32 SideStep = 1; SideStep <= MaxSideSteps && !bFoundClearPoint; ++SideStep)
+				{
+					const FVector SideOffset = WallRight * (WallSpawnerSideSearchStep * SideStep);
+					bFoundClearPoint = TryCandidate(InwardBase + SideOffset, SideStep, InwardStep);
+					if (!bFoundClearPoint)
+					{
+						bFoundClearPoint = TryCandidate(InwardBase - SideOffset, -SideStep, InwardStep);
+					}
+				}
+			}
+
+			if (!bFoundClearPoint)
+			{
 				continue;
 			}
 
-			// 2) その点に敵カプセルが「埋まらず立てる」空間があるか。
-			//    壁/家具のオクルージョンメッシュにカプセルが食い込む点は弾く（バグ: 空間不足でMeshに埋まる）。
-			const FVector CapsuleCenter = ProjectedLoc.Location + FVector(0.0f, 0.0f, CapsuleHalfHeight);
-			if (!CanEnemyFitAt(CapsuleCenter, CapsuleRadius, CapsuleHalfHeight))
+			if (ResolvedSideStep != 0 || ResolvedInwardStep != 0)
 			{
-				++NumRejectedBlocked;
-				continue;
+				++NumRelocatedToClearSpace;
+				UE_LOG(LogTemp, Log,
+					TEXT("SpawnWallSpawners: moved blocked base point to clear NavMesh point. Base=%s Resolved=%s SideStep=%d InwardStep=%d"),
+					*P.ToCompactString(),
+					*ResolvedNavLoc.Location.ToCompactString(),
+					ResolvedSideStep,
+					ResolvedInwardStep);
 			}
 
-			SpawnPoint = ProjectedLoc.Location + FVector(0.0f, 0.0f, SpawnHeightOffset);
+			SpawnPoint = ResolvedNavLoc.Location + FVector(0.0f, 0.0f, SpawnHeightOffset);
 		}
 
 		AEnemySpawner* S = World->SpawnActor<AEnemySpawner>(ClassToSpawn, SpawnPoint, Rot, Params);
@@ -771,8 +820,8 @@ void AGM_DemoScene::SpawnWallSpawners()
 		}
 	}
 	UE_LOG(LogTemp, Log,
-		TEXT("SpawnWallSpawners: placed %d/%d valid spawners along farthest wall (recovered-to-NavMesh=%d, rejected: off-NavMesh=%d, blocked/no-space=%d)"),
-		WallSpawners.Num(), Points.Num(), NumRecoveredToNav, NumRejectedOffNav, NumRejectedBlocked);
+		TEXT("SpawnWallSpawners: placed %d/%d valid spawners along farthest wall (relocated-to-clear-space=%d, rejected candidates: off-NavMesh=%d, blocked/no-space=%d)"),
+		WallSpawners.Num(), Points.Num(), NumRelocatedToClearSpace, NumRejectedOffNav, NumRejectedBlocked);
 
 	// 検証で全候補を弾いて 0 個になった場合 = この瞬間はまだ NavMesh タイルが生成されていない
 	// （Invoker 起動から生成まで数フレーム〜数百ms遅れる）か、壁前に空間が無い可能性が高い。
@@ -802,6 +851,7 @@ void AGM_DemoScene::SpawnWallSpawners()
 	}
 	else if (World)
 	{
+		WallSpawnerRetryCount = 0;
 		World->GetTimerManager().ClearTimer(WallSpawnerRetryTimerHandle);
 	}
 }

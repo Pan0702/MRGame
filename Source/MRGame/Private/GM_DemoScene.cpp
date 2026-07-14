@@ -556,6 +556,10 @@ void AGM_DemoScene::InitializeOcclusion()
 			// 机だらけの部屋では穴でNavMeshが寸断され敵がプレイヤーへ到達できなくなるため、
 			// まずは無効化して接続性を確認できるようにする。
 			Spatial->bFurnitureBlocksNavigation = bFurnitureBlocksNavigation;
+			// 実機で「BPのつもりの値」と「実際に載った値」の食い違いを切り分けるための証拠ログ。
+			// （BPの保存/コンパイル漏れや古いクックだと、ここが false のまま机の穴が開かない。）
+			UE_LOG(LogTemp, Warning, TEXT("Occlusion: bFurnitureBlocksNavigation=%s (GM -> Subsystem)"),
+			       bFurnitureBlocksNavigation ? TEXT("true") : TEXT("false"));
 
 			if (bScanRoomOnStart)
 			{

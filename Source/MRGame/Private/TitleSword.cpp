@@ -2,6 +2,7 @@
 
 
 #include "TitleSword.h"
+#include "GI_MR.h"
 #include "Components/SceneComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SphereComponent.h"
@@ -194,6 +195,16 @@ void ATitleSword::StartGrab(USceneComponent* Hand)
 
 	GrabbingHand = Hand;
 	bIsGrabbed = true;
+
+	// どちらの手で掴んだかをGIに保存する。Title以外のレベルでは
+	// AVRPawn::GetSwordAttachController がこれを読んで剣のバインド先を決める
+	if (UGI_MR* GI = Cast<UGI_MR>(GetGameInstance()))
+	{
+		if (UMotionControllerComponent* MC = Cast<UMotionControllerComponent>(Hand))
+		{
+			GI->SetHand(MC);
+		}
+	}
 
 	// 追従開始時の速度ノイズを避けるため位置を初期化
 	PrevLocation = GetActorLocation();

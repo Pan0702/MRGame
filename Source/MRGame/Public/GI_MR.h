@@ -6,6 +6,8 @@
 #include "Engine/GameInstance.h"
 #include "GI_MR.generated.h"
 
+class UMotionControllerComponent;
+
 /**
  * 
  */
@@ -15,7 +17,7 @@ class MRGAME_API UGI_MR : public UGameInstance
 	GENERATED_BODY()
 
 public:
-	//�|�����G�̐��̂��낢��//
+	//�|�����G�̐��̂��낢��//
 	UFUNCTION(BlueprintCallable, Category = "Game")
 	int32 GetScore() const;
 	UFUNCTION(BlueprintCallable, Category = "Game")
@@ -23,15 +25,19 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Game")
 	void AddScore(int32 NewAddScore);
 	
-	//�����Ă�r���낢��//
+	// 剣を持つ手。コンポーネントのポインタはレベル遷移でPawnごと破棄され無効になるため、
+	// MotionSourceから正規化した "Left"/"Right" のFNameだけを保持する
 	UFUNCTION(BlueprintCallable, Category = "Game")
 	void SetHand(UMotionControllerComponent* NewHand);
-	UFUNCTION(BlueprintCallable, Category = "Game")
-	UMotionControllerComponent* GetHand() const;
+
+	// 剣を持つ手("Left"/"Right")。未設定ならNAME_None
+	UFUNCTION(BlueprintPure, Category = "Game")
+	FName GetHandSource() const;
 private:
 	UPROPERTY(EditAnywhere, Category = "Game")
 	int32 Score;
-	
-	UPROPERTY(EditAnywhere, Category = "Game")
-	UMotionControllerComponent* Hand;
+
+	// "Left" / "Right" / NAME_None(未設定)
+	UPROPERTY(VisibleAnywhere, Category = "Game")
+	FName HandSource;
 };

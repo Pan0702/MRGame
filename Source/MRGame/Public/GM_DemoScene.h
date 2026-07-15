@@ -355,8 +355,34 @@ private:
 	// ロード完了待ちのフォールバックタイマー。
 	FTimerHandle SceneLoadFallbackTimerHandle;
 
-	// Depth API 起動は非同期なので、少し遅らせて状態をログに出す。
-	void LogDepthOcclusionStatus();
+	// Depth API の起動は非同期で、USE_SCENE 権限が未許可のままだったり、部屋スキャン画面で
+	// アプリがバックグラウンドになると失敗するが、失敗通知は来ない。
+	// このため開始状態を定期確認し、未開始なら再試行する。
+	void CheckDepthOcclusionStatus();
+
+	// StartEnvironmentDepth + SetXROcclusionsMode の実発行（初回とリトライで共用）。
+	void RequestEnvironmentDepthStart();
+
+	// Scene Captureのpause/resume完了後にEnvironment Depthの初回起動を予約する。
+	void ScheduleDepthOcclusionStart();
+	void StartDeferredDepthOcclusion();
+
+	// OnSceneLoaded直後はOVRPluginセッション再生成中の場合があるため、初回起動を少し遅らせる。
+	UPROPERTY(EditAnywhere, Category = "MR|Depth", meta = (ClampMin = "0.25"))
+	float DepthOcclusionStartDelay = 1.0f;
+
+	// Scene Ready後に開始できなかった場合のリトライ間隔(秒)と最大回数。
+	UPROPERTY(EditAnywhere, Category = "MR|Depth")
+	float DepthOcclusionRetryInterval = 1.0f;
+
+	UPROPERTY(EditAnywhere, Category = "MR|Depth")
+	int32 DepthOcclusionMaxRetries = 10;
+
+	int32 DepthOcclusionRetryCount = 0;
+
+	// 開始状態の監視・リトライ用の繰り返しタイマー。開始成功または上限到達で停止する。
+	FTimerHandle DepthOcclusionStartTimerHandle;
+	FTimerHandle DepthOcclusionRetryTimerHandle;
 
 	// MR空間の Runtime NavMesh は Invoker 起動から生成まで遅延するため、湧きが充足するまで
 	// この間隔(秒)で MaintainDesiredAliveCount を再試行する。NavMesh生成を待って敵を出す。

@@ -21,6 +21,7 @@
 #include "TimerManager.h"
 #include "OculusXRFunctionLibrary.h"
 #include "BlueprintStatsLibrary.h"
+#include "Misc/App.h"
 
 namespace
 {
@@ -61,7 +62,20 @@ void AGM_DemoScene::BeginPlay()
 	Super::BeginPlay();
 
 	InitializePassthrough();
-	InitializeDepthOcclusion();
+	if (!bEnableDepthOcclusion)
+	{
+		// A disabled GameMode must still stop depth left running by the previous level.
+		InitializeDepthOcclusion();
+	}
+	else if (!bEnableOcclusion)
+	{
+		// No Scene/MRUK flow means HandleSceneReady will not be called.
+		ScheduleDepthOcclusionStart();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: deferring start until scene capture/load completes"));
+	}
 
 	// Runtime NavMesh should be built from a stable synthetic floor aligned to the visible upper floor.
 	// Existing BP assets may still carry the old default false, so force this before MRUK mesh setup.
@@ -106,6 +120,13 @@ void AGM_DemoScene::BeginPlay()
 
 void AGM_DemoScene::HandleSceneReady(bool bSuccess)
 {
+	// Do not start Environment Depth before the room-scan activity returns. Starting it before
+	// the Android pause/resume cycle can leave Meta XR's depth provider tied to the old XR session.
+	if (bEnableDepthOcclusion && !UOculusXRFunctionLibrary::IsEnvironmentDepthStarted())
+	{
+		ScheduleDepthOcclusionStart();
+	}
+
 	// 既にループ開始済み（フォールバックタイマー等で）なら二重に始めない。
 	if (bLoopActive)
 	{
@@ -177,6 +198,7 @@ void AGM_DemoScene::StartLoopFallbackIfNeeded()
 	UE_LOG(LogTemp, Warning,
 	       TEXT("StartLoopFallbackIfNeeded: scene load did not complete within %.1fs; starting fallback loop"),
 	       SceneLoadTimeout);
+	ScheduleDepthOcclusionStart();
 	StartLoop();
 }
 
@@ -495,12 +517,74 @@ void AGM_DemoScene::InitializeDepthOcclusion()
 {
 	if (!bEnableDepthOcclusion)
 	{
+		GetWorldTimerManager().ClearTimer(DepthOcclusionStartTimerHandle);
+		GetWorldTimerManager().ClearTimer(DepthOcclusionRetryTimerHandle);
 		UOculusXRFunctionLibrary::SetXROcclusionsMode(this, EOculusXROcclusionsMode::Disabled);
 		UOculusXRFunctionLibrary::StopEnvironmentDepth();
 		UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: disabled"));
 		return;
 	}
 
+	RequestEnvironmentDepthStart();
+
+	// 起動は非同期なので、安定したXRセッション上でも一時的に開始できない場合に備えて
+	// 開始状態を定期確認し、未開始なら再試行する。
+	DepthOcclusionRetryCount = 0;
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().SetTimer(
+			DepthOcclusionRetryTimerHandle,
+			this,
+			&AGM_DemoScene::CheckDepthOcclusionStatus,
+			FMath::Max(0.25f, DepthOcclusionRetryInterval),
+			true);
+	}
+}
+
+void AGM_DemoScene::ScheduleDepthOcclusionStart()
+{
+	if (!bEnableDepthOcclusion || UOculusXRFunctionLibrary::IsEnvironmentDepthStarted())
+	{
+		return;
+	}
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(DepthOcclusionStartTimerHandle);
+		World->GetTimerManager().SetTimer(
+			DepthOcclusionStartTimerHandle,
+			this,
+			&AGM_DemoScene::StartDeferredDepthOcclusion,
+			FMath::Max(0.25f, DepthOcclusionStartDelay),
+			false);
+
+		UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: scheduled after scene ready (Delay=%.2fs)"),
+		       FMath::Max(0.25f, DepthOcclusionStartDelay));
+	}
+}
+
+void AGM_DemoScene::StartDeferredDepthOcclusion()
+{
+	if (!bEnableDepthOcclusion || UOculusXRFunctionLibrary::IsEnvironmentDepthStarted())
+	{
+		return;
+	}
+
+#if PLATFORM_ANDROID
+	if (!FApp::HasVRFocus())
+	{
+		UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: waiting for VR focus before starting"));
+		ScheduleDepthOcclusionStart();
+		return;
+	}
+#endif
+
+	UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: scene ready and VR focus restored; starting"));
+	InitializeDepthOcclusion();
+}
+
+void AGM_DemoScene::RequestEnvironmentDepthStart()
+{
 	UOculusXRFunctionLibrary::StartEnvironmentDepth();
 
 	const EOculusXROcclusionsMode Mode = bUseSoftDepthOcclusion
@@ -510,24 +594,33 @@ void AGM_DemoScene::InitializeDepthOcclusion()
 
 	UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: StartEnvironmentDepth requested. Mode=%s"),
 	       GetDepthOcclusionModeName(bUseSoftDepthOcclusion));
-
-	if (UWorld* World = GetWorld())
-	{
-		FTimerHandle DepthStatusTimerHandle;
-		World->GetTimerManager().SetTimer(
-			DepthStatusTimerHandle,
-			this,
-			&AGM_DemoScene::LogDepthOcclusionStatus,
-			1.0f,
-			false);
-	}
 }
 
-void AGM_DemoScene::LogDepthOcclusionStatus()
+void AGM_DemoScene::CheckDepthOcclusionStatus()
 {
-	UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: IsEnvironmentDepthStarted=%s Mode=%s"),
-	       UOculusXRFunctionLibrary::IsEnvironmentDepthStarted() ? TEXT("true") : TEXT("false"),
-	       bEnableDepthOcclusion ? GetDepthOcclusionModeName(bUseSoftDepthOcclusion) : TEXT("Disabled"));
+	const bool bStarted = UOculusXRFunctionLibrary::IsEnvironmentDepthStarted();
+	UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: IsEnvironmentDepthStarted=%s Mode=%s Retry=%d/%d"),
+	       bStarted ? TEXT("true") : TEXT("false"),
+	       GetDepthOcclusionModeName(bUseSoftDepthOcclusion),
+	       DepthOcclusionRetryCount, DepthOcclusionMaxRetries);
+
+	if (bStarted)
+	{
+		GetWorldTimerManager().ClearTimer(DepthOcclusionRetryTimerHandle);
+		return;
+	}
+
+	if (DepthOcclusionRetryCount >= DepthOcclusionMaxRetries)
+	{
+		UE_LOG(LogTemp, Warning,
+		       TEXT("DepthOcclusion: still not started after %d retries; giving up"),
+		       DepthOcclusionMaxRetries);
+		GetWorldTimerManager().ClearTimer(DepthOcclusionRetryTimerHandle);
+		return;
+	}
+
+	++DepthOcclusionRetryCount;
+	RequestEnvironmentDepthStart();
 }
 
 void AGM_DemoScene::InitializeOcclusion()

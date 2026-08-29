@@ -125,6 +125,26 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "MR|Spatial|NoScan")
 	bool GetFloorRect(FVector& OutCenter, FVector2D& OutHalfXY) const;
 
+	/**
+	 * 点がプレイヤーのいる部屋（PrimaryRoom）の壁ポリゴンの内側にあるか。
+	 * GetFloorRect は部屋の「外接矩形」なので、部屋がワールド軸に対して回転している・
+	 * L字/くぼみがある場合は「矩形内だが壁の外」の領域が存在する。壁メッシュは NavMesh を
+	 * 寸断しない（Nav非対象）ため、そこはNavMesh上つながっており、敵が湧くと壁の裏で
+	 * 「経路は引けるのに物理的に壁で進めず、NavMesh端で足踏みして止まる」個体になる。
+	 * スポーン点の最終検証に使う。部屋が取れない場合は true（弾きすぎて湧き全滅を防ぐ）。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MR|Spatial|NoScan")
+	bool IsPointInsidePrimaryRoom(const FVector& Point) const;
+
+	/**
+	 * 床アンカーの「実際の床面の高さ(Z)」を返す。
+	 * 床アンカーは Pitch=-90 で寝ており、GetActorLocation().Z（アンカー原点）は
+	 * 実際にプレイヤー/敵が立つ床面より約70cm低いことがある（実機で原点90 / 実床162）。
+	 * そこで PlaneBounds の4隅をアンカーTransformでワールド変換し、その Z 平均＝実床面とする。
+	 * PlaneBounds が無ければアンカー原点Zにフォールバックする。
+	 */
+	float GetFloorSurfaceZ(const AMRUKAnchor* FloorAnchor) const;
+
 	/** 床を測るレイの最大距離(cm)。起点から真下にこの距離まで探す。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|NoScan")
 	float FloorScanMaxDistance = 300.0f;
@@ -249,9 +269,11 @@ public:
 	 * 床に立つ家具(机/椅子/収納/ベッド/画面/植物/照明)を NavMesh の障害物(穴)にするか。
 	 * true: 家具ごとに「足元の薄い矩形」を Null エリアにして、敵が机を回り込むようにする。
 	 * false: 家具を Nav 関与させない（床のみ歩行可能）。問題が出たら false で即無効化できる保険。
+	 * 机が多い部屋では穴でNavMeshが寸断され敵が到達不能になるため既定 false。
+	 * 実際の値は GM_DemoScene::InitializeOcclusion が GM側プロパティの値で毎回上書きする。
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "MR|Spatial|Navigation")
-	bool bFurnitureBlocksNavigation = true;
+	bool bFurnitureBlocksNavigation = false;
 
 	/**
 	 * 家具の NavMesh 障害物(Null板)の高さの半分(cm)。床面付近だけを薄く削るための値。
@@ -296,6 +318,7 @@ private:
 	void PollForRooms();
 
 	UMRUKSubsystem* GetMRUKSubsystem() const;
+	const AMRUKRoom* GetPrimaryRoom() const;
 
 	bool EnsureScenePermissionOrRequest();
 	void RetryLoadSceneFromDevice();

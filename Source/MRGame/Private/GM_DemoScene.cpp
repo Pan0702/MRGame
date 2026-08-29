@@ -21,6 +21,7 @@
 #include "TimerManager.h"
 #include "OculusXRFunctionLibrary.h"
 #include "BlueprintStatsLibrary.h"
+#include "Misc/App.h"
 
 namespace
 {
@@ -61,7 +62,28 @@ void AGM_DemoScene::BeginPlay()
 	Super::BeginPlay();
 
 	InitializePassthrough();
-	InitializeDepthOcclusion();
+	if (!bEnableDepthOcclusion)
+	{
+		// A disabled GameMode must still stop depth left running by the previous level.
+		InitializeDepthOcclusion();
+	}
+	else if (!bEnableOcclusion)
+	{
+		// No Scene/MRUK flow means HandleSceneReady will not be called.
+		ScheduleDepthOcclusionStart();
+	}
+	else
+	{
+		UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: deferring start until scene capture/load completes"));
+	}
+
+	// Runtime NavMesh should be built from a stable synthetic floor aligned to the visible upper floor.
+	// Existing BP assets may still carry the old default false, so force this before MRUK mesh setup.
+	if (bProjectSpawnToNavMesh && !bSpawnGroundCollision)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("BeginPlay: forcing bSpawnGroundCollision=true so NavMesh uses the visible upper floor height"));
+		bSpawnGroundCollision = true;
+	}
 
 	// 敵BPクラスが1つも設定されていなければ湧かせない。BP_GM_Main の EnemyClasses に BP_Enemy を設定すること。
 	if (EnemyClasses.Num() == 0)
@@ -98,6 +120,13 @@ void AGM_DemoScene::BeginPlay()
 
 void AGM_DemoScene::HandleSceneReady(bool bSuccess)
 {
+	// Do not start Environment Depth before the room-scan activity returns. Starting it before
+	// the Android pause/resume cycle can leave Meta XR's depth provider tied to the old XR session.
+	if (bEnableDepthOcclusion && !UOculusXRFunctionLibrary::IsEnvironmentDepthStarted())
+	{
+		ScheduleDepthOcclusionStart();
+	}
+
 	// 既にループ開始済み（フォールバックタイマー等で）なら二重に始めない。
 	if (bLoopActive)
 	{
@@ -125,6 +154,21 @@ void AGM_DemoScene::HandleSceneReady(bool bSuccess)
 	if (bSpawnGroundCollision)
 	{
 		SpawnGroundCollision();
+
+		// MRUKアンカーはWorld Lock補正でロード後も動くため、固定床が床メッシュ（アンカー追従）から
+		// 上下にズレて取り残されることがある。定期的にズレを確認し、超えたら作り直して追従させる。
+		if (bRealignGroundOnDrift)
+		{
+			if (UWorld* World = GetWorld())
+			{
+				World->GetTimerManager().SetTimer(
+					GroundRealignTimerHandle,
+					this,
+					&AGM_DemoScene::RealignGroundCollisionIfDrifted,
+					FMath::Max(0.25f, GroundRealignCheckInterval),
+					true);
+			}
+		}
 	}
 
 	// NavMesh 投影を使うなら、MRUK 床メッシュ周囲に NavMesh を生成させる Invoker を先に置く。
@@ -154,6 +198,7 @@ void AGM_DemoScene::StartLoopFallbackIfNeeded()
 	UE_LOG(LogTemp, Warning,
 	       TEXT("StartLoopFallbackIfNeeded: scene load did not complete within %.1fs; starting fallback loop"),
 	       SceneLoadTimeout);
+	ScheduleDepthOcclusionStart();
 	StartLoop();
 }
 
@@ -223,6 +268,14 @@ bool AGM_DemoScene::CreateEnemies()
 	}
 
 	// 従来方式: Depth/フォールバックで湧き位置を決め、GM が直接生成する。
+	if (bUseWallSpawners)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("CreateEnemies: waiting for wall spawners; direct fallback spawn is disabled while bUseWallSpawners=true. NavMeshVerts=%d"),
+			GetNavMeshVertCount());
+		return false;
+	}
+
 	FVector SpawnLocation = FVector::ZeroVector;
 	FRotator SpawnRotation = FRotator::ZeroRotator;
 	if (!ResolveSpawnTransform(SpawnLocation, SpawnRotation))
@@ -464,12 +517,74 @@ void AGM_DemoScene::InitializeDepthOcclusion()
 {
 	if (!bEnableDepthOcclusion)
 	{
+		GetWorldTimerManager().ClearTimer(DepthOcclusionStartTimerHandle);
+		GetWorldTimerManager().ClearTimer(DepthOcclusionRetryTimerHandle);
 		UOculusXRFunctionLibrary::SetXROcclusionsMode(this, EOculusXROcclusionsMode::Disabled);
 		UOculusXRFunctionLibrary::StopEnvironmentDepth();
 		UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: disabled"));
 		return;
 	}
 
+	RequestEnvironmentDepthStart();
+
+	// 起動は非同期なので、安定したXRセッション上でも一時的に開始できない場合に備えて
+	// 開始状態を定期確認し、未開始なら再試行する。
+	DepthOcclusionRetryCount = 0;
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().SetTimer(
+			DepthOcclusionRetryTimerHandle,
+			this,
+			&AGM_DemoScene::CheckDepthOcclusionStatus,
+			FMath::Max(0.25f, DepthOcclusionRetryInterval),
+			true);
+	}
+}
+
+void AGM_DemoScene::ScheduleDepthOcclusionStart()
+{
+	if (!bEnableDepthOcclusion || UOculusXRFunctionLibrary::IsEnvironmentDepthStarted())
+	{
+		return;
+	}
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(DepthOcclusionStartTimerHandle);
+		World->GetTimerManager().SetTimer(
+			DepthOcclusionStartTimerHandle,
+			this,
+			&AGM_DemoScene::StartDeferredDepthOcclusion,
+			FMath::Max(0.25f, DepthOcclusionStartDelay),
+			false);
+
+		UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: scheduled after scene ready (Delay=%.2fs)"),
+		       FMath::Max(0.25f, DepthOcclusionStartDelay));
+	}
+}
+
+void AGM_DemoScene::StartDeferredDepthOcclusion()
+{
+	if (!bEnableDepthOcclusion || UOculusXRFunctionLibrary::IsEnvironmentDepthStarted())
+	{
+		return;
+	}
+
+#if PLATFORM_ANDROID
+	if (!FApp::HasVRFocus())
+	{
+		UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: waiting for VR focus before starting"));
+		ScheduleDepthOcclusionStart();
+		return;
+	}
+#endif
+
+	UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: scene ready and VR focus restored; starting"));
+	InitializeDepthOcclusion();
+}
+
+void AGM_DemoScene::RequestEnvironmentDepthStart()
+{
 	UOculusXRFunctionLibrary::StartEnvironmentDepth();
 
 	const EOculusXROcclusionsMode Mode = bUseSoftDepthOcclusion
@@ -479,24 +594,33 @@ void AGM_DemoScene::InitializeDepthOcclusion()
 
 	UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: StartEnvironmentDepth requested. Mode=%s"),
 	       GetDepthOcclusionModeName(bUseSoftDepthOcclusion));
-
-	if (UWorld* World = GetWorld())
-	{
-		FTimerHandle DepthStatusTimerHandle;
-		World->GetTimerManager().SetTimer(
-			DepthStatusTimerHandle,
-			this,
-			&AGM_DemoScene::LogDepthOcclusionStatus,
-			1.0f,
-			false);
-	}
 }
 
-void AGM_DemoScene::LogDepthOcclusionStatus()
+void AGM_DemoScene::CheckDepthOcclusionStatus()
 {
-	UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: IsEnvironmentDepthStarted=%s Mode=%s"),
-	       UOculusXRFunctionLibrary::IsEnvironmentDepthStarted() ? TEXT("true") : TEXT("false"),
-	       bEnableDepthOcclusion ? GetDepthOcclusionModeName(bUseSoftDepthOcclusion) : TEXT("Disabled"));
+	const bool bStarted = UOculusXRFunctionLibrary::IsEnvironmentDepthStarted();
+	UE_LOG(LogTemp, Log, TEXT("DepthOcclusion: IsEnvironmentDepthStarted=%s Mode=%s Retry=%d/%d"),
+	       bStarted ? TEXT("true") : TEXT("false"),
+	       GetDepthOcclusionModeName(bUseSoftDepthOcclusion),
+	       DepthOcclusionRetryCount, DepthOcclusionMaxRetries);
+
+	if (bStarted)
+	{
+		GetWorldTimerManager().ClearTimer(DepthOcclusionRetryTimerHandle);
+		return;
+	}
+
+	if (DepthOcclusionRetryCount >= DepthOcclusionMaxRetries)
+	{
+		UE_LOG(LogTemp, Warning,
+		       TEXT("DepthOcclusion: still not started after %d retries; giving up"),
+		       DepthOcclusionMaxRetries);
+		GetWorldTimerManager().ClearTimer(DepthOcclusionRetryTimerHandle);
+		return;
+	}
+
+	++DepthOcclusionRetryCount;
+	RequestEnvironmentDepthStart();
 }
 
 void AGM_DemoScene::InitializeOcclusion()
@@ -520,6 +644,15 @@ void AGM_DemoScene::InitializeOcclusion()
 			// NavMesh の二重生成と World Lock ドリフトによる NavMesh の揺れを防ぐ。
 			// 固定床を使わない場合のみ MRUK床メッシュを Nav 面にする。
 			Spatial->bFloorMeshAffectsNavigation = !bSpawnGroundCollision;
+
+			// 家具をNavMeshの穴にするかをBP(GameMode)から制御できるようにSubsystemへ流し込む。
+			// 机だらけの部屋では穴でNavMeshが寸断され敵がプレイヤーへ到達できなくなるため、
+			// まずは無効化して接続性を確認できるようにする。
+			Spatial->bFurnitureBlocksNavigation = bFurnitureBlocksNavigation;
+			// 実機で「BPのつもりの値」と「実際に載った値」の食い違いを切り分けるための証拠ログ。
+			// （BPの保存/コンパイル漏れや古いクックだと、ここが false のまま机の穴が開かない。）
+			UE_LOG(LogTemp, Warning, TEXT("Occlusion: bFurnitureBlocksNavigation=%s (GM -> Subsystem)"),
+			       bFurnitureBlocksNavigation ? TEXT("true") : TEXT("false"));
 
 			if (bScanRoomOnStart)
 			{
@@ -688,39 +821,194 @@ void AGM_DemoScene::SpawnWallSpawners()
 		return;
 	}
 
+	FNavLocation PlayerNavLoc;
+	const ANavigationData* PathNavData = nullptr;
+	if (NavSys)
+	{
+		const APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0);
+		PathNavData = NavSys->GetDefaultNavDataInstance();
+		if (!PlayerPawn || !PathNavData ||
+			!NavSys->ProjectPointToNavigation(PlayerPawn->GetActorLocation(), PlayerNavLoc, NavProjectExtent))
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("SpawnWallSpawners: player is not on NavMesh yet. Player=%s NavData=%s"),
+				*GetNameSafe(PlayerPawn), *GetNameSafe(PathNavData));
+			++WallSpawnerRetryCount;
+			if (WallSpawnerRetryCount <= MaxWallSpawnerRetries)
+			{
+				World->GetTimerManager().SetTimer(
+					WallSpawnerRetryTimerHandle,
+					this,
+					&AGM_DemoScene::SpawnWallSpawners,
+					SpawnRetryInterval,
+					false);
+			}
+			return;
+		}
+	}
+
 	// 検証に使う敵カプセル寸法を、実際に湧かす敵クラスの CDO から取る（BPごとに違うため）。
 	const float CapsuleRadius = GetEnemyCapsuleRadius();
 	const float CapsuleHalfHeight = GetEnemyCapsuleHalfHeight();
+	const FVector WallRight = FVector::CrossProduct(FVector::UpVector, WallInward).GetSafeNormal2D();
 
 	int32 NumRejectedOffNav = 0;
 	int32 NumRejectedBlocked = 0;
+	int32 NumRejectedUnreachable = 0;
+	int32 NumRelocatedToClearSpace = 0;
+	int32 NumResolvedByReachableFallback = 0;
 	for (const FVector& P : Points)
 	{
 		FVector SpawnPoint = P + FVector(0.0f, 0.0f, SpawnHeightOffset);
 
 		if (NavSys)
 		{
-			// 1) NavMesh に乗るか。乗らない／遠すぎる点はその場に Spawner を置かない（捨てる）。
-			//    以前はここで捨てずに置いていたため、NavMesh 外の Spawner が「湧かせないだけの置物」
-			//    として残り、そこから出た敵が NavMesh 外で動けない/埋まる原因になっていた。
-			FNavLocation ProjectedLoc;
-			if (!NavSys->ProjectPointToNavigation(P, ProjectedLoc, NavProjectExtent) ||
-				FVector::DistSquared2D(P, ProjectedLoc.Location) > FMath::Square(MaxNavProjectionDistance))
+			// 最遠壁の正面が机などで塞がれていても SpawnerCount=1 で詰まらないように、
+			// 基準点を最優先に「壁沿いの左右 → 少し室内側」の順で空き地点を探す。
+			// 各候補は必ず NavMesh 投影と敵カプセルの空間チェックを通すため、床外や家具内には置かない。
+			bool bFoundClearPoint = false;
+			bool bUsedReachableFallback = false;
+			int32 ResolvedSideStep = 0;
+			int32 ResolvedInwardStep = 0;
+			FNavLocation ResolvedNavLoc;
+
+			auto TryCandidate = [&](const FVector& Candidate, int32 SideStep, int32 InwardStep) -> bool
 			{
-				++NumRejectedOffNav;
+				FNavLocation ProjectedLoc;
+				const bool bProjected = NavSys->ProjectPointToNavigation(Candidate, ProjectedLoc, NavProjectExtent);
+				const bool bProjectedTooFar = bProjected &&
+					FVector::DistSquared2D(Candidate, ProjectedLoc.Location) > FMath::Square(MaxNavProjectionDistance);
+				if (!bProjected || bProjectedTooFar)
+				{
+					++NumRejectedOffNav;
+					return false;
+				}
+
+				// 部屋ポリゴンの内側か。床矩形は部屋の外接矩形なので、部屋が回転している/くぼみがあると
+				// 「NavMesh上だが壁の外」の点が存在する。壁はNavMeshを寸断しないため経路チェック
+				// (TestPathSync)も壁を素通しで合格してしまい、壁の裏に湧いてNavMesh端で足踏みする。
+				if (!Spatial->IsPointInsidePrimaryRoom(ProjectedLoc.Location))
+				{
+					++NumRejectedOffNav;
+					return false;
+				}
+
+				const FVector CapsuleCenter = ProjectedLoc.Location + FVector(0.0f, 0.0f, CapsuleHalfHeight);
+				if (!CanEnemyFitAt(CapsuleCenter, CapsuleRadius, CapsuleHalfHeight))
+				{
+					++NumRejectedBlocked;
+					return false;
+				}
+
+				FPathFindingQuery PathQuery(this, *PathNavData, ProjectedLoc.Location, PlayerNavLoc.Location);
+				PathQuery.SetAllowPartialPaths(false);
+				if (!NavSys->TestPathSync(PathQuery, EPathFindingMode::Regular))
+				{
+					++NumRejectedUnreachable;
+					return false;
+				}
+
+				ResolvedNavLoc = ProjectedLoc;
+				ResolvedSideStep = SideStep;
+				ResolvedInwardStep = InwardStep;
+				return true;
+			};
+
+			const int32 MaxInwardSteps = FMath::Max(0, WallSpawnerMaxInwardSearchSteps);
+			const int32 MaxSideSteps = WallRight.IsNearlyZero()
+				? 0
+				: FMath::Max(0, WallSpawnerMaxSideSearchSteps);
+			for (int32 InwardStep = 0; InwardStep <= MaxInwardSteps && !bFoundClearPoint; ++InwardStep)
+			{
+				const FVector InwardBase = P + WallInward * (WallSpawnerInwardSearchStep * InwardStep);
+
+				// まず壁前の中央を試し、その後 +右/-左を近い順に交互に試す。
+				bFoundClearPoint = TryCandidate(InwardBase, 0, InwardStep);
+				for (int32 SideStep = 1; SideStep <= MaxSideSteps && !bFoundClearPoint; ++SideStep)
+				{
+					const FVector SideOffset = WallRight * (WallSpawnerSideSearchStep * SideStep);
+					bFoundClearPoint = TryCandidate(InwardBase + SideOffset, SideStep, InwardStep);
+					if (!bFoundClearPoint)
+					{
+						bFoundClearPoint = TryCandidate(InwardBase - SideOffset, -SideStep, InwardStep);
+					}
+				}
+			}
+
+			// The far wall can be separated from the player by furniture-generated NavMesh holes. In that case,
+			// sample only the player's connected NavMesh region and keep the safe point closest to the wall target.
+			if (!bFoundClearPoint)
+			{
+				float BestScore = TNumericLimits<float>::Max();
+				FNavLocation BestReachableLoc;
+				const float ReachableRadius = FMath::Max(NavFallbackSearchRadius, NavInvokerGenerationRadius);
+				const int32 FallbackAttempts = FMath::Max(1, WallSpawnerReachableFallbackAttempts);
+				for (int32 Attempt = 0; Attempt < FallbackAttempts; ++Attempt)
+				{
+					FNavLocation ReachableLoc;
+					if (!NavSys->GetRandomReachablePointInRadius(PlayerNavLoc.Location, ReachableRadius, ReachableLoc))
+					{
+						continue;
+					}
+
+					// 到達可能サンプルも「壁の外のNavMesh」に落ちることがあるので部屋内に限定する。
+					if (!Spatial->IsPointInsidePrimaryRoom(ReachableLoc.Location))
+					{
+						continue;
+					}
+
+					const FVector CapsuleCenter = ReachableLoc.Location + FVector(0.0f, 0.0f, CapsuleHalfHeight);
+					if (!CanEnemyFitAt(CapsuleCenter, CapsuleRadius, CapsuleHalfHeight))
+					{
+						++NumRejectedBlocked;
+						continue;
+					}
+
+					FPathFindingQuery PathQuery(this, *PathNavData, ReachableLoc.Location, PlayerNavLoc.Location);
+					PathQuery.SetAllowPartialPaths(false);
+					if (!NavSys->TestPathSync(PathQuery, EPathFindingMode::Regular))
+					{
+						++NumRejectedUnreachable;
+						continue;
+					}
+
+					const float PlayerDistance = FVector::Dist2D(PlayerNavLoc.Location, ReachableLoc.Location);
+					const float TooClosePenalty = FMath::Max(0.0f, FallbackSpawnDistance - PlayerDistance) * 4.0f;
+					const float Score = FVector::Dist2D(P, ReachableLoc.Location) + TooClosePenalty;
+					if (Score < BestScore)
+					{
+						BestScore = Score;
+						BestReachableLoc = ReachableLoc;
+					}
+				}
+
+				if (BestScore < TNumericLimits<float>::Max())
+				{
+					ResolvedNavLoc = BestReachableLoc;
+					bFoundClearPoint = true;
+					bUsedReachableFallback = true;
+					++NumResolvedByReachableFallback;
+				}
+			}
+
+			if (!bFoundClearPoint)
+			{
 				continue;
 			}
 
-			// 2) その点に敵カプセルが「埋まらず立てる」空間があるか。
-			//    壁/家具のオクルージョンメッシュにカプセルが食い込む点は弾く（バグ: 空間不足でMeshに埋まる）。
-			const FVector CapsuleCenter = ProjectedLoc.Location + FVector(0.0f, 0.0f, CapsuleHalfHeight);
-			if (!CanEnemyFitAt(CapsuleCenter, CapsuleRadius, CapsuleHalfHeight))
+			if (ResolvedSideStep != 0 || ResolvedInwardStep != 0 || bUsedReachableFallback)
 			{
-				++NumRejectedBlocked;
-				continue;
+				++NumRelocatedToClearSpace;
+				UE_LOG(LogTemp, Log,
+					TEXT("SpawnWallSpawners: moved blocked base point to clear NavMesh point. Base=%s Resolved=%s SideStep=%d InwardStep=%d ReachableFallback=%s"),
+					*P.ToCompactString(),
+					*ResolvedNavLoc.Location.ToCompactString(),
+					ResolvedSideStep,
+					ResolvedInwardStep,
+					bUsedReachableFallback ? TEXT("true") : TEXT("false"));
 			}
 
-			SpawnPoint = ProjectedLoc.Location + FVector(0.0f, 0.0f, SpawnHeightOffset);
+			SpawnPoint = ResolvedNavLoc.Location + FVector(0.0f, 0.0f, SpawnHeightOffset);
 		}
 
 		AEnemySpawner* S = World->SpawnActor<AEnemySpawner>(ClassToSpawn, SpawnPoint, Rot, Params);
@@ -732,8 +1020,8 @@ void AGM_DemoScene::SpawnWallSpawners()
 		}
 	}
 	UE_LOG(LogTemp, Log,
-		TEXT("SpawnWallSpawners: placed %d/%d valid spawners along farthest wall (rejected: off-NavMesh=%d, blocked/no-space=%d)"),
-		WallSpawners.Num(), Points.Num(), NumRejectedOffNav, NumRejectedBlocked);
+		TEXT("SpawnWallSpawners: placed %d/%d valid spawners along farthest wall (relocated-to-clear-space=%d, reachable-fallback=%d, rejected candidates: off-NavMesh=%d, blocked/no-space=%d, unreachable-to-player=%d)"),
+		WallSpawners.Num(), Points.Num(), NumRelocatedToClearSpace, NumResolvedByReachableFallback, NumRejectedOffNav, NumRejectedBlocked, NumRejectedUnreachable);
 
 	// 検証で全候補を弾いて 0 個になった場合 = この瞬間はまだ NavMesh タイルが生成されていない
 	// （Invoker 起動から生成まで数フレーム〜数百ms遅れる）か、壁前に空間が無い可能性が高い。
@@ -763,6 +1051,7 @@ void AGM_DemoScene::SpawnWallSpawners()
 	}
 	else if (World)
 	{
+		WallSpawnerRetryCount = 0;
 		World->GetTimerManager().ClearTimer(WallSpawnerRetryTimerHandle);
 	}
 }
@@ -809,8 +1098,29 @@ bool AGM_DemoScene::CanEnemyFitAt(const FVector& CapsuleCenter, float Radius, fl
 	// 壁/床/家具のオクルージョンメッシュ（WorldStatic）に敵カプセルが重ならないか調べる。
 	// 重なる＝その点では敵がメッシュに埋まる → Spawner を置かない。
 	// 床自体(WorldStatic)に半径ぶん触れても埋まり扱いにならないよう、底面を少し上げて判定する。
+	// Reject the synthetic ground padding outside the measured room floor.
+	if (!bSpawnFloorBoundsCached)
+	{
+		bSpawnFloorBoundsCached = true;
+		if (const UMRSpatialRecognitionSubsystem* Spatial = World->GetSubsystem<UMRSpatialRecognitionSubsystem>())
+		{
+			bHasSpawnFloorBounds = Spatial->GetFloorRect(CachedSpawnFloorCenter, CachedSpawnFloorHalfXY);
+		}
+	}
+	if (bHasSpawnFloorBounds)
+	{
+		const float RequiredInset = Radius + SpawnFitRadiusPadding + SpawnFloorEdgeMargin;
+		const bool bInsideFloor =
+			FMath::Abs(CapsuleCenter.X - CachedSpawnFloorCenter.X) <= FMath::Max(0.0f, CachedSpawnFloorHalfXY.X - RequiredInset) &&
+			FMath::Abs(CapsuleCenter.Y - CachedSpawnFloorCenter.Y) <= FMath::Max(0.0f, CachedSpawnFloorHalfXY.Y - RequiredInset);
+		if (!bInsideFloor)
+		{
+			return false;
+		}
+	}
+
 	const FCollisionShape Capsule = FCollisionShape::MakeCapsule(
-		FMath::Max(1.0f, Radius - SpawnFitClearance),
+		FMath::Max(1.0f, Radius + SpawnFitRadiusPadding),
 		FMath::Max(1.0f, HalfHeight - SpawnFitClearance));
 
 	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(SpawnFitTest), /*bTraceComplex=*/false);
@@ -818,7 +1128,7 @@ bool AGM_DemoScene::CanEnemyFitAt(const FVector& CapsuleCenter, float Radius, fl
 	const bool bBlocked = World->OverlapBlockingTestByChannel(
 		CapsuleCenter,
 		FQuat::Identity,
-		ECC_WorldStatic,
+		ECC_Pawn,
 		Capsule,
 		QueryParams);
 
@@ -860,9 +1170,35 @@ void AGM_DemoScene::DebugDrawNavMesh() const
 
 	const TArray<FVector>& Verts = Geometry.MeshVerts;
 	const TArray<int32>& Indices = Geometry.AreaIndices[RECAST_DEFAULT_AREA];
-	// 床面に貼りつくと見にくいので少しだけ上げて描画する。
-	const FVector Lift(0.0f, 0.0f, 3.0f);
+	// 床面に貼りつくと見にくいので少し持ち上げて描画する。
+	// MR/パススルーでは細線(0.5)は深度負け・視認困難なので太くして実機で見えるようにする。
+	const FVector Lift(0.0f, 0.0f, 5.0f);
 	const FColor NavColor = FColor::Green;
+	const float NavLineThickness = 3.0f;
+	const int32 TriCount = Indices.Num() / 3;
+
+	// 診断: 取得した頂点数・歩行可能三角形数をログ。
+	// verts=0 → NavMesh のデータが無い（描く三角形ゼロ＝緑線が出ないのは当然）。
+	// verts>0 なのに実機で緑が見えない → 描画はされているが見える位置/設定の問題（高さ・線の太さ・パススルー深度）。
+	if (Verts.Num() == 0 || TriCount == 0)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("DebugDrawNavMesh: NavMesh has NO geometry yet (verts=%d tris=%d). 非同期ビルド未完 or NavMesh未生成。"),
+			Verts.Num(), TriCount);
+		return;
+	}
+
+	// 描いた範囲(バウンディング)も出すと「緑がどの高さ/位置にあるか」が分かる（足元70cm下に埋もれている等の切り分け）。
+	FBox NavBounds(ForceInit);
+	for (const FVector& V : Verts)
+	{
+		NavBounds += V;
+	}
+	UE_LOG(LogTemp, Warning,
+		TEXT("DebugDrawNavMesh: drawing verts=%d tris=%d boundsMin=%s boundsMax=%s thickness=%.1f lift=%.0f"),
+		Verts.Num(), TriCount,
+		*NavBounds.Min.ToCompactString(), *NavBounds.Max.ToCompactString(),
+		NavLineThickness, Lift.Z);
 
 	for (int32 i = 0; i + 2 < Indices.Num(); i += 3)
 	{
@@ -873,9 +1209,11 @@ void AGM_DemoScene::DebugDrawNavMesh() const
 		const FVector A = Verts[Indices[i]] + Lift;
 		const FVector B = Verts[Indices[i + 1]] + Lift;
 		const FVector C = Verts[Indices[i + 2]] + Lift;
-		DrawDebugLine(World, A, B, NavColor, false, -1.0f, 0, 0.5f);
-		DrawDebugLine(World, B, C, NavColor, false, -1.0f, 0, 0.5f);
-		DrawDebugLine(World, C, A, NavColor, false, -1.0f, 0, 0.5f);
+		DrawDebugLine(World, A, B, NavColor, false, -1.0f, 0, NavLineThickness);
+		DrawDebugLine(World, B, C, NavColor, false, -1.0f, 0, NavLineThickness);
+		DrawDebugLine(World, C, A, NavColor, false, -1.0f, 0, NavLineThickness);
+		// 頂点に点も打つ（線が見えづらくても点群でNavMeshの位置/高さが掴める）。
+		DrawDebugPoint(World, A, 6.0f, FColor::Cyan, false, -1.0f, 0);
 	}
 }
 
@@ -1010,9 +1348,16 @@ void AGM_DemoScene::SpawnGroundCollision()
 		if (Spatial->GetFloorRect(FloorCenter, FloorHalfXY))
 		{
 			GroundCenterXY = FloorCenter;
-			FloorZ = FloorCenter.Z;
-			// 床端ぴったりだと敵が縁で落ちうるので少しだけ余裕(20cm)を持たせる。
-			HalfXY = FloorHalfXY + FVector2D(20.0f, 20.0f);
+			FloorZ = FMath::Max(FloorCenter.Z, PlayerLocation.Z);
+			const FVector2D FloorBasedHalfXY = FloorHalfXY + FVector2D(20.0f, 20.0f);
+			// 床アンカー実寸が取れたら「部屋の床ぴったり＋余白」にする。
+			// 以前は GroundHalfExtent(10m) を最低サイズにしていたが、それだと NavMesh 床が
+			// 部屋よりはるかに大きくなり、壁の外側の点でも「NavMeshに乗る」検証に合格して
+			// Spawner/敵が部屋の外に立ててしまう（壁メッシュはNav非対象なのでNavMesh上は素通し）。
+			// 実寸が異常に小さい場合（過去にX=30cmに潰れるバグがあった）だけ1mで下支えする。
+			HalfXY = FVector2D(
+				FMath::Max(100.0f, FloorBasedHalfXY.X),
+				FMath::Max(100.0f, FloorBasedHalfXY.Y));
 		}
 		else
 		{
@@ -1023,6 +1368,29 @@ void AGM_DemoScene::SpawnGroundCollision()
 				FloorZ = MeasuredZ;
 			}
 		}
+
+		float MeasuredFloorZ = 0.0f;
+		if (Spatial->MeasureFloorHeight(PlayerLocation, MeasuredFloorZ))
+		{
+			if (!FMath::IsNearlyEqual(FloorZ, MeasuredFloorZ, 1.0f))
+			{
+				UE_LOG(LogTemp, Warning,
+					TEXT("SpawnGroundCollision: overriding floor Z from %.1f to measured upper floor %.1f"),
+					FloorZ,
+					MeasuredFloorZ);
+			}
+			FloorZ = MeasuredFloorZ;
+		}
+	}
+
+	// 床アンカー実測を最終値として採用する。見えている床メッシュ（アンカー追従）と固定床を
+	// 一致させるため、ポーンZへのクランプ（持ち上げ）はしない。極端に低い場合だけ診断用に警告。
+	if (FloorZ < PlayerLocation.Z - 30.0f)
+	{
+		UE_LOG(LogTemp, Warning,
+			TEXT("SpawnGroundCollision: floor anchor Z %.1f is far below player Z %.1f (using anchor Z as-is)"),
+			FloorZ,
+			PlayerLocation.Z);
 	}
 
 	// 床天面が FloorZ に来るよう、中心を厚みの半分だけ下げる。
@@ -1049,6 +1417,10 @@ void AGM_DemoScene::SpawnGroundCollision()
 		return;
 	}
 	GroundActor->SetRootComponent(Box);
+	// ※ SpawnActor に渡した座標は「ルート無しの空アクター」では捨てられる（適用先が無い）。
+	//   後付けしたルートBoxは原点(0,0,0)に居るため、登録前に明示的に床位置へ置く。
+	//   （これを怠ると、床の高さ計算が正しくても箱は常に原点＝NavMeshがZ=厚み位置に張られる。）
+	Box->SetRelativeLocation(GroundCenter);
 	// 静的配置（動かさない）として登録する。
 	Box->SetMobility(EComponentMobility::Static);
 	Box->SetBoxExtent(FVector(FMath::Max(10.0f, HalfXY.X), FMath::Max(10.0f, HalfXY.Y), GroundThickness));
@@ -1069,6 +1441,58 @@ void AGM_DemoScene::SpawnGroundCollision()
 
 	UE_LOG(LogTemp, Warning, TEXT("SpawnGroundCollision: fixed ground at center=%s halfXY=(%.1f,%.1f) Z=%.1f (no rotation)"),
 	       *GroundCenter.ToCompactString(), HalfXY.X, HalfXY.Y, FloorZ);
+}
+
+void AGM_DemoScene::RealignGroundCollisionIfDrifted()
+{
+	if (!bSpawnGroundCollision)
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	const APawn* PlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0);
+	if (!World || !PlayerPawn)
+	{
+		return;
+	}
+
+	// 何らかの理由でまだ床が無ければ作るだけ。
+	if (!GroundActor)
+	{
+		SpawnGroundCollision();
+		return;
+	}
+
+	// 現在の床アンカー高さ（アンカー追従の床メッシュと同じ高さ）を取る。
+	// アンカーが取れない場合のLineTraceフォールバックは固定床自身に当たり得るため、比較しない。
+	UMRSpatialRecognitionSubsystem* Spatial = World->GetSubsystem<UMRSpatialRecognitionSubsystem>();
+	float FloorZ = 0.0f;
+	if (!Spatial || !Spatial->MeasureFloorHeight(PlayerPawn->GetActorLocation(), FloorZ))
+	{
+		return;
+	}
+
+	// 固定床の天面Z（Box中心Z＋厚み半分）。
+	float GroundTopZ = GroundActor->GetActorLocation().Z + GroundThickness;
+	if (const UBoxComponent* Box = Cast<UBoxComponent>(GroundActor->GetRootComponent()))
+	{
+		GroundTopZ = Box->GetComponentLocation().Z + Box->GetScaledBoxExtent().Z;
+	}
+
+	const float DriftCm = FMath::Abs(GroundTopZ - FloorZ);
+	if (DriftCm <= GroundRealignToleranceCm)
+	{
+		return;
+	}
+
+	// World Lock補正でアンカーが動き、固定床が取り残された。作り直して床メッシュに追従させる。
+	UE_LOG(LogTemp, Warning,
+	       TEXT("RealignGroundCollisionIfDrifted: floor anchor Z=%.1f vs ground top Z=%.1f (drift %.1fcm). Respawning fixed ground."),
+	       FloorZ, GroundTopZ, DriftCm);
+	GroundActor->Destroy();
+	GroundActor = nullptr;
+	SpawnGroundCollision();
 }
 
 void AGM_DemoScene::SpawnNavInvoker()
@@ -1103,6 +1527,9 @@ void AGM_DemoScene::SpawnNavInvoker()
 
 	USceneComponent* Root = NewObject<USceneComponent>(NavInvokerActor);
 	NavInvokerActor->SetRootComponent(Root);
+	// 固定床と同じ罠: 後付けルートはスポーン座標を引き継がず原点に居るので、明示的に置く。
+	// （Invoker の生成半径はこの位置基準。原点のままでも半径15mで偶然部屋を覆えていたが、正しく足元に置く。）
+	Root->SetRelativeLocation(PlayerLocation);
 	Root->RegisterComponent();
 
 	UNavigationInvokerComponent* Invoker = NewObject<UNavigationInvokerComponent>(NavInvokerActor);

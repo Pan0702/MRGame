@@ -12,6 +12,7 @@ class UBoxComponent;
 class UWidgetComponent;
 class UTextRenderComponent;
 class UPrimitiveComponent;
+class USoundBase;
 
 /** スイング方向から決まる切断パターン。 */
 UENUM(BlueprintType)
@@ -111,6 +112,10 @@ public:
 	/** 切断とみなす最低スイング速度(cm/s)。これ未満は無視。 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box|Cut")
 	float MinSwingSpeed = 50.f;
+
+	/** 剣で切った瞬間に鳴らす斬撃音(BP_StartBoxで指定)。 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box|Cut")
+	TObjectPtr<USoundBase> CutSound;
 
 	/** 分離時に各ピースへ与えるImpulseの大きさ。 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box|Cut")

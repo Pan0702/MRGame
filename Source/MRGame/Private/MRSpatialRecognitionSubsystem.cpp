@@ -274,9 +274,11 @@ bool UMRSpatialRecognitionSubsystem::CalibrateFrontWall(const FVector& PlayerLoc
 {
 	bWallBaseValid = false;
 
-	UMRUKSubsystem* MRUKSubsystem = GetMRUKSubsystem();
-	if (!MRUKSubsystem)
+	const UMRUKSubsystem* MRUKSubsystem = GetMRUKSubsystem();
+	const AMRUKRoom* PrimaryRoom = GetPrimaryRoom();
+	if (!PrimaryRoom)
 	{
+		UE_LOG(LogTemp, Log, TEXT("CalibrateFrontWall: no primary room (room not ready?)"));
 		return false;
 	}
 
@@ -288,6 +290,10 @@ bool UMRSpatialRecognitionSubsystem::CalibrateFrontWall(const FVector& PlayerLoc
 	for (const AMRUKRoom* Room : MRUKSubsystem->Rooms)
 	{
 		if (!Room)
+		{
+			continue;
+		}
+		if (Room != PrimaryRoom)
 		{
 			continue;
 		}
@@ -444,11 +450,29 @@ bool UMRSpatialRecognitionSubsystem::GetSpawnPointsAlongFarthestWall(int32 NumPo
 	// クランプ後の実効間隔（NumPoints==1 のときは 0）。
 	const float EffectiveSpacing = (NumPoints > 1) ? (HalfRange * 2.0f / (NumPoints - 1)) : 0.0f;
 
+	// 床矩形を取っておく（候補点を床の内側へクランプするため）。
+	// スキャンによっては壁アンカーが床アンカーの範囲より外側に来ることがあり
+	// （実測で壁中心が床端より80cm外）、壁前オフセットの点が床＝NavMesh床の外に落ちて
+	// 全候補が off-NavMesh で棄却される。床矩形内へ寄せれば「壁に最も近い床の上」に必ず乗る。
+	FVector FloorRectCenter = FVector::ZeroVector;
+	FVector2D FloorRectHalf = FVector2D::ZeroVector;
+	const bool bHasFloorRect = GetFloorRect(FloorRectCenter, FloorRectHalf);
+	const float ClampMargin = EnemyRadius + 5.0f;
+
 	OutPoints.Reserve(NumPoints);
 	for (int32 i = 0; i < NumPoints; ++i)
 	{
 		const float Side = -HalfRange + EffectiveSpacing * i;
 		FVector P = Base + RightDir * Side;
+		if (bHasFloorRect)
+		{
+			P.X = FMath::Clamp(P.X,
+				FloorRectCenter.X - FloorRectHalf.X + ClampMargin,
+				FloorRectCenter.X + FloorRectHalf.X - ClampMargin);
+			P.Y = FMath::Clamp(P.Y,
+				FloorRectCenter.Y - FloorRectHalf.Y + ClampMargin,
+				FloorRectCenter.Y + FloorRectHalf.Y - ClampMargin);
+		}
 		// 床高さに合わせる（取れなければ CachedWallPoint.Z のままにしておく）。
 		float FloorZ = 0.0f;
 		// 非const内部実装にアクセスするため、ここだけ const を外して呼ぶ。
@@ -463,6 +487,41 @@ bool UMRSpatialRecognitionSubsystem::GetSpawnPointsAlongFarthestWall(int32 NumPo
 	return true;
 }
 
+float UMRSpatialRecognitionSubsystem::GetFloorSurfaceZ(const AMRUKAnchor* FloorAnchor) const
+{
+	if (!FloorAnchor)
+	{
+		return 0.0f;
+	}
+	const float ActorFloorZ = FloorAnchor->GetActorLocation().Z;
+	bool bUsePlaneBoundsForFloorHeight = false;
+
+	// 床アンカーは Pitch=-90 で寝ているため、GetActorLocation().Z（原点）は実床面とズレる
+	// （実機で原点90 / 実床162）。PlaneBounds の4隅をワールド変換し、その Z 平均を実床面とする。
+	// ※MRUKの平面はローカルY-Z平面（ローカルX=法線）なので4隅は (0, X, Y) として変換する（GetFloorRect と同じ規約）。
+	if (bUsePlaneBoundsForFloorHeight && FloorAnchor->PlaneBounds.bIsValid)
+	{
+		const FVector2D PMin = FloorAnchor->PlaneBounds.Min;
+		const FVector2D PMax = FloorAnchor->PlaneBounds.Max;
+		const FVector LocalCorners[4] = {
+			FVector(0.0f, PMin.X, PMin.Y),
+			FVector(0.0f, PMax.X, PMin.Y),
+			FVector(0.0f, PMax.X, PMax.Y),
+			FVector(0.0f, PMin.X, PMax.Y)
+		};
+		const FTransform& Xform = FloorAnchor->GetActorTransform();
+		float SumZ = 0.0f;
+		for (const FVector& LC : LocalCorners)
+		{
+			SumZ += Xform.TransformPosition(LC).Z;
+		}
+		return SumZ * 0.25f;
+	}
+
+	// PlaneBounds が無ければ原点Zにフォールバック。
+	return ActorFloorZ;
+}
+
 bool UMRSpatialRecognitionSubsystem::GetFloorRect(FVector& OutCenter, FVector2D& OutHalfXY) const
 {
 	const UMRUKSubsystem* MRUKSubsystem = GetMRUKSubsystem();
@@ -470,13 +529,24 @@ bool UMRSpatialRecognitionSubsystem::GetFloorRect(FVector& OutCenter, FVector2D&
 	{
 		return false;
 	}
+	const AMRUKRoom* PrimaryRoom = GetPrimaryRoom();
+	if (!PrimaryRoom)
+	{
+		return false;
+	}
 
 	// MeasureFloorHeight と同様、最も Z が高い床アンカー＝本物の床を採用する。
+	// ※PrimaryRoom（プレイヤーがいる部屋）以外は見ない。デバイスに残った古い部屋の床矩形を
+	//   拾うと、固定床(GroundActor)の中心・サイズが別の部屋基準になるため。
 	const AMRUKAnchor* BestFloor = nullptr;
 	float BestZ = -TNumericLimits<float>::Max();
 	for (const AMRUKRoom* Room : MRUKSubsystem->Rooms)
 	{
 		if (!Room)
+		{
+			continue;
+		}
+		if (Room != PrimaryRoom)
 		{
 			continue;
 		}
@@ -486,7 +556,8 @@ bool UMRSpatialRecognitionSubsystem::GetFloorRect(FVector& OutCenter, FVector2D&
 			{
 				continue;
 			}
-			const float Z = Floor->GetActorLocation().Z;
+			// 比較は MeasureFloorHeight と同様、実床面Z（4隅ワールド変換）で行い、採用アンカーを一致させる。
+			const float Z = GetFloorSurfaceZ(Floor);
 			if (Z > BestZ)
 			{
 				BestZ = Z;
@@ -510,14 +581,17 @@ bool UMRSpatialRecognitionSubsystem::GetFloorRect(FVector& OutCenter, FVector2D&
 	{
 		const FVector2D PMin = BestFloor->PlaneBounds.Min;
 		const FVector2D PMax = BestFloor->PlaneBounds.Max;
-		// 面ローカル2D(X,Y)。MRUK床アンカーは Pitch=-90 で寝ているので、面ローカルの (X,Y) は
-		// アクターTransform上は (X, Z) 平面に乗る。ローカル点は (X, Y, 0) として変換すれば、
-		// アクターの回転がそのまま適用されてワールドXYに落ちる。
+		// MRUK の平面はアンカーローカルの「Y-Z平面」に乗っており、ローカルXは法線（床なら真上）。
+		// 本家実装が PlaneBounds をローカル (Y,Z) と対応付けている:
+		//   MRUtilityKitAnchor.cpp GetClosestSurfacePosition → FVector2D(TestPositionLocal.Y, TestPositionLocal.Z)
+		//   MRUtilityKitRoom.cpp  壁エッジ計算 → FVector(0, PlaneBounds.Max.X, 0)
+		// よって4隅は (0, X, Y) として変換する。以前の (X, Y, 0) だと第1軸が法線＝ワールドZに化けて
+		// 水平成分が消え、床矩形が「対角線1本のAABB」（例: 8.6m×1.6mの細帯）に潰れていた。
 		const FVector LocalCorners[4] = {
-			FVector(PMin.X, PMin.Y, 0.0f),
-			FVector(PMax.X, PMin.Y, 0.0f),
-			FVector(PMax.X, PMax.Y, 0.0f),
-			FVector(PMin.X, PMax.Y, 0.0f)
+			FVector(0.0f, PMin.X, PMin.Y),
+			FVector(0.0f, PMax.X, PMin.Y),
+			FVector(0.0f, PMax.X, PMax.Y),
+			FVector(0.0f, PMin.X, PMax.Y)
 		};
 		const FTransform& Xform = BestFloor->GetActorTransform();
 		float MinX = TNumericLimits<float>::Max();
@@ -532,17 +606,20 @@ bool UMRSpatialRecognitionSubsystem::GetFloorRect(FVector& OutCenter, FVector2D&
 			MaxX = FMath::Max(MaxX, WC.X);
 			MaxY = FMath::Max(MaxY, WC.Y);
 		}
-		OutCenter = FVector((MinX + MaxX) * 0.5f, (MinY + MaxY) * 0.5f, AnchorLoc.Z);
+		// 床面Zはアンカー原点(寝た姿勢でズレる)ではなく、4隅をワールド変換した実床面Zを使う。
+		const float SurfaceZ = GetFloorSurfaceZ(BestFloor);
+		OutCenter = FVector((MinX + MaxX) * 0.5f, (MinY + MaxY) * 0.5f, SurfaceZ);
 		OutHalfXY = FVector2D((MaxX - MinX) * 0.5f, (MaxY - MinY) * 0.5f);
 
 		UE_LOG(LogTemp, Warning,
-			TEXT("GetFloorRect: worldRect center=%s halfXY=(%.1f,%.1f) [from 4 corners, no rotation]"),
-			*OutCenter.ToCompactString(), OutHalfXY.X, OutHalfXY.Y);
+			TEXT("GetFloorRect: worldRect center=%s halfXY=(%.1f,%.1f) anchorZ=%.1f surfaceZ=%.1f [from 4 corners, no rotation]"),
+			*OutCenter.ToCompactString(), OutHalfXY.X, OutHalfXY.Y, AnchorLoc.Z, SurfaceZ);
 		return true;
 	}
 
 	// PlaneBounds が無ければ VolumeBounds → それも無ければ広めフォールバック。
-	OutCenter = AnchorLoc;
+	// 高さは実床面Z（PlaneBounds が無ければ原点Zにフォールバックされる）。
+	OutCenter = FVector(AnchorLoc.X, AnchorLoc.Y, GetFloorSurfaceZ(BestFloor));
 	if (BestFloor->VolumeBounds.IsValid)
 	{
 		const FVector Ext = BestFloor->VolumeBounds.GetExtent();
@@ -556,8 +633,23 @@ bool UMRSpatialRecognitionSubsystem::GetFloorRect(FVector& OutCenter, FVector2D&
 	return true;
 }
 
+bool UMRSpatialRecognitionSubsystem::IsPointInsidePrimaryRoom(const FVector& Point) const
+{
+	const AMRUKRoom* PrimaryRoom = GetPrimaryRoom();
+	if (!PrimaryRoom)
+	{
+		// 部屋が取れない段階では判定不能。弾きすぎて湧きが全滅しないよう「内側」とみなす。
+		return true;
+	}
+
+	// MRUK の壁ポリゴン内判定。IsPositionInRoom は非constのBlueprint関数だが内部状態は変えないため
+	// const を外して呼ぶ。垂直方向は World Lock ドリフトで床Zがズレることがあるので水平判定のみ使う。
+	return const_cast<AMRUKRoom*>(PrimaryRoom)->IsPositionInRoom(Point, /*TestVerticalBounds=*/false);
+}
+
 bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocation, float& OutFloorZ)
 {
+	const AMRUKRoom* PrimaryRoom = GetPrimaryRoom();
 	// 床高さは、まず MRUK の床アンカーの高さを直接使う。
 	// （真下LineTraceだと机/椅子の天面に当たって「机の上＝床」と誤認し、敵が浮くため。）
 	if (UMRUKSubsystem* MRUKSubsystem = GetMRUKSubsystem())
@@ -578,6 +670,10 @@ bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocat
 			{
 				continue;
 			}
+			if (Room != PrimaryRoom)
+			{
+				continue;
+			}
 			for (const AMRUKAnchor* Floor : Room->FloorAnchors)
 			{
 				if (!Floor)
@@ -587,15 +683,17 @@ bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocat
 
 				++FloorAnchorCount;
 				const FVector AnchorLoc = Floor->GetActorLocation();
+				// 床面Zはアンカー原点ではなく、4隅をワールド変換した実床面Zを使う（寝た姿勢の原点ズレ対策）。
+				const float SurfaceZ = GetFloorSurfaceZ(Floor);
 				const FString Labels = FString::Join(Floor->SemanticClassifications, TEXT(","));
 				UE_LOG(LogTemp, Log,
-				       TEXT("MeasureFloorHeight: FloorAnchor[%d] Z=%.1f loc=(%.1f,%.1f,%.1f) labels=[%s]"),
-				       FloorAnchorCount - 1, AnchorLoc.Z, AnchorLoc.X, AnchorLoc.Y, AnchorLoc.Z, *Labels);
+				       TEXT("MeasureFloorHeight: FloorAnchor[%d] anchorZ=%.1f surfaceZ=%.1f loc=(%.1f,%.1f,%.1f) labels=[%s]"),
+				       FloorAnchorCount - 1, AnchorLoc.Z, SurfaceZ, AnchorLoc.X, AnchorLoc.Y, AnchorLoc.Z, *Labels);
 
-				// 最も高い床アンカーを採用する（低い余計なアンカーは無視）。
-				if (AnchorLoc.Z > BestZ)
+				// 最も高い床アンカーを採用する（低い余計なアンカーは無視）。比較も実床面Zで行う。
+				if (SurfaceZ > BestZ)
 				{
-					BestZ = AnchorLoc.Z;
+					BestZ = SurfaceZ;
 					BestFloor = Floor;
 				}
 			}
@@ -603,9 +701,9 @@ bool UMRSpatialRecognitionSubsystem::MeasureFloorHeight(const FVector& FromLocat
 
 		if (BestFloor)
 		{
-			OutFloorZ = BestFloor->GetActorLocation().Z;
+			OutFloorZ = GetFloorSurfaceZ(BestFloor);
 			UE_LOG(LogTemp, Log,
-			       TEXT("MeasureFloorHeight: selected highest FloorAnchor Z=%.1f (of %d anchors)"),
+			       TEXT("MeasureFloorHeight: selected highest FloorAnchor surfaceZ=%.1f (of %d anchors)"),
 			       OutFloorZ, FloorAnchorCount);
 			return true;
 		}
@@ -689,10 +787,15 @@ void UMRSpatialRecognitionSubsystem::RefreshRecognizedAnchors()
 	{
 		return;
 	}
+	const AMRUKRoom* PrimaryRoom = GetPrimaryRoom();
 
 	for (const AMRUKRoom* Room : MRUKSubsystem->Rooms)
 	{
 		if (!Room)
+		{
+			continue;
+		}
+		if (PrimaryRoom && Room != PrimaryRoom)
 		{
 			continue;
 		}
@@ -757,6 +860,7 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 		UE_LOG(LogTemp, Warning, TEXT("BuildOcclusionMeshes: MRUK subsystem unavailable"));
 		return 0;
 	}
+	const AMRUKRoom* PrimaryRoom = GetPrimaryRoom();
 
 	for (TObjectPtr<AActor>& Blocker : FurnitureNavBlockers)
 	{
@@ -768,11 +872,38 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 	FurnitureNavBlockers.Reset();
 
 	int32 NumConfigured = 0;
+	float HighestFloorZ = -TNumericLimits<float>::Max();
+	for (const AMRUKRoom* Room : MRUKSubsystem->Rooms)
+	{
+		if (!Room)
+		{
+			continue;
+		}
+		if (Room != PrimaryRoom)
+		{
+			continue;
+		}
+		for (const AMRUKAnchor* Floor : Room->FloorAnchors)
+		{
+			if (Floor)
+			{
+				HighestFloorZ = FMath::Max(HighestFloorZ, GetFloorSurfaceZ(Floor));
+			}
+		}
+	}
 
 	for (AMRUKRoom* Room : MRUKSubsystem->Rooms)
 	{
 		if (!Room)
 		{
+			continue;
+		}
+		// PrimaryRoom（プレイヤーがいる部屋）以外のアンカーにはメッシュ/コリジョン/NavBlockerを作らない。
+		// 古い部屋の床が「2枚目の床」として出現し、余計なコリジョンとNavMeshの穴を生む原因だった。
+		if (Room != PrimaryRoom)
+		{
+			UE_LOG(LogTemp, Log, TEXT("BuildOcclusionMeshes: skipped non-primary room %s (anchors=%d)"),
+			       *Room->GetName(), Room->AllAnchors.Num());
 			continue;
 		}
 
@@ -786,6 +917,16 @@ int32 UMRSpatialRecognitionSubsystem::BuildOcclusionMeshes()
 			const bool bIsCeiling = Anchor->SemanticClassifications.Contains(FMRUKLabels::Ceiling);
 			const bool bIsFloor = Anchor->SemanticClassifications.Contains(FMRUKLabels::Floor);
 			const bool bIsWall = Anchor->SemanticClassifications.Contains(FMRUKLabels::WallFace);
+			if (bIsFloor && HighestFloorZ > -TNumericLimits<float>::Max() * 0.5f &&
+				GetFloorSurfaceZ(Anchor) < HighestFloorZ - 50.0f)
+			{
+				UE_LOG(LogTemp, Log,
+					TEXT("BuildOcclusionMeshes: skipped lower floor %s floorZ=%.1f highestFloorZ=%.1f"),
+					*Anchor->GetName(),
+					GetFloorSurfaceZ(Anchor),
+					HighestFloorZ);
+				continue;
+			}
 
 			// 床に立つ「障害物家具」かどうか。これらは NavMesh に穴を開けて、敵が回り込むようにする。
 			// （壁掛けの WallArt、開口の Window/Door、部屋全体の GlobalMesh、不定の Other は含めない。）
@@ -942,11 +1083,37 @@ void UMRSpatialRecognitionSubsystem::SpawnFurnitureNavBlocker(AMRUKAnchor* Ancho
 		return;
 	}
 
+	// 机の足元矩形の「向き」をアンカーTransformから取る。
+	// UNavModifierComponent の FailsafeExtent はオーナーActorの回転(Quat)を反映した回転Boxとして
+	// 焼かれる（CalculateBounds の FRotatedBox(Bounds, GetActorQuat()) 参照）ため、
+	// ブロッカーActorに机のYawを与えれば穴が机の実際の向きに揃う。
+	// （以前は ZeroRotator 固定＝軸平行AABBで、回転した机とズレて通路まで塞いでいた。）
+	// アンカーは Pitch=-90 で寝ているので、面ローカルX/Y軸をワールドへ変換して水平に潰した方向が
+	// 矩形の辺方向。ローカルXが水平で長く出る方をActorのX軸に採用し、extentもそれに合わせる。
+	const FTransform& AnchorXform = Anchor->GetActorTransform();
+	FVector WorldU = AnchorXform.TransformVectorNoScale(FVector::XAxisVector);
+	FVector WorldV = AnchorXform.TransformVectorNoScale(FVector::YAxisVector);
+	WorldU.Z = 0.0f;
+	WorldV.Z = 0.0f;
+	float FootprintYaw = 0.0f;
+	FVector2D LocalHalf = HalfXY;
+	if (WorldU.SizeSquared() >= WorldV.SizeSquared() && !WorldU.IsNearlyZero())
+	{
+		FootprintYaw = WorldU.Rotation().Yaw;
+	}
+	else if (!WorldV.IsNearlyZero())
+	{
+		// ローカルXがほぼ垂直（面が立っている等）ならローカルYを基準にし、辺の長さを入れ替える。
+		FootprintYaw = WorldV.Rotation().Yaw;
+		LocalHalf = FVector2D(HalfXY.Y, HalfXY.X);
+	}
+	const FRotator BlockerRot(0.0f, FootprintYaw, 0.0f);
+
 	// 薄い板にする: XY は机サイズ、Z は床面付近だけ（FurnitureBlockerHalfHeight）。
 	// これにより NavMesh は机の足元だけ削れ、天板の高さや隣の机まで広がらない。
 	const FVector Failsafe(
-		FMath::Max(5.0f, HalfXY.X),
-		FMath::Max(5.0f, HalfXY.Y),
+		FMath::Max(5.0f, LocalHalf.X),
+		FMath::Max(5.0f, LocalHalf.Y),
 		FMath::Max(2.0f, FurnitureBlockerHalfHeight));
 
 	// 障害物アクターを机の位置(床高さ)に置く。アンカーの XY を使い、Z は床面に合わせる。
@@ -969,7 +1136,7 @@ void UMRSpatialRecognitionSubsystem::SpawnFurnitureNavBlocker(AMRUKAnchor* Ancho
 	       *FString::Join(Anchor->SemanticClassifications, TEXT(",")),
 	       *AnchorLoc.ToString(),
 	       *Anchor->GetActorRotation().ToString(),
-	       *FRotator::ZeroRotator.ToString(),
+	       *BlockerRot.ToString(),
 	       Anchor->VolumeBounds.IsValid ? 1 : 0,
 	       *Anchor->VolumeBounds.Min.ToString(),
 	       *Anchor->VolumeBounds.Max.ToString(),
@@ -988,7 +1155,7 @@ void UMRSpatialRecognitionSubsystem::SpawnFurnitureNavBlocker(AMRUKAnchor* Ancho
 
 	FActorSpawnParameters Params;
 	Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-	AActor* Blocker = World->SpawnActor<AActor>(AActor::StaticClass(), BlockerLoc, FRotator::ZeroRotator, Params);
+	AActor* Blocker = World->SpawnActor<AActor>(AActor::StaticClass(), BlockerLoc, BlockerRot, Params);
 	if (!Blocker)
 	{
 		return;
@@ -997,6 +1164,10 @@ void UMRSpatialRecognitionSubsystem::SpawnFurnitureNavBlocker(AMRUKAnchor* Ancho
 	// ルートを付けて NavModifier を載せる。NavModifier はコリジョンが無いので FailsafeExtent を使う。
 	USceneComponent* Root = NewObject<USceneComponent>(Blocker);
 	Blocker->SetRootComponent(Root);
+	// SpawnActor に渡した座標・回転はルート無しの空アクターでは適用されないため、後付けルートに明示的に設定する。
+	// （位置を怠ると穴がワールド原点に開き、回転を怠ると穴が軸平行AABBになり机の向きとズレる。）
+	Root->SetRelativeLocation(BlockerLoc);
+	Root->SetRelativeRotation(BlockerRot);
 	Root->RegisterComponent();
 
 	UNavModifierComponent* NavMod = NewObject<UNavModifierComponent>(Blocker);
@@ -1181,6 +1352,63 @@ UMRUKSubsystem* UMRSpatialRecognitionSubsystem::GetMRUKSubsystem() const
 	UMRSpatialRecognitionSubsystem* MutableThis = const_cast<UMRSpatialRecognitionSubsystem*>(this);
 	MutableThis->CachedMRUKSubsystem = GameInstance->GetSubsystem<UMRUKSubsystem>();
 	return MutableThis->CachedMRUKSubsystem;
+}
+
+const AMRUKRoom* UMRSpatialRecognitionSubsystem::GetPrimaryRoom() const
+{
+	const UMRUKSubsystem* MRUKSubsystem = GetMRUKSubsystem();
+	if (!MRUKSubsystem)
+	{
+		return nullptr;
+	}
+
+	// MRUK が「ヘッドセットが今いる部屋」を返す。デバイスに古い部屋データが複数残っていても、
+	// プレイヤーが実際にいる部屋を正として採用する（床の高さ比べで古い部屋を拾う事故を防ぐ）。
+	if (const AMRUKRoom* CurrentRoom = MRUKSubsystem->GetCurrentRoom())
+	{
+		return CurrentRoom;
+	}
+
+	// フォールバック: GetCurrentRoom が取れない場合のみ、床アンカーが最も高い部屋を選ぶ旧ヒューリスティック。
+	const AMRUKRoom* BestRoom = nullptr;
+	float BestFloorZ = -TNumericLimits<float>::Max();
+	for (const AMRUKRoom* Room : MRUKSubsystem->Rooms)
+	{
+		if (!Room)
+		{
+			continue;
+		}
+
+		for (const AMRUKAnchor* Floor : Room->FloorAnchors)
+		{
+			if (!Floor)
+			{
+				continue;
+			}
+
+			const float FloorZ = GetFloorSurfaceZ(Floor);
+			if (FloorZ > BestFloorZ)
+			{
+				BestFloorZ = FloorZ;
+				BestRoom = Room;
+			}
+		}
+	}
+
+	if (BestRoom)
+	{
+		return BestRoom;
+	}
+
+	for (const AMRUKRoom* Room : MRUKSubsystem->Rooms)
+	{
+		if (Room)
+		{
+			return Room;
+		}
+	}
+
+	return nullptr;
 }
 
 FMRSpatialAnchorInfo UMRSpatialRecognitionSubsystem::BuildAnchorInfo(const AMRUKAnchor* Anchor) const

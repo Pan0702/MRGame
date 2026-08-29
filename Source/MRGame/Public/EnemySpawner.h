@@ -66,9 +66,23 @@ protected:
 
 	// 空間チェックで敵カプセルから差し引く余裕(cm)。床/壁にわずかに触れただけで弾かないため。
 	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
-	float SpawnFitClearance = 5.0f;
+	float SpawnFitClearance = 1.0f;
+
+	// Extra horizontal clearance so the visible enemy mesh does not start inside furniture or walls.
+	// This only affects spawn validation; the movement capsule stays unchanged.
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	float SpawnFitRadiusPadding = 10.0f;
+
+	// Additional distance kept between the spawn capsule and the scanned floor edge.
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	float SpawnFloorEdgeMargin = 5.0f;
 
 private:
+	mutable bool bSpawnFloorBoundsCached = false;
+	mutable bool bHasSpawnFloorBounds = false;
+	mutable FVector CachedSpawnFloorCenter = FVector::ZeroVector;
+	mutable FVector2D CachedSpawnFloorHalfXY = FVector2D::ZeroVector;
+
 	// 候補点が既存の敵と近すぎる（MinEnemySeparation未満）かを返す。重なり回避に使う。
 	bool IsTooCloseToExistingEnemy(const FVector& Location) const;
 

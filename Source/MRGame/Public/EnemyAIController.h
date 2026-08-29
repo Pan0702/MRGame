@@ -60,6 +60,13 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "AI|Steering")
 	float StuckNudgeRadius = 100.0f;
 
+	// If an enemy falls far below the target and can no longer be projected to NavMesh, place it back on a nearby reachable point.
+	UPROPERTY(EditAnywhere, Category = "AI|Recovery", meta = (ClampMin = "0"))
+	float OffNavRecoveryDropDistance = 500.0f;
+
+	UPROPERTY(EditAnywhere, Category = "AI|Recovery", meta = (ClampMin = "0"))
+	float OffNavRecoverySearchRadius = 600.0f;
+
 	UPROPERTY(EditAnywhere, Category = "AI|Debug")
 	bool bLogChaseDiagnostics = true;
 

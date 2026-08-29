@@ -137,6 +137,27 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "1"))
 	float SpawnerSpacing = 120.0f;
 
+	// 壁前の基準点が家具で塞がれている時、壁に沿って左右へ空き地点を探す間隔(cm)。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "1"))
+	float WallSpawnerSideSearchStep = 60.0f;
+
+	// 壁前の基準点から左右それぞれ何段階まで空き地点を探すか。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	int32 WallSpawnerMaxSideSearchSteps = 6;
+
+	// 壁沿いが家具で埋まっている時、追加で部屋内側へ空き地点を探す間隔(cm)。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "1"))
+	float WallSpawnerInwardSearchStep = 60.0f;
+
+	// 壁前の基準点から部屋内側へ何段階まで空き地点を探すか。
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	int32 WallSpawnerMaxInwardSearchSteps = 4;
+
+	// If the far-wall candidates are on a disconnected NavMesh island, sample the player's reachable
+	// NavMesh region and choose the safe point closest to the requested wall position.
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "1"))
+	int32 WallSpawnerReachableFallbackAttempts = 64;
+
 	// 壁沿いに配置する Spawner のクラス（未指定なら AEnemySpawner を使う）。
 	UPROPERTY(EditAnywhere, Category = "Spawn")
 	TSubclassOf<class AEnemySpawner> SpawnerClass;
@@ -174,7 +195,15 @@ protected:
 	// 壁/床にカプセルがわずかに触れただけで「埋まり」と誤判定して全 Spawner を弾くのを防ぐ。
 	// 大きくすると判定が甘く（埋まり気味でも置く）、小さくすると厳しく（クリアな点だけ置く）なる。
 	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
-	float SpawnFitClearance = 5.0f;
+	float SpawnFitClearance = 1.0f;
+
+	// Extra horizontal clearance used when choosing a wall spawner location.
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	float SpawnFitRadiusPadding = 10.0f;
+
+	// Additional inset from the scanned floor boundary when placing wall spawners.
+	UPROPERTY(EditAnywhere, Category = "Spawn", meta = (ClampMin = "0"))
+	float SpawnFloorEdgeMargin = 5.0f;
 
 	// デバッグ用: 敵が歩ける範囲（NavMesh）を毎フレーム描画して目視確認する。
 	// 実行中に BP から ON/OFF できる（SetDebugDrawNavMesh / 直接書き込み）。本番では false に。
@@ -189,7 +218,7 @@ protected:
 	// デバッグ用: 生成した固定コリジョン床(GroundActor)の範囲をワイヤーフレームで描画する。
 	// 「地面外に敵が湧く」時に、床の大きさ・位置が意図通りか目視確認するため。本番では false に。
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Spawn|Debug")
-	bool bDebugDrawGround = true;
+	bool bDebugDrawGround = false;
 
 	// 接地用の見えないコリジョン床を生成するか。床アンカーの位置・サイズに合わせた固定平面を1枚敷き、
 	// それを敵の接地＋NavMesh土台にする。
@@ -198,7 +227,7 @@ protected:
 	//   false にすると HandleSceneReady で bFloorMeshAffectsNavigation=true に上書きされ、MRUK床がNav面になる。
 	//   床メッシュ自体は bSceneMeshVisualOcclusion=false により不可視のまま（World Lock上下りは見えない）。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
-	bool bSpawnGroundCollision = false;
+	bool bSpawnGroundCollision = true;
 
 	// 生成する見えない床の一辺の半分(cm)。プレイヤー中心にこの範囲を覆う。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
@@ -208,6 +237,28 @@ protected:
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
 	float GroundThickness = 10.0f;
 
+	// 生成後の固定床を床アンカーの高さに追従させるか。
+	// MRUKアンカーはWorld Lockの補正でロード後もジワジワ動くため、ロード直後に一度きりで
+	// 作った固定床が現実の床（＝アンカー追従の床メッシュ）より低く/高く取り残されることがある。
+	// true にすると床アンカーZと固定床天面Zを定期比較し、許容差を超えたら床を作り直す。
+	UPROPERTY(EditAnywhere, Category = "MR|Floor")
+	bool bRealignGroundOnDrift = true;
+
+	// 再整列を発動するZズレの許容差(cm)。これ以下のズレでは作り直さない（NavMesh再生成の抑制）。
+	UPROPERTY(EditAnywhere, Category = "MR|Floor")
+	float GroundRealignToleranceCm = 4.0f;
+
+	// 床アンカーとのズレを確認する間隔(秒)。
+	UPROPERTY(EditAnywhere, Category = "MR|Floor")
+	float GroundRealignCheckInterval = 1.0f;
+
+	// 机などの家具をNavMeshの穴(歩行不可)にするか。InitializeOcclusion で Subsystem に流し込む。
+	// 机が多い部屋（テスト部屋=机23台のオフィス）では穴だらけでNavMeshが寸断され、
+	// 敵がプレイヤーに到達できなくなるため既定は false（接続性優先。敵は机をすり抜ける）。
+	// ※BP側でこのプロパティを上書きしている場合はBPの値が勝つ点に注意。
+	UPROPERTY(EditAnywhere, Category = "MR|Floor")
+	bool bFurnitureBlocksNavigation = false;
+
 	// NavMesh 生成用 Invoker の生成半径(cm)。プレイヤー足元中心に、この半径ぶんだけ
 	// MRUK 床メッシュ上に NavMesh タイルを張る。最遠壁まで届くよう十分に大きく取る。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
@@ -216,7 +267,7 @@ protected:
 	// NavMesh 生成時のエージェント半径(cm)。敵カプセル(≈15cm)に合わせて細くすると、
 	// 細い隙間も歩行可能領域になり「通れそうな隙間を通らない」が解消する。既定35は太すぎる。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
-	float NavAgentRadius = 20.0f;
+	float NavAgentRadius = 7.5f;
 
 	// NavMesh 生成時の最大ステップ高さ(cm)。既定8だと急斜面でNavMeshに穴が空く警告が出るため少し上げる。
 	UPROPERTY(EditAnywhere, Category = "MR|Floor")
@@ -224,6 +275,10 @@ protected:
 
 	int32 AliveCount = 0;
 	bool bLoopActive = false;
+	mutable bool bSpawnFloorBoundsCached = false;
+	mutable bool bHasSpawnFloorBounds = false;
+	mutable FVector CachedSpawnFloorCenter = FVector::ZeroVector;
+	mutable FVector2D CachedSpawnFloorHalfXY = FVector2D::ZeroVector;
 
 	// 部屋ロード時に生成した壁沿い Spawner たち。
 	UPROPERTY()
@@ -278,6 +333,13 @@ private:
 	// 敵(Character)が落下せず床を歩けるようにするため。
 	void SpawnGroundCollision();
 
+	// 床アンカーの現在高さと固定床天面のZを比較し、GroundRealignToleranceCm を超えて
+	// ズレていたら固定床を作り直す（World Lock補正でアンカーが動いた後の追従）。
+	void RealignGroundCollisionIfDrifted();
+
+	// 固定床の再整列チェック用の繰り返しタイマー。
+	FTimerHandle GroundRealignTimerHandle;
+
 	// プレイヤー足元に NavigationInvoker アクターを置き、MRUK 床メッシュ周囲に
 	// 実行時 NavMesh を生成させる。bProjectSpawnToNavMesh が true の時に使う。
 	void SpawnNavInvoker();
@@ -293,8 +355,34 @@ private:
 	// ロード完了待ちのフォールバックタイマー。
 	FTimerHandle SceneLoadFallbackTimerHandle;
 
-	// Depth API 起動は非同期なので、少し遅らせて状態をログに出す。
-	void LogDepthOcclusionStatus();
+	// Depth API の起動は非同期で、USE_SCENE 権限が未許可のままだったり、部屋スキャン画面で
+	// アプリがバックグラウンドになると失敗するが、失敗通知は来ない。
+	// このため開始状態を定期確認し、未開始なら再試行する。
+	void CheckDepthOcclusionStatus();
+
+	// StartEnvironmentDepth + SetXROcclusionsMode の実発行（初回とリトライで共用）。
+	void RequestEnvironmentDepthStart();
+
+	// Scene Captureのpause/resume完了後にEnvironment Depthの初回起動を予約する。
+	void ScheduleDepthOcclusionStart();
+	void StartDeferredDepthOcclusion();
+
+	// OnSceneLoaded直後はOVRPluginセッション再生成中の場合があるため、初回起動を少し遅らせる。
+	UPROPERTY(EditAnywhere, Category = "MR|Depth", meta = (ClampMin = "0.25"))
+	float DepthOcclusionStartDelay = 1.0f;
+
+	// Scene Ready後に開始できなかった場合のリトライ間隔(秒)と最大回数。
+	UPROPERTY(EditAnywhere, Category = "MR|Depth")
+	float DepthOcclusionRetryInterval = 1.0f;
+
+	UPROPERTY(EditAnywhere, Category = "MR|Depth")
+	int32 DepthOcclusionMaxRetries = 10;
+
+	int32 DepthOcclusionRetryCount = 0;
+
+	// 開始状態の監視・リトライ用の繰り返しタイマー。開始成功または上限到達で停止する。
+	FTimerHandle DepthOcclusionStartTimerHandle;
+	FTimerHandle DepthOcclusionRetryTimerHandle;
 
 	// MR空間の Runtime NavMesh は Invoker 起動から生成まで遅延するため、湧きが充足するまで
 	// この間隔(秒)で MaintainDesiredAliveCount を再試行する。NavMesh生成を待って敵を出す。

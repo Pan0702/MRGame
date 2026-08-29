@@ -9,6 +9,7 @@
 #include "TimerManager.h"
 #include "NavigationSystem.h"
 #include "Navigation/PathFollowingComponent.h"
+#include "Components/CapsuleComponent.h"
 
 AEnemyAIController::AEnemyAIController()
 {
@@ -160,6 +161,7 @@ void AEnemyAIController::UpdateChase()
 	bool bPlayerOnNav = false;
 	bool bEnemyOnNav = false;
 	FVector PlayerProj = FVector::ZeroVector;
+	const FVector EnemyActorLoc = GetPawn()->GetActorLocation();
 	if (UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld()))
 	{
 		FNavLocation Loc;
@@ -171,7 +173,38 @@ void AEnemyAIController::UpdateChase()
 		}
 
 		FNavLocation EnemyLoc;
-		bEnemyOnNav = NavSys->ProjectPointToNavigation(GetPawn()->GetActorLocation(), EnemyLoc, TargetNavProjectExtent);
+		bEnemyOnNav = NavSys->ProjectPointToNavigation(EnemyActorLoc, EnemyLoc, TargetNavProjectExtent);
+		if (!bEnemyOnNav &&
+			OffNavRecoverySearchRadius > 0.0f &&
+			EnemyActorLoc.Z < TargetLocation.Z - OffNavRecoveryDropDistance)
+		{
+			const FVector RecoveryOrigin = bPlayerOnNav ? PlayerProj : TargetLocation;
+			FNavLocation RecoveryLoc;
+			if (NavSys->GetRandomReachablePointInRadius(RecoveryOrigin, OffNavRecoverySearchRadius, RecoveryLoc))
+			{
+				float HalfHeight = 0.0f;
+				if (const UCapsuleComponent* Capsule = GetPawn()->FindComponentByClass<UCapsuleComponent>())
+				{
+					HalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+				}
+
+				const FVector RecoveredActorLoc = RecoveryLoc.Location + FVector(0.0f, 0.0f, HalfHeight);
+				StopMovement();
+				GetPawn()->SetActorLocation(RecoveredActorLoc, false, nullptr, ETeleportType::TeleportPhysics);
+				LastSelfLocation = RecoveredActorLoc;
+				LastChaseGoal = FVector(FLT_MAX);
+				StuckAccumTime = 0.0f;
+
+				UE_LOG(LogTemp, Warning,
+					TEXT("EnemyChaseRecoverOffNav: pawn=%s from=%s to=%s target=%s searchRadius=%.1f"),
+					*GetNameSafe(GetPawn()),
+					*EnemyActorLoc.ToCompactString(),
+					*RecoveredActorLoc.ToCompactString(),
+					*TargetLocation.ToCompactString(),
+					OffNavRecoverySearchRadius);
+				return;
+			}
+		}
 	}
 
 	const EPathFollowingRequestResult::Type MoveResult = MoveToLocation(

@@ -4,14 +4,17 @@
 #include "CuttingButton.h"
 
 #include "ASword.h"
+#include "Components/BoxComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "DrawDebugHelpers.h"
+#include "EngineUtils.h"
 #include "TimerManager.h"
 
 // Sets default values
 ACuttingButton::ACuttingButton()
 {
-	// Set this actor to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
-	PrimaryActorTick.bCanEverTick = false;
+	// Tickで「振り中の剣との重なり」を直接判定するため有効化
+	PrimaryActorTick.bCanEverTick = true;
 
 	// 空のSceneComponentをRootにして、各メッシュをその子にする//
 	USceneComponent* SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
@@ -58,6 +61,40 @@ void ACuttingButton::BeginPlay()
 void ACuttingButton::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
+
+	if (bDebugDrawCutVolume)
+	{
+		// 切断判定メッシュのワールドAABBを描画(緑=未切断、赤=切断済み)
+		const FBoxSphereBounds B = CuttingBeforeButton->Bounds;
+		DrawDebugBox(GetWorld(), B.Origin, B.BoxExtent, FQuat::Identity,
+			bIsCut ? FColor::Red : FColor::Green, false, -1.f, 0, 0.3f);
+	}
+
+	if (bIsCut) return;
+
+	// BeginOverlap は「振り判定ONの瞬間に既に剣先がボタン内にある」場合に発火しない。
+	// その取りこぼしを拾うため、振り中の剣のHitBoxとの重なりを毎フレーム直接判定する。
+	ASword* Sword = CachedSword.Get();
+	if (!Sword)
+	{
+		for (TActorIterator<ASword> It(GetWorld()); It; ++It)
+		{
+			Sword = *It;
+			CachedSword = Sword;
+			break;
+		}
+	}
+	if (!Sword || !Sword->IsSwinging() || !Sword->SwordColl) return;
+
+	const UBoxComponent* Box = Sword->SwordColl;
+	const FCollisionShape Shape = FCollisionShape::MakeBox(Box->GetScaledBoxExtent());
+	if (CuttingBeforeButton->OverlapComponent(
+			Box->GetComponentLocation(), Box->GetComponentQuat(), Shape))
+	{
+		UE_LOG(LogTemp, Log, TEXT("CuttingButton %s: Tick経路で切断 (剣速 %.0f cm/s)"),
+			*GetName(), Sword->GetBladeVelocity().Size());
+		DoCut(JudgeCutType(Sword->GetBladeVelocity().GetSafeNormal()));
+	}
 }
 
 void ACuttingButton::OnOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor* OtherActor,
@@ -72,8 +109,15 @@ void ACuttingButton::OnOverlapBegin(UPrimitiveComponent* OverlappedComp, AActor*
 	 const FVector Velocity = Sword->GetBladeVelocity();
 	// if (Velocity.Size() < 100.0f) return; // 速度不足は切れない//
 
+	UE_LOG(LogTemp, Log, TEXT("CuttingButton %s: BeginOverlap経路で切断 (剣速 %.0f cm/s)"),
+		*GetName(), Velocity.Size());
 	const ECutDirection Type = JudgeCutType(Velocity.GetSafeNormal());
 	DoCut(Type);
+}
+
+FText ACuttingButton::GetTargetLevelDisplayName() const
+{
+	return FText::FromString(TargetLevel.GetAssetName());
 }
 
 ECutDirection ACuttingButton::JudgeCutType(const FVector& BladeDir) const
